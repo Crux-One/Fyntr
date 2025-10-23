@@ -11,24 +11,22 @@
     Fyntr
   </h1>
   <p>
-    A minimal forward proxy with transparent TLS passthrough.
+    A minimal forward proxy.
 
 [![GitHub license](https://img.shields.io/github/license/Crux-One/Fyntr?label=License&logo=github)](https://github.com/Crux-One/Fyntr "Click to view the repo on GitHub")
-[![Release Version](https://img.shields.io/github/release/Crux-One/Fyntr?include_prereleases&label=Release&logo=github)](https://github.com/Crux-One/Fyntr/releases/latest "Click to view the repo on GitHub")
-[![Repo Size](https://img.shields.io/github/repo-size/Crux-One/Fyntr?label=Size&logo=github)](https://github.com/Crux-One/Fyntr "Click to view the repo on GitHub")
+[![Release Version](https://img.shields.io/github/v/release/Crux-One/Fyntr?include_prereleases&label=Release&logo=github)](https://github.com/Crux-One/Fyntr/releases/latest "Click to view the repo on GitHub")
   </p>
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tɚ/)* is a minimal forward proxy with TLS passthrough, engineered in Rust, designed for efficiency and simplicity.
+Fyntr *(/ˈfɪn.tɚ/)* is a minimal forward proxy with TLS passthrough, engineered in Rust, designed for simplicity.
 It includes no authentication or inspection capabilities.
-It was created to make bursty network workloads predictable and stable.
+It was created to make bursty network workloads more predictable and stable.
 Its internal scheduler relays encrypted traffic transparently without terminating TLS.
 
 ## Why Fyntr?
 Managing cloud infrastructure with tools like Terraform often spawns a torrent of short-lived TCP connections.
-These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers,
-which can eventually stall operations or cause timeouts.
+These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers with limited NAT table capacity, particularly on consumer-grade models, which can eventually stall operations or cause timeouts.
 
 Fyntr takes a simpler approach. It doesn't pool connections; it smooths them.
 By pacing each flow through its scheduler, it prevents simultaneous bursts that could overwhelm routers,
