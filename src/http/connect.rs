@@ -1,13 +1,14 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::{Result, anyhow};
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::Mutex,
+    time::timeout,
 };
 
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
         queue::{Close, QueueActor},
         scheduler::{Register, RegisterError, Scheduler, Unregister},
     },
+    dns::{DnsCacheActor, ResolveHost},
     flow::{
         FlowId,
         connection::{BackendToClientActor, ClientToBackendActor},
@@ -22,12 +24,15 @@ use crate::{
     http::request::{read_request_line, send_connect_response, skip_headers},
 };
 
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(600);
+
 /// Handle the CONNECT method and operate as an HTTPS proxy
 pub(crate) async fn handle_connect_proxy(
     client_stream: TcpStream,
     client_addr: SocketAddr,
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
+    dns_cache: Addr<DnsCacheActor>,
 ) -> Result<(), anyhow::Error> {
     // Split the client stream (wrap the read half in a BufReader)
     let (client_read, mut client_write) = client_stream.into_split();
@@ -65,19 +70,27 @@ pub(crate) async fn handle_connect_proxy(
     // Skip headers until the blank line
     skip_headers(&mut client_reader).await?;
 
-    // Connect to the backend server
-    let backend_addr = format!("{}:{}", target_host, target_port);
-    let backend_stream = match TcpStream::connect(&backend_addr).await {
-        Ok(stream) => {
-            stream
-                .set_nodelay(true)
-                .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
-            stream
-        }
-        Err(e) => {
+    // Resolve backend addresses via DNS cache
+    let lookup = match dns_cache
+        .send(ResolveHost {
+            host: target_host.clone(),
+        })
+        .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(err)) => {
             error!(
-                "flow{}: failed to connect to {}: {}",
-                flow_id.0, backend_addr, e
+                "flow{}: DNS lookup failed for {}:{} - {}",
+                flow_id.0, target_host, target_port, err
+            );
+            let response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
+            client_write.write_all(response).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!(
+                "flow{}: DNS actor unavailable for {}:{} - {}",
+                flow_id.0, target_host, target_port, err
             );
             let response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
             client_write.write_all(response).await?;
@@ -85,7 +98,34 @@ pub(crate) async fn handle_connect_proxy(
         }
     };
 
-    info!("flow{}: connected to {}", flow_id.0, backend_addr);
+    if lookup.cache_hit || lookup.served_stale {
+        debug!(
+            "flow{}: DNS cache hit={} stale={} for host {} ({} candidates)",
+            flow_id.0,
+            lookup.cache_hit,
+            lookup.served_stale,
+            target_host,
+            lookup.ips.len()
+        );
+    }
+
+    let backend_stream = match connect_candidates(&lookup.ips, target_port).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            error!(
+                "flow{}: failed to connect to {}:{} - {}",
+                flow_id.0, target_host, target_port, err
+            );
+            let response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
+            client_write.write_all(response).await?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        "flow{}: connected to {}:{}",
+        flow_id.0, target_host, target_port
+    );
 
     // Split the backend stream
     let (backend_read, backend_write) = backend_stream.into_split();
@@ -147,4 +187,31 @@ pub(crate) async fn handle_connect_proxy(
     BackendToClientActor::new(flow_id, backend_read, client_write).start();
 
     Ok(())
+}
+
+async fn connect_candidates(ips: &[std::net::IpAddr], port: u16) -> Result<TcpStream> {
+    if ips.is_empty() {
+        return Err(anyhow!("no IP addresses resolved"));
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for ip in ips {
+        let socket = SocketAddr::new(*ip, port);
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(socket)).await {
+            Ok(Ok(stream)) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
+                return Ok(stream);
+            }
+            Ok(Err(err)) => {
+                last_err = Some(anyhow!("connect {} failed: {}", socket, err));
+            }
+            Err(_) => {
+                last_err = Some(anyhow!("connect {} timed out", socket));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to connect to any address")))
 }

@@ -13,7 +13,12 @@ use env_logger::Env;
 use log::{error, info};
 use tokio::net::TcpListener;
 
-use crate::{actors::scheduler::Scheduler, flow::FlowId, http::connect::handle_connect_proxy};
+use crate::{
+    actors::scheduler::Scheduler,
+    dns::{DnsCacheActor, DnsCacheConfig},
+    flow::FlowId,
+    http::connect::handle_connect_proxy,
+};
 
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
@@ -35,6 +40,8 @@ pub async fn server() -> Result<()> {
         .with_max_connections(max_connections)
         .start();
 
+    let dns_cache = DnsCacheActor::new(DnsCacheConfig::default())?.start();
+
     // Start the flow ID counter
     let flow_counter = Arc::new(AtomicUsize::new(1));
 
@@ -45,11 +52,13 @@ pub async fn server() -> Result<()> {
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        let dns_cache = dns_cache.clone();
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
             if let Err(e) =
-                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
+                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler, dns_cache)
+                    .await
             {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
