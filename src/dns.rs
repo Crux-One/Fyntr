@@ -10,6 +10,7 @@ use actix::prelude::*;
 use anyhow::{Context, Result, anyhow};
 use hickory_resolver::{ResolveError, TokioResolver};
 use idna::domain_to_ascii;
+use log::debug;
 use lru::LruCache;
 use tokio::{sync::oneshot, time::timeout};
 
@@ -33,12 +34,13 @@ impl Default for DnsCacheConfig {
             capacity: NonZeroUsize::new(1_024).expect("non zero"),
             min_ttl: Duration::from_secs(5),
             max_ttl: Duration::from_secs(3600),
-            prefetch_ratio: 0.2,
-            prefetch_min_margin: Duration::from_secs(1),
+            // Conservative defaults to avoid opening too many sockets during background refresh.
+            prefetch_ratio: 0.1,
+            prefetch_min_margin: Duration::from_secs(2),
             stale_grace: Duration::from_secs(45),
             negative_ttl: Duration::from_secs(4),
-            resolve_timeout: Duration::from_millis(750),
-            prefetch_batch: 8,
+            resolve_timeout: Duration::from_millis(450),
+            prefetch_batch: 3,
             ipv6_first: true,
         }
     }
@@ -63,6 +65,10 @@ pub(crate) struct DnsCacheActor {
     inflight: HashMap<String, Vec<oneshot::Sender<LookupResponse>>>,
     config: DnsCacheConfig,
     no_proxy: Option<NoProxyMatcher>,
+    prefetch_triggered: u64,
+    negative_cached: u64,
+    active_lookups: u64,
+    max_active_lookups: u64,
 }
 
 impl DnsCacheActor {
@@ -80,6 +86,10 @@ impl DnsCacheActor {
             inflight: HashMap::new(),
             config,
             no_proxy,
+            prefetch_triggered: 0,
+            negative_cached: 0,
+            active_lookups: 0,
+            max_active_lookups: 0,
         }
     }
 
@@ -141,6 +151,11 @@ impl DnsCacheActor {
         if self.inflight.contains_key(&key) {
             return;
         }
+        self.prefetch_triggered += 1;
+        debug!(
+            "dns_cache: prefetch queued for {} (total={})",
+            key, self.prefetch_triggered
+        );
         self.queue_lookup(key, ctx);
     }
 
@@ -150,6 +165,7 @@ impl DnsCacheActor {
         }
 
         self.inflight.insert(key.clone(), Vec::new());
+        self.on_lookup_started();
         let resolver = self.resolver.clone();
         let config = self.config.clone();
         ctx.spawn(
@@ -184,6 +200,7 @@ impl DnsCacheActor {
         if spawn_lookup {
             let resolver = self.resolver.clone();
             let config = self.config.clone();
+            self.on_lookup_started();
             ctx.spawn(
                 async move {
                     let result = perform_lookup(resolver, key.clone(), config).await;
@@ -205,6 +222,7 @@ impl DnsCacheActor {
         result: Result<LookupFresh, LookupFailure>,
         notify_waiters: bool,
     ) {
+        self.on_lookup_finished();
         let now = Instant::now();
 
         match result {
@@ -261,6 +279,11 @@ impl DnsCacheActor {
                 }
 
                 let expires_at = now + self.config.negative_ttl;
+                self.negative_cached += 1;
+                debug!(
+                    "dns_cache: negative cache stored for {} (total={})",
+                    key, self.negative_cached
+                );
                 self.store.put(
                     key,
                     CacheEntry::Negative(CacheNegative {
@@ -295,6 +318,29 @@ impl DnsCacheActor {
         for key in pending {
             self.prefetch(key, ctx);
         }
+    }
+
+    fn on_lookup_started(&mut self) {
+        self.active_lookups += 1;
+        if self.active_lookups > self.max_active_lookups {
+            self.max_active_lookups = self.active_lookups;
+            debug!(
+                "dns_cache: lookup started (active={} new_max={})",
+                self.active_lookups, self.max_active_lookups
+            );
+        } else {
+            debug!("dns_cache: lookup started (active={})", self.active_lookups);
+        }
+    }
+
+    fn on_lookup_finished(&mut self) {
+        if self.active_lookups > 0 {
+            self.active_lookups -= 1;
+        }
+        debug!(
+            "dns_cache: lookup finished (active={} max={})",
+            self.active_lookups, self.max_active_lookups
+        );
     }
 }
 
