@@ -10,7 +10,7 @@ use std::{
 use actix::prelude::*;
 use anyhow::Result;
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::net::TcpListener;
 
 use crate::{
@@ -24,6 +24,8 @@ const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+const RESERVED_FILE_DESCRIPTORS: u64 = 32;
+const APPROX_FDS_PER_FLOW: u64 = 4;
 
 pub async fn server() -> Result<()> {
     bootstrap();
@@ -71,8 +73,65 @@ fn bootstrap() {
 }
 
 fn get_max_connections() -> usize {
-    env::var("FYNTR_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+    if let Ok(value) = env::var("FYNTR_MAX_CONNECTIONS") {
+        match value.parse::<usize>() {
+            Ok(parsed) => {
+                info!(
+                    "Using max connections override from FYNTR_MAX_CONNECTIONS={}",
+                    parsed
+                );
+                return parsed;
+            }
+            Err(err) => {
+                warn!(
+                    "Ignoring invalid FYNTR_MAX_CONNECTIONS='{}': {}",
+                    value, err
+                );
+            }
+        }
+    }
+
+    if let Some((limit, soft_limit)) = infer_connection_limit_from_rlimit() {
+        if limit < DEFAULT_MAX_CONNECTIONS {
+            info!(
+                "Adjusting max connections to {} based on process open file soft limit {}",
+                limit, soft_limit
+            );
+        }
+        return limit;
+    }
+
+    DEFAULT_MAX_CONNECTIONS
+}
+
+fn infer_connection_limit_from_rlimit() -> Option<(usize, u64)> {
+    let soft_limit = fd_soft_limit()?;
+
+    let reserved = RESERVED_FILE_DESCRIPTORS.min(soft_limit);
+    let available = soft_limit.saturating_sub(reserved);
+    let flows = (available / APPROX_FDS_PER_FLOW).max(1);
+
+    let capped = flows
+        .min(DEFAULT_MAX_CONNECTIONS as u64) as usize;
+
+    Some((capped, soft_limit))
+}
+
+#[cfg(unix)]
+fn fd_soft_limit() -> Option<u64> {
+    use std::mem::MaybeUninit;
+
+    unsafe {
+        let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) == 0 {
+            Some(limit.assume_init().rlim_cur as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fd_soft_limit() -> Option<u64> {
+    None
 }
