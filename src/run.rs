@@ -23,7 +23,7 @@ use crate::{
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
-const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const RESERVED_FILE_DESCRIPTORS: u64 = 32;
 const APPROX_FDS_PER_FLOW: u64 = 4;
 
