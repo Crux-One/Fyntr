@@ -13,7 +13,7 @@ use log::{debug, info, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::queue::{AddQuantum, Dequeue, QueueActor},
+    actors::queue::{AddQuantum, Dequeue, DequeueResult, QueueActor},
     flow::FlowId,
     util::{format_bytes, format_rate},
 };
@@ -308,6 +308,7 @@ impl Scheduler {
         if self.flows.is_empty() {
             return;
         }
+
         let n = self.flows.len();
         let start = self.rr_index;
 
@@ -317,50 +318,7 @@ impl Scheduler {
             let queue_addr = self.flows[idx].queue_addr();
             let backend_write = self.flows[idx].backend_write();
 
-            queue_addr
-                .send(Dequeue {
-                    max_bytes: usize::MAX,
-                })
-                .into_actor(self)
-                .map(move |res, act, _ctx| {
-                    match res {
-                        Ok(Some(result)) => {
-                            debug!(
-                                "flow{}: dequeue granted (remaining_queue={})",
-                                flow.0, result.remaining
-                            );
-
-                            // Update stats
-                            if let Some(entry) = act.flow_mut(flow) {
-                                entry.update_stats(result.packet.len());
-                            }
-
-                            act.total_bytes_sent += result.packet.len() as u64;
-                            if act.global_start_time.is_none() {
-                                act.global_start_time = Some(Instant::now());
-                            }
-
-                            // Write the dequeued data to the backend connection (TCP stream) asynchronously.
-                            let data = result.packet.clone();
-                            let backend_write = backend_write.clone();
-                            actix::spawn(async move {
-                                let mut bw = backend_write.lock().await;
-                                if let Err(e) = bw.write_all(&data).await {
-                                    warn!("flow{}: backend write error: {}", flow.0, e);
-                                }
-                            });
-                        }
-                        Ok(None) => {
-                            // The queue is empty; no data to dequeue for this flow at this tick.
-                        }
-                        Err(e) => {
-                            warn!("flow{}: dequeue response error: {}", flow.0, e);
-                            // If the QueueActor is dead or unreachable, unregister this flow from the scheduler to clean up resources.
-                            _ctx.address().do_send(Unregister { flow_id: flow });
-                        }
-                    }
-                })
-                .spawn(ctx);
+            self.request_dequeue(flow, queue_addr, backend_write, ctx);
         }
 
         if !self.flows.is_empty() {
@@ -368,6 +326,96 @@ impl Scheduler {
         } else {
             self.rr_index = 0;
         }
+    }
+
+    fn request_dequeue(
+        &self,
+        flow: FlowId,
+        queue_addr: Addr<QueueActor>,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        ctx: &mut <Self as Actor>::Context,
+    ) {
+        queue_addr
+            .send(Dequeue {
+                max_bytes: usize::MAX,
+            })
+            .into_actor(self)
+            .map(move |res, act, ctx| {
+                act.handle_dequeue_response(flow, backend_write, res, ctx);
+            })
+            .spawn(ctx);
+    }
+
+    fn handle_dequeue_response(
+        &mut self,
+        flow: FlowId,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        res: Result<Option<DequeueResult>, MailboxError>,
+        ctx: &mut <Self as Actor>::Context,
+    ) {
+        match res {
+            Ok(Some(result)) => self.handle_dequeue_success(flow, backend_write, result),
+            Ok(None) => self.handle_empty_dequeue(flow),
+            Err(e) => self.handle_dequeue_error(flow, e, ctx),
+        }
+    }
+
+    fn handle_dequeue_success(
+        &mut self,
+        flow: FlowId,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        result: DequeueResult,
+    ) {
+        debug!(
+            "flow{}: dequeue granted (remaining_queue={})",
+            flow.0, result.remaining
+        );
+
+        let packet_len = result.packet.len();
+        self.update_flow_stats(flow, packet_len);
+        self.update_global_stats(packet_len);
+        self.spawn_backend_write(flow, backend_write, result.packet);
+    }
+
+    fn handle_empty_dequeue(&self, _flow: FlowId) {
+        // The queue is empty; no data to dequeue for this flow at this tick.
+    }
+
+    fn handle_dequeue_error(
+        &mut self,
+        flow: FlowId,
+        error: MailboxError,
+        ctx: &mut <Self as Actor>::Context,
+    ) {
+        warn!("flow{}: dequeue response error: {}", flow.0, error);
+        ctx.address().do_send(Unregister { flow_id: flow });
+    }
+
+    fn update_flow_stats(&mut self, flow: FlowId, bytes: usize) {
+        if let Some(entry) = self.flow_mut(flow) {
+            entry.update_stats(bytes);
+        }
+    }
+
+    fn update_global_stats(&mut self, bytes: usize) {
+        self.total_bytes_sent += bytes as u64;
+        if self.global_start_time.is_none() {
+            self.global_start_time = Some(Instant::now());
+        }
+    }
+
+    fn spawn_backend_write(
+        &self,
+        flow: FlowId,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        data: bytes::Bytes,
+    ) {
+        actix::spawn(async move {
+            let mut bw = backend_write.lock().await;
+            if let Err(e) = bw.write_all(&data).await {
+                warn!("flow{}: backend write error: {}", flow.0, e);
+            }
+        });
     }
 
     fn remove_flows(&mut self, ids: &[FlowId]) -> usize {
