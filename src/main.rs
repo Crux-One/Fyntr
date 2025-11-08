@@ -5,11 +5,11 @@ use fyntr::run::{self, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Port to listen on
-    #[arg(long, env = "FYNTR_PORT", default_value_t = DEFAULT_PORT)]
+    #[clap(long, env = "FYNTR_PORT", default_value_t = DEFAULT_PORT)]
     port: u16,
 
     /// Maximum number of concurrent connections allowed
-    #[arg(long, env = "FYNTR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
+    #[clap(long, env = "FYNTR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
 }
 
