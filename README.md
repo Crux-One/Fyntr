@@ -38,7 +38,7 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
 
 1.  Install and run Fyntr:
 
-    Install the latest release directly from crates.io and run it locally (Fyntr listens on port 9999 by default).
+    Install the crates.io release and run it locally (defaults to port 9999).
 
     ```bash
     cargo install fyntr
