@@ -19,7 +19,7 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tɚ/)* is a minimal forward proxy with TLS passthrough, engineered in Rust, designed for simplicity.
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy with TLS passthrough, engineered in Rust, designed for simplicity.
 It includes no authentication or inspection capabilities.
 It was created to make bursty network workloads more predictable and stable.
 Its internal scheduler relays encrypted traffic transparently without terminating TLS.
