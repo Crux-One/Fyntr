@@ -15,9 +15,9 @@ use tokio::net::TcpListener;
 use crate::{actors::scheduler::Scheduler, flow::FlowId, http::connect::handle_connect_proxy};
 
 pub const DEFAULT_PORT: u16 = 9999;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
-pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 
 pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
