@@ -1,5 +1,4 @@
 use std::{
-    env,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -15,22 +14,21 @@ use tokio::net::TcpListener;
 
 use crate::{actors::scheduler::Scheduler, flow::FlowId, http::connect::handle_connect_proxy};
 
-const DEFAULT_PORT: u16 = 9999;
+pub const DEFAULT_PORT: u16 = 9999;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
-const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 
-pub async fn server() -> Result<()> {
+pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
 
-    let proxy_listen_addr = format!("127.0.0.1:{}", DEFAULT_PORT);
+    let proxy_listen_addr = format!("127.0.0.1:{}", port);
     info!("Starting Fyntr on {}", proxy_listen_addr);
     let listener = TcpListener::bind(proxy_listen_addr).await?;
 
     // Start the scheduler
     let quantum = DEFAULT_QUANTUM;
     let tick = Duration::from_millis(DEFAULT_TICK_MS);
-    let max_connections = get_max_connections();
     let scheduler = Scheduler::new(quantum, tick)
         .with_max_connections(max_connections)
         .start();
@@ -59,11 +57,4 @@ pub async fn server() -> Result<()> {
 
 fn bootstrap() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-}
-
-fn get_max_connections() -> usize {
-    env::var("FYNTR_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
 }
