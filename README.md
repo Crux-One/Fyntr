@@ -44,6 +44,14 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
     cargo run --release
     ```
 
+    Override the listener port or connection cap via CLI flags or env vars:
+
+    ```bash
+    cargo run --release -- --port 8080 --max-connections 512
+    # or
+    FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
+    ```
+
 2.  Configure Your Environment:
 
     Export the following environment variables in a separate terminal.
@@ -67,13 +75,10 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
     ```bash
     # Set environment variables
     export HTTPS_PROXY=http://127.0.0.1:9999
-    export NO_PROXY=169.254.169.254,localhost,127.0.0.1
+
+    # Prevent proxying local/metadata endpoints
+    export NO_PROXY=localhost,127.0.0.1,169.254.169.254
 
     # Assuming your AWS credentials are managed by aws-vault
     aws-vault exec my-profile -- terraform apply
     ```
-
-## Status
-
-Fyntr is currently in an alpha stage and under development.
-Feedback, bug reports, and contributions are highly welcome.
