@@ -143,7 +143,7 @@ impl Handler<QuantumTick> for Scheduler {
         self.total_ticks += 1;
         self.distribute_quantum(ctx);
         self.round_robin_once(ctx);
-        if self.total_ticks % 500 == 0 {
+        if self.total_ticks.is_multiple_of(500) {
             self.log_stats();
         }
     }
@@ -450,13 +450,13 @@ impl Scheduler {
         );
         if let Some(global_start) = self.global_start_time {
             let elapsed = global_start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                if let Some((avg_value, avg_unit)) = format_rate(self.total_bytes_sent, elapsed) {
-                    debug!(
-                        "   ⤷ avg throughput: {:.2} {} over {:.2}s",
-                        avg_value, avg_unit, elapsed
-                    );
-                }
+            if elapsed > 0.0
+                && let Some((avg_value, avg_unit)) = format_rate(self.total_bytes_sent, elapsed)
+            {
+                debug!(
+                    "   ⤷ avg throughput: {:.2} {} over {:.2}s",
+                    avg_value, avg_unit, elapsed
+                );
             }
         }
     }
