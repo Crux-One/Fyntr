@@ -1,6 +1,6 @@
 [package]
 name = "fyntr"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A minimal forward proxy with TLS passthrough, smoothing bursty connections with DRR"
 license = "MIT"
