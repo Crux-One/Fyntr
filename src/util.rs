@@ -87,8 +87,8 @@ mod tests {
             if let Some((_, unit)) = format_rate(bytes, seconds) {
                 match unit {
                     "GB/s" => rate >= 1_000_000_000.0,
-                    "MB/s" => rate >= 1_000_000.0 && rate < 1_000_000_000.0,
-                    "KB/s" => rate >= 1_000.0 && rate < 1_000_000.0,
+                    "MB/s" => (1_000_000.0..1_000_000_000.0).contains(&rate),
+                    "KB/s" => (1_000.0..1_000_000.0).contains(&rate),
                     "B/s" => rate < 1_000.0,
                     _ => false,
                 }

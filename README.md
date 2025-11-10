@@ -24,21 +24,18 @@ It includes no authentication or inspection capabilities.
 It was created to make bursty network workloads more predictable and stable.
 Its internal scheduler relays encrypted traffic transparently without terminating TLS.
 
-## Why Fyntr?
-Managing cloud infrastructure with tools like Terraform often spawns a torrent of short-lived TCP connections.
-These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers with limited NAT table capacity, particularly on consumer-grade models, which can eventually stall operations or cause timeouts.
-
-Fyntr takes a simpler approach. It doesn't pool connections; it smooths them.
-By pacing each flow through its scheduler, it prevents simultaneous bursts that could overwhelm routers,
-resulting in fewer network spikes and reduced traffic congestion.
-
-Under the hood, the internal scheduler—built on an actor-based concurrency model and a Deficit Round-Robin (DRR) algorithm—ensures every flow is handled fairly, even under heavy parallel load.
-
 ## Quick Start
 
-1.  Run Fyntr:
+1.  Install and run Fyntr:
 
-    Fyntr listens on port 9999 by default.
+    Install the crates.io release and run it locally (defaults to port 9999).
+
+    ```bash
+    cargo install fyntr
+    fyntr
+    ```
+
+    Or build from source:
 
     ```bash
     cargo run --release
@@ -67,6 +64,16 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
     ```bash
     curl https://ifconfig.me
     ```
+
+## Why Fyntr?
+Managing cloud infrastructure with tools like Terraform often spawns a torrent of short-lived TCP connections.
+These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers with limited NAT table capacity, particularly on consumer-grade models, which can eventually stall operations or cause timeouts.
+
+Fyntr takes a simpler approach. It doesn't pool connections; it smooths them.
+By pacing each flow through its scheduler, it prevents simultaneous bursts that could overwhelm routers,
+resulting in fewer network spikes and reduced traffic congestion.
+
+Under the hood, the internal scheduler—built on an actor-based concurrency model and a Deficit Round-Robin (DRR) algorithm—ensures every flow is handled fairly, even under heavy parallel load.
 
 ## Usage with Terraform
 
