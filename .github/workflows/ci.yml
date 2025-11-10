@@ -3,7 +3,17 @@ name: Rusty Pipeline
 on:
   push:
     branches: [main, develop]
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
   pull_request:
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
 
 jobs:
   rust-ci-suite:
