@@ -1,9 +1,9 @@
 <div align="center">
   <p>
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="./assets/fyntr.png">
-      <source media="(prefers-color-scheme: light)" srcset="./assets/fyntr.png">
-        <img class="logo-img" alt="Fyntr" width="30%">
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Crux-One/Fyntr/main/assets/fyntr.png">
+      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Crux-One/Fyntr/main/assets/fyntr.png">
+        <img class="logo-img" alt="Fyntr" width="30%" src="https://raw.githubusercontent.com/Crux-One/Fyntr/main/assets/fyntr.png">
     </picture>
   </p>
 
