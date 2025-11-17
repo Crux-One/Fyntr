@@ -463,26 +463,34 @@ impl Scheduler {
 }
 
 #[cfg(test)]
+pub(super) struct InspectReply {
+    pub connections: usize,
+    pub rr_index: usize,
+    pub flow_ids: Vec<FlowId>,
+}
+
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "InspectReply")]
+pub(super) struct InspectState;
+
+#[cfg(test)]
+impl Handler<InspectState> for Scheduler {
+    type Result = MessageResult<InspectState>;
+
+    fn handle(&mut self, _msg: InspectState, _ctx: &mut Context<Self>) -> Self::Result {
+        MessageResult(InspectReply {
+            connections: self.current_connection_count(),
+            rr_index: self.rr_index,
+            flow_ids: self.flows.iter().map(|flow| flow.id()).collect(),
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
-
-    async fn make_backend_write() -> Arc<Mutex<OwnedWriteHalf>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let accept_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            stream
-        });
-
-        let client_stream = TcpStream::connect(addr).await.unwrap();
-        let server_stream = accept_handle.await.unwrap();
-        drop(client_stream);
-
-        let (_read_half, write_half) = server_stream.into_split();
-        Arc::new(Mutex::new(write_half))
-    }
+    use crate::test_utils::make_backend_write;
 
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
@@ -556,6 +564,48 @@ mod tests {
         assert!(
             result.is_ok(),
             "registration should succeed after a connection is unregistered"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn unregister_updates_connection_count_and_rr_index() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(5)
+            .start();
+
+        for id in [FlowId(1), FlowId(2), FlowId(3)] {
+            let queue = QueueActor::new().start();
+            let backend_write = make_backend_write().await;
+            scheduler
+                .send(Register {
+                    flow_id: id,
+                    queue_addr: queue,
+                    backend_write,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        scheduler.send(QuantumTick).await.unwrap();
+        scheduler.send(QuantumTick).await.unwrap();
+
+        scheduler
+            .send(Unregister { flow_id: FlowId(2) })
+            .await
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+
+        assert_eq!(reply.connections, 2, "connection count should decrement");
+        assert_eq!(
+            reply.rr_index, 0,
+            "rr_index should wrap within remaining flows"
+        );
+        assert_eq!(
+            reply.flow_ids,
+            vec![FlowId(1), FlowId(3)],
+            "flow2 should be removed"
         );
     }
 }

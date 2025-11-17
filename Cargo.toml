@@ -1,10 +1,10 @@
 [package]
 name = "fyntr"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
-description = "A minimal forward proxy with TLS passthrough, smoothing bursty connections with DRR"
+description = "A minimal forward proxy with TLS passthrough, smoothing bursty connections"
 license = "MIT"
-repository = "https://github.com/Crux-One/fyntr"
+repository = "https://github.com/Crux-One/Fyntr"
 readme = "README.md"
 
 [[bin]]
@@ -14,9 +14,9 @@ path = "src/main.rs"
 [dependencies]
 actix = "0.13"
 actix-rt = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 anyhow = "1"
-bytes = "1"
+bytes = "1.11"
 env_logger = "0.11"
 log = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
