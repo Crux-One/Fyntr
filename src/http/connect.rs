@@ -154,7 +154,7 @@ impl ValidatedSession {
 impl BackendConnectedSession {
     async fn register_flow(self) -> Result<ControlFlow<(), RegisteredSession>> {
         let BackendConnectedSession {
-            session,
+            mut session,
             queue_tx,
             backend_read,
             backend_write,
@@ -180,7 +180,6 @@ impl BackendConnectedSession {
                     "flow{}: registration rejected - max connections ({}) reached",
                     session.flow_id.0, max
                 );
-                let mut session = session;
                 session
                     .client_write
                     .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
@@ -312,7 +311,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(response, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n",);
+        assert_eq!(response, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
     }
 
     #[actix_rt::test]
@@ -331,7 +330,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(response, b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n",);
+        assert_eq!(response, b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n");
     }
 
     #[actix_rt::test]
@@ -357,7 +356,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n",);
+        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
     }
 
     #[actix_rt::test]
@@ -395,7 +394,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n",);
+        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
         backend_accept.await.unwrap();
     }
 }
