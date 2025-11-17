@@ -266,6 +266,7 @@ pub(crate) async fn handle_connect_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::make_backend_write;
     use std::{future::Future, net::SocketAddr, time::Duration};
 
     use tokio::{
@@ -277,23 +278,6 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         buf
-    }
-
-    async fn make_backend_write() -> Arc<Mutex<OwnedWriteHalf>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let accept_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            stream
-        });
-
-        let client_stream = TcpStream::connect(addr).await.unwrap();
-        let server_stream = accept_handle.await.unwrap();
-        drop(client_stream);
-
-        let (_read_half, write_half) = server_stream.into_split();
-        Arc::new(Mutex::new(write_half))
     }
 
     async fn drive_proxy(
