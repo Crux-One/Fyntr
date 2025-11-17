@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
 
 use actix::prelude::*;
 use anyhow::{Result, anyhow};
@@ -31,9 +31,25 @@ struct ConnectSession {
     scheduler: Addr<Scheduler>,
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
-    queue_tx: Option<Addr<QueueActor>>,
-    backend_read: Option<OwnedReadHalf>,
-    backend_write: Option<Arc<Mutex<OwnedWriteHalf>>>,
+}
+
+struct ValidatedSession {
+    session: ConnectSession,
+    target_host: String,
+    target_port: u16,
+}
+
+struct BackendConnectedSession {
+    session: ConnectSession,
+    queue_tx: Addr<QueueActor>,
+    backend_read: OwnedReadHalf,
+    backend_write: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+struct RegisteredSession {
+    session: ConnectSession,
+    queue_tx: Addr<QueueActor>,
+    backend_read: OwnedReadHalf,
 }
 
 impl ConnectSession {
@@ -50,62 +66,70 @@ impl ConnectSession {
             scheduler,
             client_reader: BufReader::new(client_read),
             client_write,
-            queue_tx: None,
-            backend_read: None,
-            backend_write: None,
         }
     }
 
-    async fn validate_request(&mut self) -> Result<Option<(String, u16)>> {
-        let request_line = read_request_line(&mut self.client_reader).await?;
+    async fn validate_request(self) -> Result<ControlFlow<(), ValidatedSession>> {
+        let mut session = self;
+        let request_line = read_request_line(&mut session.client_reader).await?;
 
         if !request_line.is_http_1x() {
             warn!(
                 "flow{}: unsupported HTTP version {} from {}",
-                self.flow_id.0, request_line.version, self.client_addr
+                session.flow_id.0, request_line.version, session.client_addr
             );
             let response = b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n";
-            self.client_write.write_all(response).await?;
-            return Ok(None);
+            session.client_write.write_all(response).await?;
+            return Ok(ControlFlow::Break(()));
         }
 
         if !request_line.is_connect_method() {
             warn!(
                 "flow{}: unsupported method {} from {}",
-                self.flow_id.0, request_line.method, self.client_addr
+                session.flow_id.0, request_line.method, session.client_addr
             );
             let response = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-            self.client_write.write_all(response).await?;
-            return Ok(None);
+            session.client_write.write_all(response).await?;
+            return Ok(ControlFlow::Break(()));
         }
 
         let (target_host, target_port) = request_line.parse_connect_target()?;
         info!(
             "flow{}: CONNECT {}:{}",
-            self.flow_id.0, target_host, target_port
+            session.flow_id.0, target_host, target_port
         );
 
-        skip_headers(&mut self.client_reader).await?;
+        skip_headers(&mut session.client_reader).await?;
 
-        Ok(Some((target_host, target_port)))
+        Ok(ControlFlow::Continue(ValidatedSession {
+            session,
+            target_host,
+            target_port,
+        }))
     }
+}
 
+impl ValidatedSession {
     async fn establish_backend_connection(
-        &mut self,
-        target_host: &str,
-        target_port: u16,
-    ) -> Result<Option<TcpStream>> {
+        self,
+    ) -> Result<ControlFlow<(), BackendConnectedSession>> {
+        let ValidatedSession {
+            mut session,
+            target_host,
+            target_port,
+        } = self;
+
         let backend_addr = format!("{}:{}", target_host, target_port);
         let backend_stream = match TcpStream::connect(&backend_addr).await {
             Ok(stream) => stream,
             Err(e) => {
                 error!(
                     "flow{}: failed to connect to {}: {}",
-                    self.flow_id.0, backend_addr, e
+                    session.flow_id.0, backend_addr, e
                 );
                 let response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
-                self.client_write.write_all(response).await?;
-                return Ok(None);
+                session.client_write.write_all(response).await?;
+                return Ok(ControlFlow::Break(()));
             }
         };
 
@@ -113,97 +137,99 @@ impl ConnectSession {
             .set_nodelay(true)
             .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
 
-        info!("flow{}: connected to {}", self.flow_id.0, backend_addr);
+        info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
 
-        Ok(Some(backend_stream))
-    }
-
-    fn initialize_backend(&mut self, backend_stream: TcpStream) {
         let (backend_read, backend_write) = backend_stream.into_split();
-        self.backend_read = Some(backend_read);
-        self.backend_write = Some(Arc::new(Mutex::new(backend_write)));
-        self.queue_tx = Some(QueueActor::new().start());
+        let queue_tx = QueueActor::new().start();
+
+        Ok(ControlFlow::Continue(BackendConnectedSession {
+            session,
+            queue_tx,
+            backend_read,
+            backend_write: Arc::new(Mutex::new(backend_write)),
+        }))
     }
+}
 
-    async fn register_flow(&mut self) -> Result<bool> {
-        let queue_tx = self
-            .queue_tx
-            .as_ref()
-            .expect("queue must be initialized before registration");
-        let backend_write = self
-            .backend_write
-            .as_ref()
-            .expect("backend must be initialized before registration");
+impl BackendConnectedSession {
+    async fn register_flow(self) -> Result<ControlFlow<(), RegisteredSession>> {
+        let BackendConnectedSession {
+            mut session,
+            queue_tx,
+            backend_read,
+            backend_write,
+        } = self;
 
-        match self
+        match session
             .scheduler
             .send(Register {
-                flow_id: self.flow_id,
+                flow_id: session.flow_id,
                 queue_addr: queue_tx.clone(),
                 backend_write: backend_write.clone(),
             })
             .await
         {
-            Ok(Ok(())) => Ok(true),
+            Ok(Ok(())) => Ok(ControlFlow::Continue(RegisteredSession {
+                session,
+                queue_tx,
+                backend_read,
+            })),
             Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
                 queue_tx.do_send(Close);
                 warn!(
                     "flow{}: registration rejected - max connections ({}) reached",
-                    self.flow_id.0, max
+                    session.flow_id.0, max
                 );
-                let response = b"HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                self.client_write.write_all(response).await?;
-                Ok(false)
+                session
+                    .client_write
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                    .await?;
+                Ok(ControlFlow::Break(()))
             }
             Err(e) => {
                 queue_tx.do_send(Close);
                 error!(
                     "flow{}: failed to register with scheduler: {}",
-                    self.flow_id.0, e
+                    session.flow_id.0, e
                 );
                 Err(anyhow!("Scheduler registration failed"))
             }
         }
     }
+}
 
-    async fn finalize(mut self) -> Result<()> {
-        let queue_tx = self
-            .queue_tx
-            .take()
-            .expect("queue must be initialized before finalization");
-        let scheduler = self.scheduler.clone();
+impl RegisteredSession {
+    async fn finalize(self) -> Result<()> {
+        let RegisteredSession {
+            session,
+            queue_tx,
+            backend_read,
+        } = self;
 
-        if let Err(e) = send_connect_response(&mut self.client_write).await {
+        let ConnectSession {
+            flow_id,
+            scheduler,
+            client_reader,
+            mut client_write,
+            ..
+        } = session;
+
+        if let Err(e) = send_connect_response(&mut client_write).await {
             queue_tx.do_send(Close);
-            if let Err(err) = scheduler
-                .send(Unregister {
-                    flow_id: self.flow_id,
-                })
-                .await
-            {
+            if let Err(err) = scheduler.send(Unregister { flow_id }).await {
                 warn!(
                     "flow{}: failed to unregister after handshake error: {}",
-                    self.flow_id.0, err
+                    flow_id.0, err
                 );
             }
             return Err(e);
         }
 
-        let client_read = self.client_reader.into_inner();
-        let backend_read = self
-            .backend_read
-            .take()
-            .expect("backend must be initialized before finalization");
-        let client_write = self.client_write;
+        let client_read = client_reader.into_inner();
 
-        ClientToBackendActor::new(
-            self.flow_id,
-            client_read,
-            queue_tx.clone(),
-            scheduler.clone(),
-        )
-        .start();
-        BackendToClientActor::new(self.flow_id, backend_read, client_write).start();
+        ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler.clone())
+            .start();
+        BackendToClientActor::new(flow_id, backend_read, client_write).start();
 
         Ok(())
     }
@@ -216,24 +242,161 @@ pub(crate) async fn handle_connect_proxy(
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
 ) -> Result<(), anyhow::Error> {
-    let mut session = ConnectSession::new(client_stream, flow_id, client_addr, scheduler);
+    let session = ConnectSession::new(client_stream, flow_id, client_addr, scheduler);
 
-    let Some((target_host, target_port)) = session.validate_request().await? else {
-        return Ok(());
+    let validated = match session.validate_request().await? {
+        ControlFlow::Continue(validated) => validated,
+        ControlFlow::Break(()) => return Ok(()),
     };
 
-    let Some(backend_stream) = session
-        .establish_backend_connection(&target_host, target_port)
-        .await?
-    else {
-        return Ok(());
+    let backend_connected = match validated.establish_backend_connection().await? {
+        ControlFlow::Continue(connected) => connected,
+        ControlFlow::Break(()) => return Ok(()),
     };
 
-    session.initialize_backend(backend_stream);
+    let registered = match backend_connected.register_flow().await? {
+        ControlFlow::Continue(registered) => registered,
+        ControlFlow::Break(()) => return Ok(()),
+    };
 
-    if !session.register_flow().await? {
-        return Ok(());
+    registered.finalize().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::make_backend_write;
+    use std::{future::Future, time::Duration};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn read_response(mut stream: TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        buf
     }
 
-    session.finalize().await
+    async fn drive_proxy(
+        listener: TcpListener,
+        scheduler: Addr<Scheduler>,
+        client_task: impl Future<Output = Vec<u8>>,
+    ) -> Vec<u8> {
+        let server = async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connect_proxy(stream, peer, FlowId(1), scheduler)
+                .await
+                .unwrap();
+        };
+
+        let ((), response) = tokio::join!(server, client_task);
+        response
+    }
+
+    #[actix_rt::test]
+    async fn returns_405_for_non_connect_method() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_505_for_unsupported_http_version() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"CONNECT example.com:443 HTTP/2\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_502_when_backend_connection_fails() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Choose an ephemeral port to ensure the outbound CONNECT attempt fails quickly.
+        // The listener is dropped immediately after capturing the port, making the port unreachable.
+        let unreachable_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: example\r\n\r\n",
+                unreachable_port
+            );
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_503_when_scheduler_is_at_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(1)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(42),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        let backend_accept = tokio::spawn(async move {
+            let (_stream, _) = backend_listener.accept().await.unwrap();
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let request = format!("CONNECT {} HTTP/1.1\r\nHost: example\r\n\r\n", backend_addr);
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        backend_accept.await.unwrap();
+    }
 }
