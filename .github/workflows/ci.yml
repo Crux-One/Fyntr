@@ -35,13 +35,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: cargo +stable fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features --locked
+        run: cargo +stable test --all-features --locked
 
       - name: Tests with ASan
         env:
