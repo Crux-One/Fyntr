@@ -28,6 +28,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
       - name: Cache cargo directories
         uses: Swatinem/rust-cache@v2
 
@@ -39,3 +42,10 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features --locked
+
+      - name: Tests with ASan
+        env:
+          RUSTFLAGS: -Z sanitizer=address
+          RUSTDOCFLAGS: -Z sanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: cargo +nightly test --all-features --locked
