@@ -266,7 +266,7 @@ pub(crate) async fn handle_connect_proxy(
 mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
-    use std::{future::Future, net::SocketAddr, time::Duration};
+    use std::{future::Future, time::Duration};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -338,6 +338,8 @@ mod tests {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Choose an ephemeral port to ensure the outbound CONNECT attempt fails quickly.
+        // The listener is dropped immediately after capturing the port, making the port unreachable.
         let unreachable_port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
