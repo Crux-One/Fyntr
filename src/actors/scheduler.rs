@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -13,7 +13,7 @@ use log::{debug, info, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::queue::{AddQuantum, Dequeue, DequeueResult, QueueActor},
+    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
     flow::FlowId,
     util::{format_bytes, format_rate},
 };
@@ -29,6 +29,12 @@ pub(crate) struct Register {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
+    pub flow_id: FlowId,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct FlowReady {
     pub flow_id: FlowId,
 }
 
@@ -111,9 +117,10 @@ impl FlowEntry {
 
 pub(crate) struct Scheduler {
     flows: Vec<FlowEntry>,
+    ready_queue: VecDeque<FlowId>,
+    ready_set: HashSet<FlowId>,
     quantum: usize,
     tick: Duration,
-    rr_index: usize,
     total_bytes_sent: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
@@ -153,9 +160,10 @@ impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
             flows: vec![],
+            ready_queue: VecDeque::new(),
+            ready_set: HashSet::new(),
             quantum,
             tick,
-            rr_index: 0,
             total_bytes_sent: 0,
             global_start_time: None,
             total_ticks: 0,
@@ -241,25 +249,49 @@ impl Scheduler {
     fn flow_mut(&mut self, id: FlowId) -> Option<&mut FlowEntry> {
         self.flows.iter_mut().find(|flow| flow.id() == id)
     }
+
+    fn flow(&self, id: FlowId) -> Option<&FlowEntry> {
+        self.flows.iter().find(|flow| flow.id() == id)
+    }
+
+    fn mark_flow_ready(&mut self, id: FlowId) {
+        if self.ready_set.insert(id) {
+            self.ready_queue.push_back(id);
+        }
+    }
+
+    fn remove_flow_from_ready(&mut self, id: FlowId) {
+        if self.ready_set.remove(&id) {
+            self.ready_queue.retain(|flow_id| *flow_id != id);
+        }
+    }
 }
 
 // Handler for Register
 impl Handler<Register> for Scheduler {
     type Result = Result<(), RegisterError>;
 
-    fn handle(&mut self, msg: Register, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: Register, ctx: &mut Self::Context) -> Self::Result {
         self.try_increment_connection_count()?;
-        self.register(msg.flow_id, msg.queue_addr, msg.backend_write);
+        let flow_id = msg.flow_id;
+        let queue_addr = msg.queue_addr;
+        let backend_write = msg.backend_write;
+
+        self.register(flow_id, queue_addr.clone(), backend_write);
+        queue_addr.do_send(BindScheduler {
+            flow_id,
+            scheduler: ctx.address(),
+        });
         match self.max_connections {
             Some(limit) => info!(
                 "flow{}: registered to scheduler (connections: {}/{})",
-                msg.flow_id.0,
+                flow_id.0,
                 self.current_connection_count(),
                 limit
             ),
             None => info!(
                 "flow{}: registered to scheduler (connections: {})",
-                msg.flow_id.0,
+                flow_id.0,
                 self.current_connection_count()
             ),
         };
@@ -274,6 +306,7 @@ impl Handler<Unregister> for Scheduler {
 
     fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
         if self.unregister(msg.flow_id) {
+            self.remove_flow_from_ready(msg.flow_id);
             self.decrement_connection_count();
             match self.max_connections {
                 Some(limit) => info!(
@@ -297,6 +330,16 @@ impl Handler<Unregister> for Scheduler {
     }
 }
 
+impl Handler<FlowReady> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
+        if self.flow(msg.flow_id).is_some() {
+            self.mark_flow_ready(msg.flow_id);
+        }
+    }
+}
+
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
         for flow in &self.flows {
@@ -305,26 +348,22 @@ impl Scheduler {
     }
 
     fn round_robin_once(&mut self, ctx: &mut <Self as Actor>::Context) {
-        if self.flows.is_empty() {
-            return;
-        }
+        let ready_count = self.ready_queue.len();
+        for _ in 0..ready_count {
+            let Some(flow) = self.ready_queue.pop_front() else {
+                break;
+            };
 
-        let n = self.flows.len();
-        let start = self.rr_index;
+            let maybe_target = self
+                .flow(flow)
+                .map(|entry| (entry.queue_addr(), entry.backend_write()));
 
-        for step in 0..n {
-            let idx = (start + step) % n;
-            let flow = self.flows[idx].id();
-            let queue_addr = self.flows[idx].queue_addr();
-            let backend_write = self.flows[idx].backend_write();
-
-            self.request_dequeue(flow, queue_addr, backend_write, ctx);
-        }
-
-        if !self.flows.is_empty() {
-            self.rr_index = (start + 1) % self.flows.len();
-        } else {
-            self.rr_index = 0;
+            if let Some((queue_addr, backend_write)) = maybe_target {
+                self.ready_set.remove(&flow);
+                self.request_dequeue(flow, queue_addr, backend_write, ctx);
+            } else {
+                self.ready_set.remove(&flow);
+            }
         }
     }
 
@@ -374,11 +413,14 @@ impl Scheduler {
         let packet_len = result.packet.len();
         self.update_flow_stats(flow, packet_len);
         self.update_global_stats(packet_len);
+        if result.ready_for_more {
+            self.mark_flow_ready(flow);
+        }
         self.spawn_backend_write(flow, backend_write, result.packet);
     }
 
-    fn handle_empty_dequeue(&self, _flow: FlowId) {
-        // The queue is empty; no data to dequeue for this flow at this tick.
+    fn handle_empty_dequeue(&mut self, flow: FlowId) {
+        self.remove_flow_from_ready(flow);
     }
 
     fn handle_dequeue_error(
@@ -388,6 +430,7 @@ impl Scheduler {
         ctx: &mut <Self as Actor>::Context,
     ) {
         warn!("flow{}: dequeue response error: {}", flow.0, error);
+        self.remove_flow_from_ready(flow);
         ctx.address().do_send(Unregister { flow_id: flow });
     }
 
@@ -426,12 +469,8 @@ impl Scheduler {
         let before = self.flows.len();
 
         self.flows.retain(|flow| !to_remove.contains(&flow.id()));
-
-        if self.flows.is_empty() {
-            self.rr_index = 0;
-        } else {
-            self.rr_index %= self.flows.len();
-        }
+        self.ready_queue.retain(|flow| !to_remove.contains(flow));
+        self.ready_set.retain(|flow| !to_remove.contains(flow));
 
         before.saturating_sub(self.flows.len())
     }
@@ -465,7 +504,7 @@ impl Scheduler {
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
-    pub rr_index: usize,
+    pub ready_queue_len: usize,
     pub flow_ids: Vec<FlowId>,
 }
 
@@ -481,7 +520,7 @@ impl Handler<InspectState> for Scheduler {
     fn handle(&mut self, _msg: InspectState, _ctx: &mut Context<Self>) -> Self::Result {
         MessageResult(InspectReply {
             connections: self.current_connection_count(),
-            rr_index: self.rr_index,
+            ready_queue_len: self.ready_queue.len(),
             flow_ids: self.flows.iter().map(|flow| flow.id()).collect(),
         })
     }
@@ -568,7 +607,7 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn unregister_updates_connection_count_and_rr_index() {
+    async fn unregister_updates_connection_count_and_ready_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(5)
             .start();
@@ -599,8 +638,8 @@ mod tests {
 
         assert_eq!(reply.connections, 2, "connection count should decrement");
         assert_eq!(
-            reply.rr_index, 0,
-            "rr_index should wrap within remaining flows"
+            reply.ready_queue_len, 0,
+            "ready queue should be empty without pending notifications"
         );
         assert_eq!(
             reply.flow_ids,
