@@ -54,9 +54,10 @@ impl QueueState {
             if front.len() <= self.deficit && front.len() <= max_bytes {
                 let pkt = self.buf.pop_front().unwrap();
                 self.deficit -= pkt.len();
-                let ready_for_more = self.buf.front().map_or(false, |next| {
-                    next.len() <= self.deficit && next.len() <= max_bytes
-                });
+                let ready_for_more = self
+                    .buf
+                    .front()
+                    .is_some_and(|next| next.len() <= self.deficit && next.len() <= max_bytes);
                 Some(DequeueResult {
                     packet: pkt,
                     remaining: self.buf.len(),
@@ -74,9 +75,9 @@ impl QueueState {
     }
 
     fn has_ready_packet(&self, max_bytes: usize) -> bool {
-        self.buf.front().map_or(false, |front| {
-            front.len() <= self.deficit && front.len() <= max_bytes
-        })
+        self.buf
+            .front()
+            .is_some_and(|front| front.len() <= self.deficit && front.len() <= max_bytes)
     }
 
     pub(crate) fn close(&mut self) -> bool {
