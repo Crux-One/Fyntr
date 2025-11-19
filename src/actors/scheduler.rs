@@ -335,6 +335,8 @@ impl Handler<FlowReady> for Scheduler {
 
     fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
         if self.flow(msg.flow_id).is_some() {
+            // FlowReady notifications can race, but ready_set.insert returns false for
+            // duplicates, so redundant notifications are harmless.
             self.mark_flow_ready(msg.flow_id);
         }
     }
@@ -358,10 +360,10 @@ impl Scheduler {
                 .flow(flow)
                 .map(|entry| (entry.queue_addr(), entry.backend_write()));
 
-            self.ready_set.remove(&flow);
             if let Some((queue_addr, backend_write)) = maybe_target {
                 self.request_dequeue(flow, queue_addr, backend_write, ctx);
             }
+            self.ready_set.remove(&flow);
         }
     }
 
