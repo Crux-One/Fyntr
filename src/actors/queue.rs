@@ -1,6 +1,11 @@
 use std::collections::VecDeque;
 
 use actix::prelude::*;
+
+use crate::{
+    actors::scheduler::{FlowReady, Scheduler},
+    flow::FlowId,
+};
 use bytes::Bytes;
 
 #[derive(Message)]
@@ -25,6 +30,7 @@ pub(crate) struct Close;
 pub(crate) struct DequeueResult {
     pub packet: Bytes,
     pub remaining: usize,
+    pub ready_for_more: bool,
 }
 
 #[derive(Default)]
@@ -48,9 +54,14 @@ impl QueueState {
             if front.len() <= self.deficit && front.len() <= max_bytes {
                 let pkt = self.buf.pop_front().unwrap();
                 self.deficit -= pkt.len();
+                let ready_for_more = self
+                    .buf
+                    .front()
+                    .is_some_and(|next| next.len() <= self.deficit && next.len() <= max_bytes);
                 Some(DequeueResult {
                     packet: pkt,
                     remaining: self.buf.len(),
+                    ready_for_more,
                 })
             } else {
                 None
@@ -63,6 +74,12 @@ impl QueueState {
         (dequeue_result, should_stop)
     }
 
+    fn has_ready_packet(&self, max_bytes: usize) -> bool {
+        self.buf
+            .front()
+            .is_some_and(|front| front.len() <= self.deficit && front.len() <= max_bytes)
+    }
+
     pub(crate) fn close(&mut self) -> bool {
         self.closing = true;
         self.buf.is_empty()
@@ -71,6 +88,13 @@ impl QueueState {
 
 pub(crate) struct QueueActor {
     state: QueueState,
+    notifier: Option<QueueNotifier>,
+    ready_notified: bool,
+}
+
+struct QueueNotifier {
+    flow_id: FlowId,
+    scheduler: Addr<Scheduler>,
 }
 
 impl Actor for QueueActor {
@@ -81,8 +105,42 @@ impl QueueActor {
     pub(crate) fn new() -> Self {
         Self {
             state: QueueState::default(),
+            notifier: None,
+            ready_notified: false,
         }
     }
+
+    fn bind_scheduler(&mut self, flow_id: FlowId, scheduler: Addr<Scheduler>) {
+        self.notifier = Some(QueueNotifier { flow_id, scheduler });
+        self.ready_notified = false;
+        self.maybe_notify_ready();
+    }
+
+    fn maybe_notify_ready(&mut self) {
+        if self.ready_notified {
+            return;
+        }
+
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+
+        // Scheduler currently dequeues with usize::MAX as the byte limit, so
+        // we mirror that constraint here when deciding whether to notify.
+        if self.state.has_ready_packet(usize::MAX) {
+            notifier.scheduler.do_send(FlowReady {
+                flow_id: notifier.flow_id,
+            });
+            self.ready_notified = true;
+        }
+    }
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct BindScheduler {
+    pub flow_id: FlowId,
+    pub scheduler: Addr<Scheduler>,
 }
 
 // Enqueue
@@ -91,6 +149,7 @@ impl Handler<Enqueue> for QueueActor {
 
     fn handle(&mut self, msg: Enqueue, _ctx: &mut Self::Context) -> Self::Result {
         self.state.enqueue(msg.0);
+        self.maybe_notify_ready();
     }
 }
 
@@ -100,6 +159,7 @@ impl Handler<AddQuantum> for QueueActor {
 
     fn handle(&mut self, msg: AddQuantum, _ctx: &mut Self::Context) -> Self::Result {
         self.state.add_quantum(msg.0);
+        self.maybe_notify_ready();
     }
 }
 
@@ -110,6 +170,12 @@ impl Handler<Dequeue> for QueueActor {
     fn handle(&mut self, msg: Dequeue, ctx: &mut Self::Context) -> Self::Result {
         let (dequeue_result, should_stop) = self.state.dequeue(msg.max_bytes);
 
+        if let Some(result) = &dequeue_result {
+            self.ready_notified = result.ready_for_more;
+        } else {
+            self.ready_notified = false;
+        }
+
         if should_stop {
             ctx.stop();
         }
@@ -118,6 +184,13 @@ impl Handler<Dequeue> for QueueActor {
     }
 }
 
+impl Handler<BindScheduler> for QueueActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: BindScheduler, _ctx: &mut Self::Context) -> Self::Result {
+        self.bind_scheduler(msg.flow_id, msg.scheduler);
+    }
+}
 // Close
 impl Handler<Close> for QueueActor {
     type Result = ();
