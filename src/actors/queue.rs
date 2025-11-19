@@ -54,10 +54,9 @@ impl QueueState {
             if front.len() <= self.deficit && front.len() <= max_bytes {
                 let pkt = self.buf.pop_front().unwrap();
                 self.deficit -= pkt.len();
-                let ready_for_more = self
-                    .buf
-                    .front()
-                    .map_or(false, |next| next.len() <= self.deficit && next.len() <= max_bytes);
+                let ready_for_more = self.buf.front().map_or(false, |next| {
+                    next.len() <= self.deficit && next.len() <= max_bytes
+                });
                 Some(DequeueResult {
                     packet: pkt,
                     remaining: self.buf.len(),
@@ -75,9 +74,9 @@ impl QueueState {
     }
 
     fn has_ready_packet(&self, max_bytes: usize) -> bool {
-        self.buf
-            .front()
-            .map_or(false, |front| front.len() <= self.deficit && front.len() <= max_bytes)
+        self.buf.front().map_or(false, |front| {
+            front.len() <= self.deficit && front.len() <= max_bytes
+        })
     }
 
     pub(crate) fn close(&mut self) -> bool {
@@ -125,10 +124,12 @@ impl QueueActor {
             return;
         };
 
+        // Scheduler currently dequeues with usize::MAX as the byte limit, so
+        // we mirror that constraint here when deciding whether to notify.
         if self.state.has_ready_packet(usize::MAX) {
-            notifier
-                .scheduler
-                .do_send(FlowReady { flow_id: notifier.flow_id });
+            notifier.scheduler.do_send(FlowReady {
+                flow_id: notifier.flow_id,
+            });
             self.ready_notified = true;
         }
     }

@@ -358,11 +358,9 @@ impl Scheduler {
                 .flow(flow)
                 .map(|entry| (entry.queue_addr(), entry.backend_write()));
 
+            self.ready_set.remove(&flow);
             if let Some((queue_addr, backend_write)) = maybe_target {
-                self.ready_set.remove(&flow);
                 self.request_dequeue(flow, queue_addr, backend_write, ctx);
-            } else {
-                self.ready_set.remove(&flow);
             }
         }
     }
@@ -376,6 +374,8 @@ impl Scheduler {
     ) {
         queue_addr
             .send(Dequeue {
+                // Keep the API surface for future byte caps even though we
+                // currently allow full packets (usize::MAX).
                 max_bytes: usize::MAX,
             })
             .into_actor(self)
