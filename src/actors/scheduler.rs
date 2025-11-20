@@ -458,14 +458,21 @@ impl Scheduler {
             return 0;
         }
 
+        let mut removed_ids = HashSet::new();
         let mut removed_count = 0;
+
         for &id in ids {
             if self.flows.remove(&id).is_some() {
                 removed_count += 1;
                 // Also clean up ready state
                 self.ready_set.remove(&id);
-                self.ready_queue.retain(|&flow_id| flow_id != id);
+                removed_ids.insert(id);
             }
+        }
+
+        if !removed_ids.is_empty() {
+            self.ready_queue
+                .retain(|flow_id| !removed_ids.contains(flow_id));
         }
 
         removed_count
