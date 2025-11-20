@@ -170,11 +170,9 @@ impl Handler<Dequeue> for QueueActor {
     fn handle(&mut self, msg: Dequeue, ctx: &mut Self::Context) -> Self::Result {
         let (dequeue_result, should_stop) = self.state.dequeue(msg.max_bytes);
 
-        if let Some(result) = &dequeue_result {
-            self.ready_notified = result.ready_for_more;
-        } else {
-            self.ready_notified = false;
-        }
+        self.ready_notified = dequeue_result
+            .as_ref()
+            .is_some_and(|result| result.ready_for_more);
 
         if should_stop {
             ctx.stop();
