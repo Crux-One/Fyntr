@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -78,28 +78,18 @@ impl FlowStats {
 }
 
 struct FlowEntry {
-    id: FlowId,
     queue_addr: Addr<QueueActor>,
     backend_write: Arc<Mutex<OwnedWriteHalf>>,
     stats: FlowStats,
 }
 
 impl FlowEntry {
-    fn new(
-        id: FlowId,
-        queue_addr: Addr<QueueActor>,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-    ) -> Self {
+    fn new(queue_addr: Addr<QueueActor>, backend_write: Arc<Mutex<OwnedWriteHalf>>) -> Self {
         Self {
-            id,
             queue_addr,
             backend_write,
             stats: FlowStats::new(),
         }
-    }
-
-    fn id(&self) -> FlowId {
-        self.id
     }
 
     fn queue_addr(&self) -> Addr<QueueActor> {
@@ -116,7 +106,7 @@ impl FlowEntry {
 }
 
 pub(crate) struct Scheduler {
-    flows: Vec<FlowEntry>,
+    flows: HashMap<FlowId, FlowEntry>,
     ready_queue: VecDeque<FlowId>,
     ready_set: HashSet<FlowId>,
     quantum: usize,
@@ -159,7 +149,7 @@ impl Handler<QuantumTick> for Scheduler {
 impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
-            flows: vec![],
+            flows: HashMap::new(),
             ready_queue: VecDeque::new(),
             ready_set: HashSet::new(),
             quantum,
@@ -239,7 +229,7 @@ impl Scheduler {
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
     ) {
         self.flows
-            .push(FlowEntry::new(id, queue_addr, backend_write));
+            .insert(id, FlowEntry::new(queue_addr, backend_write));
     }
 
     fn unregister(&mut self, id: FlowId) -> bool {
@@ -247,11 +237,11 @@ impl Scheduler {
     }
 
     fn flow_mut(&mut self, id: FlowId) -> Option<&mut FlowEntry> {
-        self.flows.iter_mut().find(|flow| flow.id() == id)
+        self.flows.get_mut(&id)
     }
 
     fn flow(&self, id: FlowId) -> Option<&FlowEntry> {
-        self.flows.iter().find(|flow| flow.id() == id)
+        self.flows.get(&id)
     }
 
     fn mark_flow_ready(&mut self, id: FlowId) {
@@ -344,7 +334,7 @@ impl Handler<FlowReady> for Scheduler {
 
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
-        for flow in &self.flows {
+        for flow in self.flows.values() {
             flow.queue_addr().do_send(AddQuantum(self.quantum));
         }
     }
@@ -467,14 +457,18 @@ impl Scheduler {
         if ids.is_empty() {
             return 0;
         }
-        let to_remove: HashSet<FlowId> = ids.iter().copied().collect();
-        let before = self.flows.len();
 
-        self.flows.retain(|flow| !to_remove.contains(&flow.id()));
-        self.ready_queue.retain(|flow| !to_remove.contains(flow));
-        self.ready_set.retain(|flow| !to_remove.contains(flow));
+        let mut removed_count = 0;
+        for &id in ids {
+            if self.flows.remove(&id).is_some() {
+                removed_count += 1;
+                // Also clean up ready state
+                self.ready_set.remove(&id);
+                self.ready_queue.retain(|&flow_id| flow_id != id);
+            }
+        }
 
-        before.saturating_sub(self.flows.len())
+        removed_count
     }
 
     fn log_stats(&self) {
@@ -523,7 +517,7 @@ impl Handler<InspectState> for Scheduler {
         MessageResult(InspectReply {
             connections: self.current_connection_count(),
             ready_queue_len: self.ready_queue.len(),
-            flow_ids: self.flows.iter().map(|flow| flow.id()).collect(),
+            flow_ids: self.flows.keys().copied().collect(),
         })
     }
 }
@@ -643,8 +637,10 @@ mod tests {
             reply.ready_queue_len, 0,
             "ready queue should be empty without pending notifications"
         );
+        let mut flow_ids = reply.flow_ids;
+        flow_ids.sort();
         assert_eq!(
-            reply.flow_ids,
+            flow_ids,
             vec![FlowId(1), FlowId(3)],
             "flow2 should be removed"
         );
