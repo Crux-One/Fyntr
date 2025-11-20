@@ -255,7 +255,7 @@ impl Scheduler {
     }
 
     fn mark_flow_ready(&mut self, id: FlowId) {
-        if self.ready_set.insert(id) {
+        if self.flow(id).is_some() && self.ready_set.insert(id) {
             self.ready_queue.push_back(id);
         }
     }
@@ -336,11 +336,9 @@ impl Handler<FlowReady> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
-        if self.flow(msg.flow_id).is_some() {
-            // FlowReady notifications can race; ready_set.insert filters duplicates and
-            // the flow lookup guards the case where a flow was unregistered meanwhile.
-            self.mark_flow_ready(msg.flow_id);
-        }
+        // FlowReady notifications can race; mark_flow_ready handles the existence check
+        // and ready_set.insert filters duplicates.
+        self.mark_flow_ready(msg.flow_id);
     }
 }
 
