@@ -262,6 +262,8 @@ impl Scheduler {
 
     fn remove_flow_from_ready(&mut self, id: FlowId) {
         if self.ready_set.remove(&id) {
+            // retain walks the whole queue, so this removal stays O(n) just like
+            // a manual position+remove scan would.
             self.ready_queue.retain(|flow_id| *flow_id != id);
         }
     }
@@ -335,8 +337,8 @@ impl Handler<FlowReady> for Scheduler {
 
     fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
         if self.flow(msg.flow_id).is_some() {
-            // FlowReady notifications can race, but ready_set.insert returns false for
-            // duplicates, so redundant notifications are harmless.
+            // FlowReady notifications can race; ready_set.insert filters duplicates and
+            // the flow lookup guards the case where a flow was unregistered meanwhile.
             self.mark_flow_ready(msg.flow_id);
         }
     }
@@ -376,8 +378,8 @@ impl Scheduler {
     ) {
         queue_addr
             .send(Dequeue {
-                // Keep the API surface for future byte caps even though we
-                // currently allow full packets (usize::MAX).
+                // scheduler always requests full packets today, but we keep the
+                // API field so a future byte cap can hook in without churn.
                 max_bytes: usize::MAX,
             })
             .into_actor(self)
