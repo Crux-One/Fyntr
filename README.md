@@ -26,7 +26,7 @@ Its internal scheduler relays encrypted traffic transparently without terminatin
 
 ## Quick Start
 
-1.  Install and run Fyntr:
+1. Install and run Fyntr:
 
     Install the crates.io release and run it locally (defaults to port 9999).
 
@@ -49,7 +49,7 @@ Its internal scheduler relays encrypted traffic transparently without terminatin
     FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
     ```
 
-2.  Configure Your Environment:
+2. Configure Your Environment:
 
     Export the following environment variables in a separate terminal.
 
@@ -57,7 +57,10 @@ Its internal scheduler relays encrypted traffic transparently without terminatin
     export HTTPS_PROXY=http://127.0.0.1:9999 
     ```
 
-3.  Verify It Works:
+    > [!TIP]
+    > This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more. 
+
+3. Verify It Works:
 
     You can test the connection with a simple `curl` command.
 
@@ -77,7 +80,7 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
 
 ## Usage with Terraform
 
-- Example: AWS Provider
+### Example: AWS Provider
     
     ```bash
     # Set environment variables
