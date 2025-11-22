@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -13,7 +13,7 @@ use log::{debug, info, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::queue::{AddQuantum, Dequeue, DequeueResult, QueueActor},
+    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
     flow::FlowId,
     util::{format_bytes, format_rate},
 };
@@ -29,6 +29,12 @@ pub(crate) struct Register {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
+    pub flow_id: FlowId,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct FlowReady {
     pub flow_id: FlowId,
 }
 
@@ -72,28 +78,18 @@ impl FlowStats {
 }
 
 struct FlowEntry {
-    id: FlowId,
     queue_addr: Addr<QueueActor>,
     backend_write: Arc<Mutex<OwnedWriteHalf>>,
     stats: FlowStats,
 }
 
 impl FlowEntry {
-    fn new(
-        id: FlowId,
-        queue_addr: Addr<QueueActor>,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-    ) -> Self {
+    fn new(queue_addr: Addr<QueueActor>, backend_write: Arc<Mutex<OwnedWriteHalf>>) -> Self {
         Self {
-            id,
             queue_addr,
             backend_write,
             stats: FlowStats::new(),
         }
-    }
-
-    fn id(&self) -> FlowId {
-        self.id
     }
 
     fn queue_addr(&self) -> Addr<QueueActor> {
@@ -110,10 +106,11 @@ impl FlowEntry {
 }
 
 pub(crate) struct Scheduler {
-    flows: Vec<FlowEntry>,
+    flows: HashMap<FlowId, FlowEntry>,
+    ready_queue: VecDeque<FlowId>,
+    ready_set: HashSet<FlowId>,
     quantum: usize,
     tick: Duration,
-    rr_index: usize,
     total_bytes_sent: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
@@ -152,10 +149,11 @@ impl Handler<QuantumTick> for Scheduler {
 impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
-            flows: vec![],
+            flows: HashMap::new(),
+            ready_queue: VecDeque::new(),
+            ready_set: HashSet::new(),
             quantum,
             tick,
-            rr_index: 0,
             total_bytes_sent: 0,
             global_start_time: None,
             total_ticks: 0,
@@ -231,7 +229,7 @@ impl Scheduler {
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
     ) {
         self.flows
-            .push(FlowEntry::new(id, queue_addr, backend_write));
+            .insert(id, FlowEntry::new(queue_addr, backend_write));
     }
 
     fn unregister(&mut self, id: FlowId) -> bool {
@@ -239,7 +237,25 @@ impl Scheduler {
     }
 
     fn flow_mut(&mut self, id: FlowId) -> Option<&mut FlowEntry> {
-        self.flows.iter_mut().find(|flow| flow.id() == id)
+        self.flows.get_mut(&id)
+    }
+
+    fn flow(&self, id: FlowId) -> Option<&FlowEntry> {
+        self.flows.get(&id)
+    }
+
+    fn mark_flow_ready(&mut self, id: FlowId) {
+        if self.flow(id).is_some() && self.ready_set.insert(id) {
+            self.ready_queue.push_back(id);
+        }
+    }
+
+    fn remove_flow_from_ready(&mut self, id: FlowId) {
+        if self.ready_set.remove(&id) {
+            // retain walks the whole queue, so this removal stays O(n) just like
+            // a manual position+remove scan would.
+            self.ready_queue.retain(|flow_id| *flow_id != id);
+        }
     }
 }
 
@@ -247,19 +263,27 @@ impl Scheduler {
 impl Handler<Register> for Scheduler {
     type Result = Result<(), RegisterError>;
 
-    fn handle(&mut self, msg: Register, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: Register, ctx: &mut Self::Context) -> Self::Result {
         self.try_increment_connection_count()?;
-        self.register(msg.flow_id, msg.queue_addr, msg.backend_write);
+        let flow_id = msg.flow_id;
+        let queue_addr = msg.queue_addr;
+        let backend_write = msg.backend_write;
+
+        self.register(flow_id, queue_addr.clone(), backend_write);
+        queue_addr.do_send(BindScheduler {
+            flow_id,
+            scheduler: ctx.address(),
+        });
         match self.max_connections {
             Some(limit) => info!(
                 "flow{}: registered to scheduler (connections: {}/{})",
-                msg.flow_id.0,
+                flow_id.0,
                 self.current_connection_count(),
                 limit
             ),
             None => info!(
                 "flow{}: registered to scheduler (connections: {})",
-                msg.flow_id.0,
+                flow_id.0,
                 self.current_connection_count()
             ),
         };
@@ -297,34 +321,38 @@ impl Handler<Unregister> for Scheduler {
     }
 }
 
+impl Handler<FlowReady> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
+        // FlowReady notifications can race; mark_flow_ready handles the existence check
+        // and ready_set.insert filters duplicates.
+        self.mark_flow_ready(msg.flow_id);
+    }
+}
+
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
-        for flow in &self.flows {
+        for flow in self.flows.values() {
             flow.queue_addr().do_send(AddQuantum(self.quantum));
         }
     }
 
     fn round_robin_once(&mut self, ctx: &mut <Self as Actor>::Context) {
-        if self.flows.is_empty() {
-            return;
-        }
+        let ready_count = self.ready_queue.len();
+        for _ in 0..ready_count {
+            let Some(flow) = self.ready_queue.pop_front() else {
+                break;
+            };
 
-        let n = self.flows.len();
-        let start = self.rr_index;
+            let maybe_target = self
+                .flow(flow)
+                .map(|entry| (entry.queue_addr(), entry.backend_write()));
 
-        for step in 0..n {
-            let idx = (start + step) % n;
-            let flow = self.flows[idx].id();
-            let queue_addr = self.flows[idx].queue_addr();
-            let backend_write = self.flows[idx].backend_write();
-
-            self.request_dequeue(flow, queue_addr, backend_write, ctx);
-        }
-
-        if !self.flows.is_empty() {
-            self.rr_index = (start + 1) % self.flows.len();
-        } else {
-            self.rr_index = 0;
+            if let Some((queue_addr, backend_write)) = maybe_target {
+                self.request_dequeue(flow, queue_addr, backend_write, ctx);
+            }
+            self.ready_set.remove(&flow);
         }
     }
 
@@ -337,6 +365,8 @@ impl Scheduler {
     ) {
         queue_addr
             .send(Dequeue {
+                // scheduler always requests full packets today, but we keep the
+                // API field so a future byte cap can hook in without churn.
                 max_bytes: usize::MAX,
             })
             .into_actor(self)
@@ -374,11 +404,14 @@ impl Scheduler {
         let packet_len = result.packet.len();
         self.update_flow_stats(flow, packet_len);
         self.update_global_stats(packet_len);
+        if result.ready_for_more {
+            self.mark_flow_ready(flow);
+        }
         self.spawn_backend_write(flow, backend_write, result.packet);
     }
 
-    fn handle_empty_dequeue(&self, _flow: FlowId) {
-        // The queue is empty; no data to dequeue for this flow at this tick.
+    fn handle_empty_dequeue(&mut self, flow: FlowId) {
+        self.remove_flow_from_ready(flow);
     }
 
     fn handle_dequeue_error(
@@ -388,6 +421,7 @@ impl Scheduler {
         ctx: &mut <Self as Actor>::Context,
     ) {
         warn!("flow{}: dequeue response error: {}", flow.0, error);
+        self.remove_flow_from_ready(flow);
         ctx.address().do_send(Unregister { flow_id: flow });
     }
 
@@ -422,18 +456,26 @@ impl Scheduler {
         if ids.is_empty() {
             return 0;
         }
-        let to_remove: HashSet<FlowId> = ids.iter().copied().collect();
-        let before = self.flows.len();
 
-        self.flows.retain(|flow| !to_remove.contains(&flow.id()));
+        let mut removed_count = 0;
+        let mut queue_needs_cleanup = false;
 
-        if self.flows.is_empty() {
-            self.rr_index = 0;
-        } else {
-            self.rr_index %= self.flows.len();
+        for &id in ids {
+            if self.flows.remove(&id).is_some() {
+                removed_count += 1;
+                // Also clean up ready state
+                if self.ready_set.remove(&id) {
+                    queue_needs_cleanup = true;
+                }
+            }
         }
 
-        before.saturating_sub(self.flows.len())
+        if queue_needs_cleanup {
+            self.ready_queue
+                .retain(|flow_id| self.ready_set.contains(flow_id));
+        }
+
+        removed_count
     }
 
     fn log_stats(&self) {
@@ -465,7 +507,7 @@ impl Scheduler {
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
-    pub rr_index: usize,
+    pub ready_queue_len: usize,
     pub flow_ids: Vec<FlowId>,
 }
 
@@ -481,8 +523,8 @@ impl Handler<InspectState> for Scheduler {
     fn handle(&mut self, _msg: InspectState, _ctx: &mut Context<Self>) -> Self::Result {
         MessageResult(InspectReply {
             connections: self.current_connection_count(),
-            rr_index: self.rr_index,
-            flow_ids: self.flows.iter().map(|flow| flow.id()).collect(),
+            ready_queue_len: self.ready_queue.len(),
+            flow_ids: self.flows.keys().copied().collect(),
         })
     }
 }
@@ -568,7 +610,7 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn unregister_updates_connection_count_and_rr_index() {
+    async fn unregister_updates_connection_count_and_ready_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(5)
             .start();
@@ -599,11 +641,13 @@ mod tests {
 
         assert_eq!(reply.connections, 2, "connection count should decrement");
         assert_eq!(
-            reply.rr_index, 0,
-            "rr_index should wrap within remaining flows"
+            reply.ready_queue_len, 0,
+            "ready queue should be empty without pending notifications"
         );
+        let mut flow_ids = reply.flow_ids;
+        flow_ids.sort();
         assert_eq!(
-            reply.flow_ids,
+            flow_ids,
             vec![FlowId(1), FlowId(3)],
             "flow2 should be removed"
         );

@@ -1,8 +1,8 @@
 [package]
 name = "fyntr"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-description = "A minimal forward proxy with TLS passthrough, smoothing bursty connections"
+description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
 repository = "https://github.com/Crux-One/Fyntr"
 readme = "README.md"
