@@ -298,7 +298,6 @@ impl Handler<Unregister> for Scheduler {
 
     fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
         if self.unregister(msg.flow_id) {
-            self.remove_flow_from_ready(msg.flow_id);
             self.decrement_connection_count();
             match self.max_connections {
                 Some(limit) => info!(
