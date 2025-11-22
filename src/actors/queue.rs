@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use actix::prelude::*;
+use bytes::Bytes;
 
 use crate::{
     actors::scheduler::{FlowReady, Scheduler},
     flow::FlowId,
 };
-use bytes::Bytes;
 
 #[derive(Message)]
 #[rtype(result = "()")]
