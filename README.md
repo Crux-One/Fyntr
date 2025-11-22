@@ -56,8 +56,7 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     export HTTPS_PROXY=http://127.0.0.1:9999 
     ```
 
-    > [!TIP]
-    > This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more. 
+    This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more. 
 
 3. Verify It Works:
 
@@ -81,10 +80,10 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
 
 ### Example: AWS Provider
     
-    ```bash
-    # Set environment variables
-    export HTTPS_PROXY=http://127.0.0.1:9999
+```bash
+# Set environment variables
+export HTTPS_PROXY=http://127.0.0.1:9999
 
-    # Assuming your AWS credentials are managed by aws-vault
-    aws-vault exec my-profile -- terraform apply
-    ```
+# Assuming your AWS credentials are managed by aws-vault
+aws-vault exec my-profile -- terraform apply
+```
