@@ -11,7 +11,7 @@
     Fyntr
   </h1>
   <p>
-    A minimal forward proxy.
+    A minimal forward proxy to tame bursty outbound traffic.
 
 [![GitHub license](https://img.shields.io/github/license/Crux-One/Fyntr?label=License&logo=github)](https://github.com/Crux-One/Fyntr "Click to view the repo on GitHub")
 [![Release Version](https://img.shields.io/github/v/release/Crux-One/Fyntr?include_prereleases&label=Release&logo=github)](https://github.com/Crux-One/Fyntr/releases/latest "Click to view the repo on GitHub")
@@ -19,10 +19,9 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy with TLS passthrough, engineered in Rust, designed for simplicity.
-It includes no authentication or inspection capabilities.
-It was created to make bursty network workloads more predictable and stable.
-Its internal scheduler relays encrypted traffic transparently without terminating TLS.
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic.
+It needs no config to launch and stays out of the way: no auth, no inspection, tiny footprint (~12MB on macOS).
+Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and stable.
 
 ## Quick Start
 
@@ -85,9 +84,6 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
     ```bash
     # Set environment variables
     export HTTPS_PROXY=http://127.0.0.1:9999
-
-    # Prevent proxying local/metadata endpoints
-    export NO_PROXY=localhost,127.0.0.1,169.254.169.254
 
     # Assuming your AWS credentials are managed by aws-vault
     aws-vault exec my-profile -- terraform apply
