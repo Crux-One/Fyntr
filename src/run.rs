@@ -108,7 +108,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix::MailboxError;
     use std::time::Duration;
     use tokio::time::timeout;
 
