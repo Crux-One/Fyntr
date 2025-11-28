@@ -149,10 +149,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify the scheduler has stopped by checking that sending another message fails
+        // with MailboxError::Closed, confirming the actor actually stopped rather than a timeout
         let result = scheduler.send(Shutdown).await;
         assert!(
-            result.is_err(),
-            "Scheduler should not accept messages after shutdown"
+            matches!(result, Err(MailboxError::Closed)),
+            "Scheduler should have closed its mailbox after shutdown, but got: {:?}",
+            result
         );
     }
 }
