@@ -58,22 +58,38 @@ impl std::error::Error for RegisterError {}
 #[derive(Debug)]
 struct FlowStats {
     bytes_sent: u64,
+    packets_sent: u64,
     start_time: Option<Instant>,
+    avg_packet_size_lpf: Option<f64>,
 }
 
 impl FlowStats {
     fn new() -> Self {
         Self {
             bytes_sent: 0,
+            packets_sent: 0,
             start_time: None,
+            avg_packet_size_lpf: None,
         }
     }
 
     fn update(&mut self, bytes: usize) {
         self.bytes_sent += bytes as u64;
+        self.packets_sent += 1;
         if self.start_time.is_none() {
             self.start_time = Some(Instant::now());
         }
+
+        const ALPHA: f64 = 0.2;
+        let sample = bytes as f64;
+        self.avg_packet_size_lpf = Some(match self.avg_packet_size_lpf {
+            Some(prev) => prev + ALPHA * (sample - prev),
+            None => sample,
+        });
+    }
+
+    fn avg_packet_size(&self) -> Option<usize> {
+        self.avg_packet_size_lpf.map(|avg| avg as usize)
     }
 }
 
@@ -103,13 +119,25 @@ impl FlowEntry {
     fn update_stats(&mut self, bytes: usize) {
         self.stats.update(bytes);
     }
+
+    fn recommended_quantum(&self, default_quantum: usize) -> usize {
+        const SMALL_PACKET_THRESHOLD: usize = 200;
+        const LATENCY_OPTIMIZED_QUANTUM: usize = 1500;
+        const THROUGHPUT_OPTIMIZED_QUANTUM: usize = 16 * 1024;
+
+        match self.stats.avg_packet_size() {
+            Some(avg) if avg < SMALL_PACKET_THRESHOLD => LATENCY_OPTIMIZED_QUANTUM,
+            Some(_) => THROUGHPUT_OPTIMIZED_QUANTUM,
+            None => default_quantum,
+        }
+    }
 }
 
 pub(crate) struct Scheduler {
     flows: HashMap<FlowId, FlowEntry>,
     ready_queue: VecDeque<FlowId>,
     ready_set: HashSet<FlowId>,
-    quantum: usize,
+    default_quantum: usize,
     tick: Duration,
     total_bytes_sent: u64,
     global_start_time: Option<Instant>,
@@ -152,7 +180,7 @@ impl Scheduler {
             flows: HashMap::new(),
             ready_queue: VecDeque::new(),
             ready_set: HashSet::new(),
-            quantum,
+            default_quantum: quantum,
             tick,
             total_bytes_sent: 0,
             global_start_time: None,
@@ -334,7 +362,8 @@ impl Handler<FlowReady> for Scheduler {
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
         for flow in self.flows.values() {
-            flow.queue_addr().do_send(AddQuantum(self.quantum));
+            let quantum = flow.recommended_quantum(self.default_quantum);
+            flow.queue_addr().do_send(AddQuantum(quantum));
         }
     }
 
