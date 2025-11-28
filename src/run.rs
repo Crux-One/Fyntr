@@ -120,7 +120,8 @@ mod tests {
         tokio::pin!(shutdown_future);
 
         // The shutdown_signal should NOT complete immediately - it should be waiting
-        let result = timeout(Duration::from_millis(50), shutdown_future).await;
+        // Use a longer timeout to ensure reliability across different systems
+        let result = timeout(Duration::from_millis(200), shutdown_future).await;
         assert!(
             result.is_err(),
             "shutdown_signal should not complete without receiving a signal"
@@ -129,11 +130,15 @@ mod tests {
 
     /// Tests that the scheduler correctly handles the Shutdown message
     /// by stopping itself, which is part of the graceful shutdown sequence.
+    /// This mirrors the behavior in server() when shutdown_signal completes.
     #[actix_rt::test]
-    async fn scheduler_shutdown_message_stops_scheduler() {
-        let scheduler = Scheduler::new(1024, Duration::from_millis(10)).start();
+    async fn scheduler_handles_graceful_shutdown() {
+        // Create scheduler with connection limit, similar to production configuration
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(100)
+            .start();
 
-        // Send the shutdown message
+        // Send the shutdown message (simulating what happens after shutdown_signal completes)
         let result = scheduler.send(Shutdown).await;
         assert!(
             result.is_ok(),
@@ -141,39 +146,12 @@ mod tests {
         );
 
         // Give the scheduler time to process the shutdown
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify the scheduler has stopped by checking that sending another message fails
         let result = scheduler.send(Shutdown).await;
         assert!(
             result.is_err(),
-            "Scheduler should be stopped after receiving Shutdown message"
-        );
-    }
-
-    /// Tests the complete graceful shutdown integration by simulating what happens
-    /// when a shutdown is triggered - the scheduler receives the Shutdown message
-    /// and stops processing. This mirrors the behavior in server() when shutdown_signal completes.
-    #[actix_rt::test]
-    async fn graceful_shutdown_sequence_stops_scheduler() {
-        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(100)
-            .start();
-
-        // Simulate what happens after shutdown_signal completes in the server function
-        // The server sends Shutdown to the scheduler
-        let shutdown_result = scheduler.send(Shutdown).await;
-        assert!(
-            shutdown_result.is_ok(),
-            "Scheduler should accept Shutdown message during graceful shutdown"
-        );
-
-        // After shutdown, the scheduler should have stopped and not accept new messages
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let post_shutdown_result = scheduler.send(Shutdown).await;
-        assert!(
-            post_shutdown_result.is_err(),
             "Scheduler should not accept messages after shutdown"
         );
     }
