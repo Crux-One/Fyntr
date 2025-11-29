@@ -671,12 +671,8 @@ impl Handler<InspectState> for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_backend_write;
-    use tokio::{
-        io::AsyncReadExt,
-        net::{TcpListener, TcpStream, tcp::OwnedReadHalf},
-        sync::oneshot,
-    };
+    use crate::test_utils::{make_backend_halves, make_backend_write};
+    use tokio::{io::AsyncReadExt, sync::oneshot};
 
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
@@ -841,23 +837,6 @@ mod tests {
         assert_eq!(count, 1, "unregister should decrement count");
     }
 
-    async fn make_backend_pair() -> (Arc<Mutex<OwnedWriteHalf>>, OwnedReadHalf) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let accept_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            stream
-        });
-
-        let client = TcpStream::connect(addr).await.unwrap();
-        let server = accept_handle.await.unwrap();
-        drop(client);
-
-        let (read_half, write_half) = server.into_split();
-        (Arc::new(Mutex::new(write_half)), read_half)
-    }
-
     #[actix_rt::test]
     async fn shutdown_active_flows_cleans_up_state() {
         let mut scheduler = Scheduler::new(1024, Duration::from_millis(10));
@@ -865,7 +844,8 @@ mod tests {
 
         let flow_id = FlowId(99);
         let queue = QueueActor::new().start();
-        let (backend_write, mut backend_read) = make_backend_pair().await;
+        let (mut backend_read, backend_write_half) = make_backend_halves().await;
+        let backend_write = Arc::new(Mutex::new(backend_write_half));
 
         scheduler.register(flow_id, queue.clone(), backend_write.clone());
         scheduler.ready_queue.push_back(flow_id);

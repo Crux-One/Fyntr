@@ -176,11 +176,12 @@ async fn wait_for_scheduler_shutdown(scheduler: &Addr<Scheduler>) {
     )
     .await;
 
-    if status == SchedulerStopStatus::TimedOut {
-        warn!(
+    match status {
+        SchedulerStopStatus::Stopped => info!("Scheduler terminated cleanly"),
+        SchedulerStopStatus::TimedOut => warn!(
             "Scheduler did not stop within {}ms; runtime may continue running",
             SCHEDULER_STOP_TIMEOUT_MS
-        );
+        ),
     }
 }
 
