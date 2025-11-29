@@ -781,6 +781,35 @@ mod tests {
         );
     }
 
+    #[actix_rt::test]
+    async fn test_quantum_adapts_with_filtered_average() {
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let default_quantum = 4096;
+
+        let mut flow = FlowEntry::new(queue, backend_write);
+
+        // Initial tiny packets force the minimum quantum.
+        flow.update_stats(100);
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            1500,
+            "Small packets should produce MIN_QUANTUM"
+        );
+
+        // Sustained large packets should cause the EMA to rise, eventually yielding
+        // the maximum quantum due to clamping.
+        for _ in 0..25 {
+            flow.update_stats(2000);
+        }
+
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            16384,
+            "EMA should adapt and drive the quantum to MAX_QUANTUM after sustained large packets"
+        );
+    }
+
     #[test]
     fn test_flow_stats_ema() {
         let mut stats = FlowStats::new();
