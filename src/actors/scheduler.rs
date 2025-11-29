@@ -736,4 +736,84 @@ mod tests {
             "flow2 should be removed"
         );
     }
+
+    #[actix_rt::test]
+    async fn test_recommended_quantum_selection() {
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let default_quantum = 8192;
+
+        // Case 1: No stats -> default_quantum
+        let flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            default_quantum,
+            "Should return default quantum when no stats available"
+        );
+
+        // Case 2: Small packets (< 200 bytes) -> MIN_QUANTUM (1500)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(100); // Set avg to 100
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            1500,
+            "Should return MIN_QUANTUM for small packets"
+        );
+
+        // Case 3: Normal packets -> Scaled (avg * 10)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(500); // Set avg to 500
+        // Target = 500 * 10 = 5000
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            5000,
+            "Should scale quantum for normal packets"
+        );
+
+        // Case 4: Large packets -> MAX_QUANTUM (16384)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(2000); // Set avg to 2000
+        // Target = 2000 * 10 = 20000 -> Clamped to 16384
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            16384,
+            "Should clamp to MAX_QUANTUM for large packets"
+        );
+    }
+
+    #[test]
+    fn test_flow_stats_ema() {
+        let mut stats = FlowStats::new();
+
+        // Initial state
+        assert!(stats.avg_packet_size().is_none());
+
+        // First packet: initializes average
+        stats.update(1000);
+        assert_eq!(stats.avg_packet_size(), Some(1000));
+
+        // Second packet: 2000 bytes
+        // ALPHA = 0.2
+        // avg = 1000 + 0.2 * (2000 - 1000) = 1000 + 200 = 1200
+        stats.update(2000);
+        assert_eq!(stats.avg_packet_size(), Some(1200));
+
+        // Third packet: 500 bytes
+        // avg = 1200 + 0.2 * (500 - 1200) = 1200 + 0.2 * (-700) = 1200 - 140 = 1060
+        stats.update(500);
+        assert_eq!(stats.avg_packet_size(), Some(1060));
+
+        // Convergence test: constant stream of 2000 bytes
+        // It should approach 2000.
+        for _ in 0..50 {
+            stats.update(2000);
+        }
+        // After many updates, it should be very close to 2000.
+        let avg = stats.avg_packet_size().unwrap();
+        assert!(
+            (1900..2000).contains(&avg),
+            "Average should converge to 2000, got {}",
+            avg
+        );
+    }
 }
