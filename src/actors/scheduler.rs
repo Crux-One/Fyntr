@@ -122,34 +122,43 @@ impl FlowEntry {
 
     /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet statistics.
     ///
-    /// This method dynamically adapts the quantum to balance the trade-off between **low latency**
-    /// and **high throughput** depending on the flow's characteristics.
+    /// This method dynamically adapts the quantum to balance the trade-off between low latency
+    /// and high throughput depending on the flow's characteristics.
+    ///
+    /// # Parameters
+    /// * `default_quantum` - The fallback quantum size when no packet statistics are available.
+    ///
+    /// # Returns
+    /// The recommended quantum size in bytes, clamped between `MIN_QUANTUM` and `MAX_QUANTUM`.
     ///
     /// # Strategy
     ///
-    /// 1. **Interactive Flows (Low Latency):** If the average packet size is small (< 200 bytes, e.g., VoIP, SSH, ACKs),
+    /// 1. If no packet statistics are available yet, return `default_quantum`.
+    /// 2. Interactive Flows (Low Latency): If the average packet size is small (< 200 bytes, e.g., VoIP, SSH, ACKs),
     ///    we use `MIN_QUANTUM`. This forces the scheduler to cycle through flows frequently, reducing jitter.
-    /// 2. **Bulk Flows (High Throughput):** For larger packets, we scale the quantum to allow a burst of
-    ///    `TARGET_BURST_PACKETS` per turn. This amortizes the cost of context switching and scheduling
-    ///    decisions (improving CPU cache locality).
+    /// 3. Bulk Flows (High Throughput): For larger packets, we scale the quantum to allow a burst of
+    ///    `TARGET_BURST_PACKETS` per turn. This amortizes the cost of context switching and scheduling decisions.
     ///
     /// # Constants Rationale
     ///
     /// * `MIN_QUANTUM (1500 bytes)`: Corresponds to the standard Ethernet MTU. This ensures that even
-    ///   latency-sensitive flows can send at least one full-sized packet per turn without waiting for deficit accumulation.
+    ///   latency-sensitive flows can send at least one standard MTU-sized packet per turn without waiting for deficit accumulation.
     /// * `MAX_QUANTUM (16 KiB)`: A cap to prevent any single flow from hogging the bandwidth for too long,
     ///   ensuring fairness among active flows.
-    /// * `TARGET_BURST_PACKETS (10)`: Empirical value. Processing ~10 packets in a batch balances throughput
-    ///   efficiency against latency.
-    /// * `SMALL_PACKET_THRESHOLD (200 bytes)`: A heuristic threshold to identify interactive or control traffic.
+    /// * `TARGET_BURST_PACKETS (10)`: Empirical value based on typical network workloads. Processing ~10 packets per turn
+    ///   amortizes scheduling overhead while keeping latency low for interactive flows.
+    /// * `SMALL_PACKET_THRESHOLD (200 bytes)`: A heuristic threshold to distinguish interactive traffic. Below this,
+    ///   packets are likely control messages (e.g., TCP ACKs ~64 bytes) or small data packets (e.g., VoIP, SSH).
+    ///
+    /// # Examples
+    ///
+    /// - For a flow with average packet size of 1500 bytes (MTU), quantum = 1500 * 10 = 15000 bytes (no clamping needed as it's below MAX_QUANTUM).
+    /// - For larger packets (avg 2000 bytes), quantum = 2000 * 10 = 20000 bytes, clamped to MAX_QUANTUM (16384 bytes).
+    /// - For small packets (avg 100 bytes), quantum = MIN_QUANTUM (1500 bytes) to ensure frequent scheduling.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        // Standard Ethernet MTU. Essential to avoid Head-of-Line blocking for standard packets.
         const MIN_QUANTUM: usize = 1_500;
-        // Approx 11 MTUs. Upper limit to guarantee fair scheduling latency for other flows.
         const MAX_QUANTUM: usize = 16 * 1024;
-        // Aim to allow ~10 packets per turn for throughput optimization (amortization of overhead).
         const TARGET_BURST_PACKETS: usize = 10;
-        // Heuristic threshold for "interactive" traffic (e.g., SSH, DNS, TCP ACKs).
         const SMALL_PACKET_THRESHOLD: usize = 200;
 
         match self.stats.avg_packet_size() {
