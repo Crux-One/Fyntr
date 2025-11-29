@@ -26,6 +26,8 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FLOW_DRAIN_TIMEOUT_MS: u64 = 30_000; // 30s
 // Interval for polling the scheduler's active-flow count while draining.
 const FLOW_DRAIN_POLL_MS: u64 = 100; // 100ms
+// Interval for checking whether the scheduler actor has terminated.
+const SCHEDULER_STOP_POLL_MS: u64 = 50; // 50ms
 // How long to wait for the Scheduler actor to terminate after sending Shutdown
 // before we assume the runtime is stuck and continue teardown.
 const SCHEDULER_STOP_TIMEOUT_MS: u64 = 5_000; // 5s
@@ -152,7 +154,7 @@ async fn wait_for_scheduler_shutdown(scheduler: &Addr<Scheduler>) {
             break;
         }
 
-        sleep(Duration::from_millis(FLOW_DRAIN_POLL_MS)).await;
+        sleep(Duration::from_millis(SCHEDULER_STOP_POLL_MS)).await;
     }
 }
 
