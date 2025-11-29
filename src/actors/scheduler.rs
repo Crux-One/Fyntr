@@ -811,7 +811,7 @@ mod tests {
         // After many updates, it should be very close to 2000.
         let avg = stats.avg_packet_size().unwrap();
         assert!(
-            (1900..2000).contains(&avg),
+            (1900..=2000).contains(&avg),
             "Average should converge to 2000, got {}",
             avg
         );
