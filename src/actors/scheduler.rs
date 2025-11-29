@@ -10,12 +10,7 @@ use std::{
 
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
-use tokio::{
-    io::AsyncWriteExt,
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::Mutex,
-    time::Instant,
-};
+use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
     actors::queue::{AddQuantum, BindScheduler, Close, Dequeue, DequeueResult, QueueActor},
@@ -679,7 +674,7 @@ mod tests {
     use crate::test_utils::make_backend_write;
     use tokio::{
         io::AsyncReadExt,
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, tcp::OwnedReadHalf},
         sync::oneshot,
     };
 

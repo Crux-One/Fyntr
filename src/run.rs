@@ -1,4 +1,6 @@
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -116,53 +118,103 @@ async fn shutdown_signal() {
 }
 
 async fn wait_for_active_flows(scheduler: &Addr<Scheduler>) {
+    let result = wait_for_active_flows_inner(
+        || Box::pin(scheduler.send(ConnectionCount)),
+        Duration::from_millis(FLOW_DRAIN_TIMEOUT_MS),
+        Duration::from_millis(FLOW_DRAIN_POLL_MS),
+    )
+    .await;
+
+    match result {
+        FlowDrainStatus::Drained => info!("All active flows drained"),
+        FlowDrainStatus::TimedOut(remaining) => warn!(
+            "Graceful drain timed out with {} active flows; proceeding with shutdown",
+            remaining
+        ),
+        FlowDrainStatus::QueryFailed => warn!("Unable to query scheduler for active flows"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FlowDrainStatus {
+    Drained,
+    TimedOut(usize),
+    QueryFailed,
+}
+
+async fn wait_for_active_flows_inner<F>(
+    mut query_active_flows: F,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> FlowDrainStatus
+where
+    F: FnMut() -> ActiveFlowQueryFuture,
+{
     let start = Instant::now();
 
     loop {
-        match scheduler.send(ConnectionCount).await {
-            Ok(0) => {
-                info!("All active flows drained");
-                break;
-            }
+        match query_active_flows().await {
+            Ok(0) => return FlowDrainStatus::Drained,
             Ok(count) => {
-                if start.elapsed() >= Duration::from_millis(FLOW_DRAIN_TIMEOUT_MS) {
-                    warn!(
-                        "Graceful drain timed out with {} active flows; proceeding with shutdown",
-                        count
-                    );
-                    break;
+                if start.elapsed() >= timeout {
+                    return FlowDrainStatus::TimedOut(count);
                 }
-                sleep(Duration::from_millis(FLOW_DRAIN_POLL_MS)).await;
+                sleep(poll_interval).await;
             }
-            Err(err) => {
-                warn!("Unable to query scheduler for active flows: {}", err);
-                break;
-            }
+            Err(_) => return FlowDrainStatus::QueryFailed,
         }
     }
 }
 
+type ActiveFlowQueryFuture = Pin<Box<dyn Future<Output = Result<usize, MailboxError>> + Send>>;
+
 async fn wait_for_scheduler_shutdown(scheduler: &Addr<Scheduler>) {
+    let status = wait_for_scheduler_shutdown_inner(
+        || scheduler.connected(),
+        Duration::from_millis(SCHEDULER_STOP_TIMEOUT_MS),
+        Duration::from_millis(SCHEDULER_STOP_POLL_MS),
+    )
+    .await;
+
+    if status == SchedulerStopStatus::TimedOut {
+        warn!(
+            "Scheduler did not stop within {}ms; runtime may continue running",
+            SCHEDULER_STOP_TIMEOUT_MS
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SchedulerStopStatus {
+    Stopped,
+    TimedOut,
+}
+
+async fn wait_for_scheduler_shutdown_inner<F>(
+    mut is_connected: F,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> SchedulerStopStatus
+where
+    F: FnMut() -> bool,
+{
     let start = Instant::now();
 
-    while scheduler.connected() {
-        if start.elapsed() >= Duration::from_millis(SCHEDULER_STOP_TIMEOUT_MS) {
-            warn!(
-                "Scheduler did not stop within {}ms; runtime may continue running",
-                SCHEDULER_STOP_TIMEOUT_MS
-            );
-            break;
+    while is_connected() {
+        if start.elapsed() >= timeout {
+            return SchedulerStopStatus::TimedOut;
         }
-
-        sleep(Duration::from_millis(SCHEDULER_STOP_POLL_MS)).await;
+        sleep(poll_interval).await;
     }
+
+    SchedulerStopStatus::Stopped
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use actix::MailboxError;
-    use std::time::Duration;
+    use std::{collections::VecDeque, sync::Mutex, time::Duration};
     use tokio::time::timeout;
 
     /// Tests that the shutdown_signal function is properly configured to listen
@@ -210,5 +262,83 @@ mod tests {
             "Scheduler should have closed its mailbox after shutdown, but got: {:?}",
             result
         );
+    }
+
+    fn sequence_responder(
+        responses: Vec<Result<usize, MailboxError>>,
+    ) -> impl FnMut() -> ActiveFlowQueryFuture {
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        move || {
+            let queue = Arc::clone(&queue);
+            Box::pin(async move {
+                let mut guard = queue.lock().unwrap();
+                guard.pop_front().unwrap_or(Ok(0))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_flows_inner_completes_when_count_hits_zero() {
+        let responder = sequence_responder(vec![Ok(2), Ok(1), Ok(0)]);
+        let result = wait_for_active_flows_inner(
+            responder,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, FlowDrainStatus::Drained);
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_flows_inner_times_out() {
+        let responder = sequence_responder(vec![Ok(3); 10]);
+        let result = wait_for_active_flows_inner(
+            responder,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, FlowDrainStatus::TimedOut(3));
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_flows_inner_handles_query_errors() {
+        let responder = sequence_responder(vec![Err(MailboxError::Closed)]);
+        let result = wait_for_active_flows_inner(
+            responder,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, FlowDrainStatus::QueryFailed);
+    }
+
+    #[tokio::test]
+    async fn wait_for_scheduler_shutdown_inner_detects_stop() {
+        let states = Arc::new(Mutex::new(VecDeque::from(vec![true, true, false])));
+        let result = wait_for_scheduler_shutdown_inner(
+            {
+                let states = Arc::clone(&states);
+                move || {
+                    let mut guard = states.lock().unwrap();
+                    guard.pop_front().unwrap_or(false)
+                }
+            },
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, SchedulerStopStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn wait_for_scheduler_shutdown_inner_times_out() {
+        let result = wait_for_scheduler_shutdown_inner(
+            || true,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, SchedulerStopStatus::TimedOut);
     }
 }
