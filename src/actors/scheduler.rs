@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fmt,
+    fmt, mem,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +13,7 @@ use log::{debug, info, trace, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
+    actors::queue::{AddQuantum, BindScheduler, Close, Dequeue, DequeueResult, QueueActor},
     flow::FlowId,
     util::{format_bytes, format_rate},
 };
@@ -41,6 +41,10 @@ pub(crate) struct FlowReady {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Shutdown;
+
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub(crate) struct ConnectionCount;
 
 #[derive(Debug)]
 pub(crate) enum RegisterError {
@@ -236,8 +240,20 @@ impl Handler<Shutdown> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, _msg: Shutdown, ctx: &mut Self::Context) -> Self::Result {
-        info!("scheduler: received shutdown signal, stopping");
+        info!(
+            "scheduler: received shutdown signal, closing {} active flows",
+            self.flows.len()
+        );
+        self.shutdown_active_flows();
         ctx.stop();
+    }
+}
+
+impl Handler<ConnectionCount> for Scheduler {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConnectionCount, _ctx: &mut Self::Context) -> Self::Result {
+        self.current_connection_count()
     }
 }
 
@@ -549,6 +565,15 @@ impl Scheduler {
         });
     }
 
+    fn spawn_backend_shutdown(&self, flow: FlowId, backend_write: Arc<Mutex<OwnedWriteHalf>>) {
+        actix::spawn(async move {
+            let mut bw = backend_write.lock().await;
+            if let Err(err) = bw.shutdown().await {
+                warn!("flow{}: backend shutdown error: {}", flow.0, err);
+            }
+        });
+    }
+
     fn remove_flows(&mut self, ids: &[FlowId]) -> usize {
         if ids.is_empty() {
             return 0;
@@ -573,6 +598,23 @@ impl Scheduler {
         }
 
         removed_count
+    }
+
+    fn shutdown_active_flows(&mut self) {
+        if self.flows.is_empty() {
+            return;
+        }
+
+        let flows = mem::take(&mut self.flows);
+
+        for (flow_id, entry) in flows {
+            entry.queue_addr().do_send(Close);
+            self.spawn_backend_shutdown(flow_id, entry.backend_write());
+        }
+
+        self.ready_queue.clear();
+        self.ready_set.clear();
+        self.current_connections.store(0, Ordering::Release);
     }
 
     fn log_stats(&self) {

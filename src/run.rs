@@ -3,17 +3,17 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use actix::prelude::*;
 use anyhow::Result;
 use env_logger::Env;
-use log::{error, info};
-use tokio::net::TcpListener;
+use log::{error, info, warn};
+use tokio::{net::TcpListener, time::sleep};
 
 use crate::{
-    actors::scheduler::{Scheduler, Shutdown},
+    actors::scheduler::{ConnectionCount, Scheduler, Shutdown},
     flow::FlowId,
     http::connect::handle_connect_proxy,
 };
@@ -22,6 +22,13 @@ pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
+// Maximum time to wait for active flows to drain before forcing shutdown.
+const FLOW_DRAIN_TIMEOUT_MS: u64 = 30_000; // 30s
+// Interval for polling the scheduler's active-flow count while draining.
+const FLOW_DRAIN_POLL_MS: u64 = 100; // 100ms
+// How long to wait for the Scheduler actor to terminate after sending Shutdown
+// before we assume the runtime is stuck and continue teardown.
+const SCHEDULER_STOP_TIMEOUT_MS: u64 = 5_000; // 5s
 
 pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
@@ -69,9 +76,12 @@ pub async fn server(port: u16, max_connections: usize) -> Result<()> {
         }
     }
 
+    wait_for_active_flows(&scheduler).await;
+
     info!("Stopping scheduler");
-    if let Err(err) = scheduler.send(Shutdown).await {
-        error!("Failed to stop scheduler gracefully: {}", err);
+    match scheduler.send(Shutdown).await {
+        Ok(()) => wait_for_scheduler_shutdown(&scheduler).await,
+        Err(err) => error!("Failed to stop scheduler gracefully: {}", err),
     }
 
     Ok(())
@@ -100,6 +110,49 @@ async fn shutdown_signal() {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
+    }
+}
+
+async fn wait_for_active_flows(scheduler: &Addr<Scheduler>) {
+    let start = Instant::now();
+
+    loop {
+        match scheduler.send(ConnectionCount).await {
+            Ok(0) => {
+                info!("All active flows drained");
+                break;
+            }
+            Ok(count) => {
+                if start.elapsed() >= Duration::from_millis(FLOW_DRAIN_TIMEOUT_MS) {
+                    warn!(
+                        "Graceful drain timed out with {} active flows; proceeding with shutdown",
+                        count
+                    );
+                    break;
+                }
+                sleep(Duration::from_millis(FLOW_DRAIN_POLL_MS)).await;
+            }
+            Err(err) => {
+                warn!("Unable to query scheduler for active flows: {}", err);
+                break;
+            }
+        }
+    }
+}
+
+async fn wait_for_scheduler_shutdown(scheduler: &Addr<Scheduler>) {
+    let start = Instant::now();
+
+    while scheduler.connected() {
+        if start.elapsed() >= Duration::from_millis(SCHEDULER_STOP_TIMEOUT_MS) {
+            warn!(
+                "Scheduler did not stop within {}ms; runtime may continue running",
+                SCHEDULER_STOP_TIMEOUT_MS
+            );
+            break;
+        }
+
+        sleep(Duration::from_millis(FLOW_DRAIN_POLL_MS)).await;
     }
 }
 
