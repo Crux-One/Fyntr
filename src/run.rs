@@ -74,8 +74,6 @@ pub async fn server(port: u16, max_connections: usize) -> Result<()> {
         error!("Failed to stop scheduler gracefully: {}", err);
     }
 
-    System::current().stop();
-
     Ok(())
 }
 
