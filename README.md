@@ -13,8 +13,10 @@
   <p>
     A minimal forward proxy to tame bursty outbound traffic.
 
-[![GitHub license](https://img.shields.io/github/license/Crux-One/Fyntr?label=License&logo=github)](https://github.com/Crux-One/Fyntr "Click to view the repo on GitHub")
-[![Release Version](https://img.shields.io/github/v/release/Crux-One/Fyntr?include_prereleases&label=Release&logo=github)](https://github.com/Crux-One/Fyntr/releases/latest "Click to view the repo on GitHub")
+[![GitHub License](https://img.shields.io/github/license/Crux-One/Fyntr?logo=github&style=for-the-badge)](https://github.com/Crux-One/Fyntr)
+[![Release Version](https://img.shields.io/github/v/release/Crux-One/Fyntr?include_prereleases&logo=github&style=for-the-badge)](https://github.com/Crux-One/Fyntr/releases/latest)
+[![Crates.io Version](https://img.shields.io/crates/v/fyntr?style=for-the-badge&logo=rust&color=yellow)](https://crates.io/crates/fyntr)
+
   </p>
 </div>
 
