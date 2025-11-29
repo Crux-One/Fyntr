@@ -103,7 +103,7 @@ impl FlowStats {
     }
 
     fn avg_packet_size(&self) -> Option<usize> {
-        self.avg_packet_size_lpf.map(|avg| avg as usize)
+        self.avg_packet_size_lpf.map(|avg| avg.round() as usize)
     }
 }
 
