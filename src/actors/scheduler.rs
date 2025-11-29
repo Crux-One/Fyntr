@@ -10,7 +10,12 @@ use std::{
 
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
-use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
+use tokio::{
+    io::AsyncWriteExt,
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::Mutex,
+    time::Instant,
+};
 
 use crate::{
     actors::queue::{AddQuantum, BindScheduler, Close, Dequeue, DequeueResult, QueueActor},
@@ -672,6 +677,11 @@ impl Handler<InspectState> for Scheduler {
 mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+    };
 
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
@@ -790,6 +800,64 @@ mod tests {
             vec![FlowId(1), FlowId(3)],
             "flow2 should be removed"
         );
+    }
+
+    async fn make_backend_pair() -> (Arc<Mutex<OwnedWriteHalf>>, OwnedReadHalf) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server = accept_handle.await.unwrap();
+        drop(client);
+
+        let (read_half, write_half) = server.into_split();
+        (Arc::new(Mutex::new(write_half)), read_half)
+    }
+
+    #[actix_rt::test]
+    async fn shutdown_active_flows_cleans_up_state() {
+        let mut scheduler = Scheduler::new(1024, Duration::from_millis(10));
+        scheduler.try_increment_connection_count().unwrap();
+
+        let flow_id = FlowId(99);
+        let queue = QueueActor::new().start();
+        let (backend_write, mut backend_read) = make_backend_pair().await;
+
+        scheduler.register(flow_id, queue.clone(), backend_write.clone());
+        scheduler.ready_queue.push_back(flow_id);
+        scheduler.ready_set.insert(flow_id);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            let closed = matches!(backend_read.read(&mut buf).await, Ok(0));
+            let _ = shutdown_tx.send(closed);
+        });
+
+        scheduler.shutdown_active_flows();
+
+        assert!(scheduler.flows.is_empty(), "flows map should be cleared");
+        assert!(scheduler.ready_queue.is_empty());
+        assert!(scheduler.ready_set.is_empty());
+        assert_eq!(scheduler.current_connection_count(), 0);
+
+        let dequeue_result = queue
+            .send(Dequeue {
+                max_bytes: usize::MAX,
+            })
+            .await;
+        assert!(matches!(dequeue_result, Err(MailboxError::Closed)));
+
+        let closed = tokio::time::timeout(Duration::from_millis(500), shutdown_rx)
+            .await
+            .expect("backend read task timed out")
+            .expect("backend shutdown channel dropped");
+        assert!(closed, "backend writer should be shutdown to signal EOF");
     }
 
     #[actix_rt::test]
