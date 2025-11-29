@@ -55,6 +55,10 @@ impl fmt::Display for RegisterError {
 
 impl std::error::Error for RegisterError {}
 
+/// Tracks statistics for a flow, including bytes sent, packets sent, and average packet size using a low-pass filter.
+///
+/// The average packet size is maintained using an exponential moving average (EMA) with a smoothing factor.
+/// This helps smooth out short-term fluctuations while responding to longer-term trends in packet sizes.
 #[derive(Debug)]
 struct FlowStats {
     bytes_sent: u64,
@@ -73,14 +77,20 @@ impl FlowStats {
         }
     }
 
+    /// Updates the flow statistics with a new packet size sample.
+    ///
+    /// Uses an exponential moving average to compute the average packet size, reducing noise from individual packet variations.
+    /// The smoothing factor ALPHA = 0.2 provides a balance: 20% weight to the current sample and 80% to the previous average,
+    /// allowing the average to adapt to changes while filtering out transient spikes.
     fn update(&mut self, bytes: usize) {
+        const ALPHA: f64 = 0.2;
+
         self.bytes_sent += bytes as u64;
         self.packets_sent += 1;
         if self.start_time.is_none() {
             self.start_time = Some(Instant::now());
         }
 
-        const ALPHA: f64 = 0.2;
         let sample = bytes as f64;
         self.avg_packet_size_lpf = Some(match self.avg_packet_size_lpf {
             Some(prev) => prev + ALPHA * (sample - prev),
