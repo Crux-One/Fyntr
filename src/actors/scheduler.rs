@@ -121,13 +121,20 @@ impl FlowEntry {
     }
 
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
+        const MIN_QUANTUM: usize = 1500; // 1 MTU (latency-optimized)
+        const MAX_QUANTUM: usize = 16 * 1024; // ~11 MTU (throughput-optimized)
+        const TARGET_BURST_PACKETS: usize = 10; // Aim to allow ~10 packets per turn
         const SMALL_PACKET_THRESHOLD: usize = 200;
-        const LATENCY_OPTIMIZED_QUANTUM: usize = 1500;
-        const THROUGHPUT_OPTIMIZED_QUANTUM: usize = 16 * 1024;
 
         match self.stats.avg_packet_size() {
-            Some(avg) if avg < SMALL_PACKET_THRESHOLD => LATENCY_OPTIMIZED_QUANTUM,
-            Some(_) => THROUGHPUT_OPTIMIZED_QUANTUM,
+            Some(avg) => {
+                if avg < SMALL_PACKET_THRESHOLD {
+                    return MIN_QUANTUM;
+                }
+
+                let target = avg.saturating_mul(TARGET_BURST_PACKETS);
+                target.clamp(MIN_QUANTUM, MAX_QUANTUM)
+            }
             None => default_quantum,
         }
     }
