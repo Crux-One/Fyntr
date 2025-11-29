@@ -55,6 +55,10 @@ impl fmt::Display for RegisterError {
 
 impl std::error::Error for RegisterError {}
 
+/// Tracks statistics for a flow, including bytes sent, packets sent, and average packet size using a low-pass filter.
+///
+/// The average packet size is maintained using an exponential moving average (EMA) with a smoothing factor.
+/// This helps smooth out short-term fluctuations while responding to longer-term trends in packet sizes.
 #[derive(Debug)]
 struct FlowStats {
     bytes_sent: u64,
@@ -73,14 +77,20 @@ impl FlowStats {
         }
     }
 
+    /// Updates the flow statistics with a new packet size sample.
+    ///
+    /// Uses an exponential moving average to compute the average packet size, reducing noise from individual packet variations.
+    /// The smoothing factor ALPHA = 0.2 provides a balance: 20% weight to the current sample and 80% to the previous average,
+    /// allowing the average to adapt to changes while filtering out transient spikes.
     fn update(&mut self, bytes: usize) {
+        const ALPHA: f64 = 0.2;
+
         self.bytes_sent += bytes as u64;
         self.packets_sent += 1;
         if self.start_time.is_none() {
             self.start_time = Some(Instant::now());
         }
 
-        const ALPHA: f64 = 0.2;
         let sample = bytes as f64;
         self.avg_packet_size_lpf = Some(match self.avg_packet_size_lpf {
             Some(prev) => prev + ALPHA * (sample - prev),
@@ -120,18 +130,55 @@ impl FlowEntry {
         self.stats.update(bytes);
     }
 
+    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet statistics.
+    ///
+    /// This method dynamically adapts the quantum to balance the trade-off between low latency
+    /// and high throughput depending on the flow's characteristics.
+    ///
+    /// # Parameters
+    /// * `default_quantum` - The fallback quantum size when no packet statistics are available.
+    ///
+    /// # Returns
+    /// The recommended quantum size in bytes, clamped between `MIN_QUANTUM` and `MAX_QUANTUM`.
+    ///
+    /// # Strategy
+    ///
+    /// 1. If no packet statistics are available yet, return `default_quantum`.
+    /// 2. Interactive Flows (Low Latency): If the average packet size is small (< 200 bytes, e.g., VoIP, SSH, ACKs),
+    ///    we use `MIN_QUANTUM`. This forces the scheduler to cycle through flows frequently, reducing jitter.
+    /// 3. Bulk Flows (High Throughput): For larger packets, we scale the quantum to allow a burst of
+    ///    `TARGET_BURST_PACKETS` per turn. This amortizes the cost of context switching and scheduling decisions.
+    ///
+    /// # Constants Rationale
+    ///
+    /// * `MIN_QUANTUM (1500 bytes)`: Corresponds to the standard Ethernet MTU. This ensures that even
+    ///   latency-sensitive flows can send at least one standard MTU-sized packet per turn without waiting for deficit accumulation.
+    /// * `MAX_QUANTUM (16 KiB)`: A cap to prevent any single flow from hogging the bandwidth for too long,
+    ///   ensuring fairness among active flows.
+    /// * `TARGET_BURST_PACKETS (10)`: Empirical value based on typical network workloads. Processing ~10 packets per turn
+    ///   amortizes scheduling overhead while keeping latency low for interactive flows.
+    /// * `SMALL_PACKET_THRESHOLD (200 bytes)`: A heuristic threshold to distinguish interactive traffic. Below this,
+    ///   packets are likely control messages (e.g., TCP ACKs ~64 bytes) or small data packets (e.g., VoIP, SSH).
+    ///
+    /// # Examples
+    ///
+    /// - For a flow with average packet size of 1500 bytes (MTU), quantum = 1500 * 10 = 15000 bytes (no clamping needed as it's below MAX_QUANTUM).
+    /// - For larger packets (avg 2000 bytes), quantum = 2000 * 10 = 20000 bytes, clamped to MAX_QUANTUM (16384 bytes).
+    /// - For small packets (avg 100 bytes), quantum = MIN_QUANTUM (1500 bytes) to ensure frequent scheduling.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        const MIN_QUANTUM: usize = 1500; // 1 MTU (latency-optimized)
-        const MAX_QUANTUM: usize = 16 * 1024; // ~11 MTU (throughput-optimized)
-        const TARGET_BURST_PACKETS: usize = 10; // Aim to allow ~10 packets per turn
+        const MIN_QUANTUM: usize = 1_500;
+        const MAX_QUANTUM: usize = 16 * 1024;
+        const TARGET_BURST_PACKETS: usize = 10;
         const SMALL_PACKET_THRESHOLD: usize = 200;
 
         match self.stats.avg_packet_size() {
             Some(avg) => {
+                // If the flow consists of very small packets, force frequent scheduling (low latency).
                 if avg < SMALL_PACKET_THRESHOLD {
                     return MIN_QUANTUM;
                 }
 
+                // Scale quantum linearly with packet size to maintain the target burst count.
                 let target = avg.saturating_mul(TARGET_BURST_PACKETS);
                 target.clamp(MIN_QUANTUM, MAX_QUANTUM)
             }
