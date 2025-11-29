@@ -415,8 +415,9 @@ impl Handler<FlowReady> for Scheduler {
 
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
-        for flow in self.flows.values() {
+        for (&flow_id, flow) in &self.flows {
             let quantum = flow.recommended_quantum(self.default_quantum);
+            debug!("flow{}: assigned quantum {}", flow_id.0, quantum);
             flow.queue_addr().do_send(AddQuantum(quantum));
         }
     }
