@@ -120,18 +120,46 @@ impl FlowEntry {
         self.stats.update(bytes);
     }
 
+    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet statistics.
+    ///
+    /// This method dynamically adapts the quantum to balance the trade-off between **low latency**
+    /// and **high throughput** depending on the flow's characteristics.
+    ///
+    /// # Strategy
+    ///
+    /// 1. **Interactive Flows (Low Latency):** If the average packet size is small (< 200 bytes, e.g., VoIP, SSH, ACKs),
+    ///    we use `MIN_QUANTUM`. This forces the scheduler to cycle through flows frequently, reducing jitter.
+    /// 2. **Bulk Flows (High Throughput):** For larger packets, we scale the quantum to allow a burst of
+    ///    `TARGET_BURST_PACKETS` per turn. This amortizes the cost of context switching and scheduling
+    ///    decisions (improving CPU cache locality).
+    ///
+    /// # Constants Rationale
+    ///
+    /// * `MIN_QUANTUM (1500 bytes)`: Corresponds to the standard Ethernet MTU. This ensures that even
+    ///   latency-sensitive flows can send at least one full-sized packet per turn without waiting for deficit accumulation.
+    /// * `MAX_QUANTUM (16 KiB)`: A cap to prevent any single flow from hogging the bandwidth for too long,
+    ///   ensuring fairness among active flows.
+    /// * `TARGET_BURST_PACKETS (10)`: Empirical value. Processing ~10 packets in a batch balances throughput
+    ///   efficiency against latency.
+    /// * `SMALL_PACKET_THRESHOLD (200 bytes)`: A heuristic threshold to identify interactive or control traffic.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        const MIN_QUANTUM: usize = 1500; // 1 MTU (latency-optimized)
-        const MAX_QUANTUM: usize = 16 * 1024; // ~11 MTU (throughput-optimized)
-        const TARGET_BURST_PACKETS: usize = 10; // Aim to allow ~10 packets per turn
+        // Standard Ethernet MTU. Essential to avoid Head-of-Line blocking for standard packets.
+        const MIN_QUANTUM: usize = 1_500;
+        // Approx 11 MTUs. Upper limit to guarantee fair scheduling latency for other flows.
+        const MAX_QUANTUM: usize = 16 * 1024;
+        // Aim to allow ~10 packets per turn for throughput optimization (amortization of overhead).
+        const TARGET_BURST_PACKETS: usize = 10;
+        // Heuristic threshold for "interactive" traffic (e.g., SSH, DNS, TCP ACKs).
         const SMALL_PACKET_THRESHOLD: usize = 200;
 
         match self.stats.avg_packet_size() {
             Some(avg) => {
+                // If the flow consists of very small packets, force frequent scheduling (low latency).
                 if avg < SMALL_PACKET_THRESHOLD {
                     return MIN_QUANTUM;
                 }
 
+                // Scale quantum linearly with packet size to maintain the target burst count.
                 let target = avg.saturating_mul(TARGET_BURST_PACKETS);
                 target.clamp(MIN_QUANTUM, MAX_QUANTUM)
             }
