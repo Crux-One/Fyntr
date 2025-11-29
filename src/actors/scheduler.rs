@@ -797,6 +797,50 @@ mod tests {
         );
     }
 
+    #[actix_rt::test]
+    async fn connection_count_handler_reports_active_flows() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(5)
+            .start();
+
+        let queue1 = QueueActor::new().start();
+        let backend1 = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(11),
+                queue_addr: queue1,
+                backend_write: backend1,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queue2 = QueueActor::new().start();
+        let backend2 = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(22),
+                queue_addr: queue2,
+                backend_write: backend2,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let count = scheduler.send(ConnectionCount).await.unwrap();
+        assert_eq!(count, 2, "two flows should be tracked");
+
+        scheduler
+            .send(Unregister {
+                flow_id: FlowId(11),
+            })
+            .await
+            .unwrap();
+
+        let count = scheduler.send(ConnectionCount).await.unwrap();
+        assert_eq!(count, 1, "unregister should decrement count");
+    }
+
     async fn make_backend_pair() -> (Arc<Mutex<OwnedWriteHalf>>, OwnedReadHalf) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
