@@ -229,7 +229,7 @@ impl RegisteredSession {
 
         ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler.clone())
             .start();
-        BackendToClientActor::new(flow_id, backend_read, client_write).start();
+        BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone()).start();
 
         Ok(())
     }
