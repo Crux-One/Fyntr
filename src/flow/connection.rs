@@ -3,8 +3,9 @@ use super::FlowId;
 use actix::prelude::*;
 use bytes::Bytes;
 use log::{info, warn};
+use std::pin::Pin;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     time::{Duration, Instant, sleep},
 };
@@ -20,6 +21,75 @@ use crate::{
 const BUFFER_SIZE: usize = 8 * 1024; // 8 KB
 const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
+
+async fn pump_reader<R, S, H>(
+    flow_id: FlowId,
+    label: &'static str,
+    mut reader: R,
+    state: &mut S,
+    mut handle_chunk: H,
+    on_close: impl FnOnce(u64, Instant),
+) where
+    R: AsyncRead + Unpin,
+    H: for<'a> FnMut(&'a mut S, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>,
+{
+    let mut buf = vec![0u8; BUFFER_SIZE];
+    let mut total_read = 0u64;
+    let start_time = Instant::now();
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => {
+                on_close(total_read, start_time);
+                break;
+            }
+            Ok(n) => {
+                total_read += n as u64;
+                if let Err(e) = handle_chunk(state, Vec::from(&buf[..n])).await {
+                    warn!("flow{} {} handler error: {}", flow_id.0, label, e);
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("flow{} {} read error: {}", flow_id.0, label, e);
+                break;
+            }
+        }
+    }
+}
+
+fn log_client_close(flow_id: FlowId, total_read: u64, start_time: Instant) {
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let (total_value, total_unit) = format_bytes(total_read);
+
+    if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
+        info!(
+            "flow{}: client connection closed (total read: {:.2} {} in {:.2}s, avg: {:.2} {})",
+            flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+        );
+    }
+}
+
+async fn enqueue_chunk(queue_tx: &Addr<QueueActor>, chunk: Vec<u8>) -> Result<(), String> {
+    let chunk = Bytes::from(chunk);
+    queue_tx
+        .send(Enqueue(chunk))
+        .await
+        .map_err(|e| format!("failed to enqueue chunk: {}", e))
+}
+
+async fn forward_to_client(
+    client: &mut OwnedWriteHalf,
+    scheduler: Addr<Scheduler>,
+    chunk: Vec<u8>,
+) -> Result<(), String> {
+    client
+        .write_all(&chunk)
+        .await
+        .map_err(|e| format!("client write error: {}", e))?;
+    scheduler.do_send(RecordDownstreamBytes { bytes: chunk.len() });
+    Ok(())
+}
 
 pub(crate) struct ClientToBackendActor {
     flow_id: FlowId,
@@ -51,46 +121,23 @@ impl Actor for ClientToBackendActor {
         let flow_id = self.flow_id;
         let queue_tx = self.queue_tx.clone();
         let scheduler = self.scheduler.clone();
-        let mut client = self
+        let client = self
             .client
             .take()
             .expect("ClientToBackendActor started without client stream");
 
         ctx.spawn(
             async move {
-                let mut buf = vec![0u8; BUFFER_SIZE];
-                let mut total_read = 0u64;
-                let start_time = Instant::now();
-
-                loop {
-                    match client.read(&mut buf).await {
-                        Ok(0) => {
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            let (total_value, total_unit) = format_bytes(total_read);
-
-                            if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
-                                info!(
-                                    "flow{}: client connection closed (total read: {:.2} {} in {:.2}s, avg: {:.2} {})",
-                                    flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
-                                );
-                            }
-
-                            break;
-                        }
-                        Ok(n) => {
-                            total_read += n as u64;
-                            let chunk = Bytes::copy_from_slice(&buf[..n]);
-                            if let Err(e) = queue_tx.send(Enqueue(chunk)).await {
-                                warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("flow{}: read error: {}", flow_id.0, e);
-                            break;
-                        }
-                    }
-                }
+                let mut queue_state = queue_tx;
+                pump_reader(
+                    flow_id,
+                    "client->queue",
+                    client,
+                    &mut queue_state,
+                    |queue_tx, chunk| Box::pin(enqueue_chunk(queue_tx, chunk)),
+                    |total_read, start_time| log_client_close(flow_id, total_read, start_time),
+                )
+                .await;
 
                 // Unregister this flow from the scheduler to signal completion and trigger cleanup.
                 for attempt in 1..=UNREGISTER_RETRY_LIMIT {
@@ -158,26 +205,20 @@ impl Actor for BackendToClientActor {
 
         ctx.spawn(
             async move {
-                let mut buf = vec![0u8; BUFFER_SIZE];
-                loop {
-                    match backend.read(&mut buf).await {
-                        Ok(0) => {
-                            info!("flow{}: backend connection closed", flow_id.0);
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = client.write_all(&buf[..n]).await {
-                                warn!("flow{}: client write error: {}", flow_id.0, e);
-                                break;
-                            }
-                            scheduler.do_send(RecordDownstreamBytes { bytes: n });
-                        }
-                        Err(e) => {
-                            warn!("flow{}: backend read error: {}", flow_id.0, e);
-                            break;
-                        }
-                    }
-                }
+                pump_reader(
+                    flow_id,
+                    "backend->client",
+                    &mut backend,
+                    &mut client,
+                    |client, chunk| {
+                        let scheduler = scheduler.clone();
+                        Box::pin(forward_to_client(client, scheduler, chunk))
+                    },
+                    |_total_read, _start_time| {
+                        info!("flow{}: backend connection closed", flow_id.0)
+                    },
+                )
+                .await;
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
