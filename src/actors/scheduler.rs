@@ -38,6 +38,12 @@ pub(crate) struct FlowReady {
     pub flow_id: FlowId,
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct RecordDownstreamBytes {
+    pub bytes: usize,
+}
+
 #[derive(Debug)]
 pub(crate) enum RegisterError {
     MaxConnectionsReached { max: usize },
@@ -193,7 +199,8 @@ pub(crate) struct Scheduler {
     ready_set: HashSet<FlowId>,
     default_quantum: usize,
     tick: Duration,
-    total_bytes_sent: u64,
+    total_client_to_backend_bytes: u64,
+    total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
     max_connections: Option<usize>,
@@ -228,6 +235,15 @@ impl Handler<QuantumTick> for Scheduler {
     }
 }
 
+impl Handler<RecordDownstreamBytes> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecordDownstreamBytes, _ctx: &mut Self::Context) -> Self::Result {
+        self.total_backend_to_client_bytes += msg.bytes as u64;
+        self.ensure_global_start_time();
+    }
+}
+
 impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
@@ -236,7 +252,8 @@ impl Scheduler {
             ready_set: HashSet::new(),
             default_quantum: quantum,
             tick,
-            total_bytes_sent: 0,
+            total_client_to_backend_bytes: 0,
+            total_backend_to_client_bytes: 0,
             global_start_time: None,
             total_ticks: 0,
             max_connections: None,
@@ -487,7 +504,7 @@ impl Scheduler {
 
         let packet_len = result.packet.len();
         self.update_flow_stats(flow, packet_len);
-        self.update_global_stats(packet_len);
+        self.record_client_to_backend_bytes(packet_len);
         if result.ready_for_more {
             self.mark_flow_ready(flow);
         }
@@ -515,8 +532,12 @@ impl Scheduler {
         }
     }
 
-    fn update_global_stats(&mut self, bytes: usize) {
-        self.total_bytes_sent += bytes as u64;
+    fn record_client_to_backend_bytes(&mut self, bytes: usize) {
+        self.total_client_to_backend_bytes += bytes as u64;
+        self.ensure_global_start_time();
+    }
+
+    fn ensure_global_start_time(&mut self) {
         if self.global_start_time.is_none() {
             self.global_start_time = Some(Instant::now());
         }
@@ -564,25 +585,43 @@ impl Scheduler {
 
     fn log_stats(&self) {
         let flow_count = self.flows.len();
-        let (total_value, total_unit) = format_bytes(self.total_bytes_sent);
+        let (tx_value, tx_unit) = format_bytes(self.total_client_to_backend_bytes);
+        let (rx_value, rx_unit) = format_bytes(self.total_backend_to_client_bytes);
         let max_display = self.max_connections.map(|limit| limit.to_string());
         debug!(
-            "⏱ scheduler: ticks={}, active connections={}/{}, total={:.2} {}",
+            "⏱ scheduler: ticks={}, active connections={}/{}, total_tx={:.2} {}, total_rx={:.2} {}",
             self.total_ticks,
             flow_count,
             max_display.as_deref().unwrap_or("∞"),
-            total_value,
-            total_unit
+            tx_value,
+            tx_unit,
+            rx_value,
+            rx_unit
         );
         if let Some(global_start) = self.global_start_time {
             let elapsed = global_start.elapsed().as_secs_f64();
-            if elapsed > 0.0
-                && let Some((avg_value, avg_unit)) = format_rate(self.total_bytes_sent, elapsed)
-            {
-                debug!(
-                    "   ⤷ avg throughput: {:.2} {} over {:.2}s",
-                    avg_value, avg_unit, elapsed
-                );
+            if elapsed > 0.0 {
+                let mut segments = Vec::new();
+                if self.total_client_to_backend_bytes > 0
+                    && let Some((avg_value, avg_unit)) =
+                        format_rate(self.total_client_to_backend_bytes, elapsed)
+                {
+                    segments.push(format!("tx={:.2} {}", avg_value, avg_unit));
+                }
+                if self.total_backend_to_client_bytes > 0
+                    && let Some((avg_value, avg_unit)) =
+                        format_rate(self.total_backend_to_client_bytes, elapsed)
+                {
+                    segments.push(format!("rx={:.2} {}", avg_value, avg_unit));
+                }
+
+                if !segments.is_empty() {
+                    debug!(
+                        "   ⤷ avg throughput: {} over {:.2}s",
+                        segments.join(", "),
+                        elapsed
+                    );
+                }
             }
         }
     }
@@ -593,12 +632,21 @@ pub(super) struct InspectReply {
     pub connections: usize,
     pub ready_queue_len: usize,
     pub flow_ids: Vec<FlowId>,
+    pub total_client_to_backend_bytes: u64,
+    pub total_backend_to_client_bytes: u64,
 }
 
 #[cfg(test)]
 #[derive(Message)]
 #[rtype(result = "InspectReply")]
 pub(super) struct InspectState;
+
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(super) struct RecordUpstreamBytesTest {
+    pub bytes: usize,
+}
 
 #[cfg(test)]
 impl Handler<InspectState> for Scheduler {
@@ -609,7 +657,18 @@ impl Handler<InspectState> for Scheduler {
             connections: self.current_connection_count(),
             ready_queue_len: self.ready_queue.len(),
             flow_ids: self.flows.keys().copied().collect(),
+            total_client_to_backend_bytes: self.total_client_to_backend_bytes,
+            total_backend_to_client_bytes: self.total_backend_to_client_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+impl Handler<RecordUpstreamBytesTest> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecordUpstreamBytesTest, _ctx: &mut Context<Self>) -> Self::Result {
+        self.record_client_to_backend_bytes(msg.bytes);
     }
 }
 
@@ -617,6 +676,54 @@ impl Handler<InspectState> for Scheduler {
 mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
+
+    #[actix_rt::test]
+    async fn record_downstream_bytes_updates_totals() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10)).start();
+
+        scheduler
+            .send(RecordDownstreamBytes { bytes: 1024 })
+            .await
+            .unwrap();
+        scheduler
+            .send(RecordDownstreamBytes { bytes: 2048 })
+            .await
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.total_backend_to_client_bytes, 3072,
+            "downstream byte counter should accumulate all messages"
+        );
+        assert_eq!(
+            reply.total_client_to_backend_bytes, 0,
+            "upstream counter should remain untouched"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn record_upstream_bytes_updates_totals() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10)).start();
+
+        scheduler
+            .send(super::RecordUpstreamBytesTest { bytes: 512 })
+            .await
+            .unwrap();
+        scheduler
+            .send(super::RecordUpstreamBytesTest { bytes: 256 })
+            .await
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.total_client_to_backend_bytes, 768,
+            "upstream byte counter should accumulate all messages"
+        );
+        assert_eq!(
+            reply.total_backend_to_client_bytes, 0,
+            "downstream counter should remain untouched"
+        );
+    }
 
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
