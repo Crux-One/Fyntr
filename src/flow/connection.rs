@@ -12,7 +12,7 @@ use tokio::{
 use crate::{
     actors::{
         queue::{Enqueue, QueueActor},
-        scheduler::{Scheduler, Unregister},
+        scheduler::{RecordDownstreamBytes, Scheduler, Unregister},
     },
     util::{format_bytes, format_rate},
 };
@@ -122,14 +122,21 @@ pub(crate) struct BackendToClientActor {
     flow_id: FlowId,
     backend: Option<OwnedReadHalf>,
     client: Option<OwnedWriteHalf>,
+    scheduler: Addr<Scheduler>,
 }
 
 impl BackendToClientActor {
-    pub(crate) fn new(flow_id: FlowId, backend: OwnedReadHalf, client: OwnedWriteHalf) -> Self {
+    pub(crate) fn new(
+        flow_id: FlowId,
+        backend: OwnedReadHalf,
+        client: OwnedWriteHalf,
+        scheduler: Addr<Scheduler>,
+    ) -> Self {
         Self {
             flow_id,
             backend: Some(backend),
             client: Some(client),
+            scheduler,
         }
     }
 }
@@ -147,6 +154,7 @@ impl Actor for BackendToClientActor {
             .client
             .take()
             .expect("BackendToClientActor started without client stream");
+        let scheduler = self.scheduler.clone();
 
         ctx.spawn(
             async move {
@@ -162,6 +170,7 @@ impl Actor for BackendToClientActor {
                                 warn!("flow{}: client write error: {}", flow_id.0, e);
                                 break;
                             }
+                            scheduler.do_send(RecordDownstreamBytes { bytes: n });
                         }
                         Err(e) => {
                             warn!("flow{}: backend read error: {}", flow_id.0, e);

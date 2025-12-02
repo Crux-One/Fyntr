@@ -9,7 +9,7 @@ use std::{
 };
 
 use actix::prelude::*;
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
@@ -38,6 +38,12 @@ pub(crate) struct FlowReady {
     pub flow_id: FlowId,
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct RecordDownstreamBytes {
+    pub bytes: usize,
+}
+
 #[derive(Debug)]
 pub(crate) enum RegisterError {
     MaxConnectionsReached { max: usize },
@@ -55,25 +61,51 @@ impl fmt::Display for RegisterError {
 
 impl std::error::Error for RegisterError {}
 
+/// Tracks statistics for a flow, including bytes sent, packets sent, and average packet size using a low-pass filter.
+///
+/// The average packet size is maintained using an exponential moving average (EMA) with a smoothing factor.
+/// This helps smooth out short-term fluctuations while responding to longer-term trends in packet sizes.
 #[derive(Debug)]
 struct FlowStats {
     bytes_sent: u64,
+    packets_sent: u64,
     start_time: Option<Instant>,
+    avg_packet_size_lpf: Option<f64>,
 }
 
 impl FlowStats {
     fn new() -> Self {
         Self {
             bytes_sent: 0,
+            packets_sent: 0,
             start_time: None,
+            avg_packet_size_lpf: None,
         }
     }
 
+    /// Updates the flow statistics with a new packet size sample.
+    ///
+    /// Uses an exponential moving average to compute the average packet size, reducing noise from individual packet variations.
+    /// The smoothing factor ALPHA = 0.2 provides a balance: 20% weight to the current sample and 80% to the previous average,
+    /// allowing the average to adapt to changes while filtering out transient spikes.
     fn update(&mut self, bytes: usize) {
+        const ALPHA: f64 = 0.2;
+
         self.bytes_sent += bytes as u64;
+        self.packets_sent += 1;
         if self.start_time.is_none() {
             self.start_time = Some(Instant::now());
         }
+
+        let sample = bytes as f64;
+        self.avg_packet_size_lpf = Some(match self.avg_packet_size_lpf {
+            Some(prev) => prev + ALPHA * (sample - prev),
+            None => sample,
+        });
+    }
+
+    fn avg_packet_size(&self) -> Option<usize> {
+        self.avg_packet_size_lpf.map(|avg| avg.round() as usize)
     }
 }
 
@@ -103,15 +135,72 @@ impl FlowEntry {
     fn update_stats(&mut self, bytes: usize) {
         self.stats.update(bytes);
     }
+
+    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet statistics.
+    ///
+    /// This method dynamically adapts the quantum to balance the trade-off between low latency
+    /// and high throughput depending on the flow's characteristics.
+    ///
+    /// # Parameters
+    /// * `default_quantum` - The fallback quantum size when no packet statistics are available.
+    ///
+    /// # Returns
+    /// The recommended quantum size in bytes, clamped between `MIN_QUANTUM` and `MAX_QUANTUM`.
+    ///
+    /// # Strategy
+    ///
+    /// 1. If no packet statistics are available yet, return `default_quantum`.
+    /// 2. Interactive Flows (Low Latency): If the average packet size is small (< 200 bytes, e.g., VoIP, SSH, ACKs),
+    ///    we use `MIN_QUANTUM`. This forces the scheduler to cycle through flows frequently, reducing jitter.
+    /// 3. Bulk Flows (High Throughput): For larger packets, we scale the quantum to allow a burst of
+    ///    `TARGET_BURST_PACKETS` per turn. This amortizes the cost of context switching and scheduling decisions.
+    ///
+    /// # Constants Rationale
+    ///
+    /// * `MIN_QUANTUM (1500 bytes)`: Corresponds to the standard Ethernet MTU. This ensures that even
+    ///   latency-sensitive flows can send at least one standard MTU-sized packet per turn without waiting for deficit accumulation.
+    /// * `MAX_QUANTUM (16 KiB)`: A cap to prevent any single flow from hogging the bandwidth for too long,
+    ///   ensuring fairness among active flows.
+    /// * `TARGET_BURST_PACKETS (10)`: Empirical value based on typical network workloads. Processing ~10 packets per turn
+    ///   amortizes scheduling overhead while keeping latency low for interactive flows.
+    /// * `SMALL_PACKET_THRESHOLD (200 bytes)`: A heuristic threshold to distinguish interactive traffic. Below this,
+    ///   packets are likely control messages (e.g., TCP ACKs ~64 bytes) or small data packets (e.g., VoIP, SSH).
+    ///
+    /// # Examples
+    ///
+    /// - For a flow with average packet size of 1500 bytes (MTU), quantum = 1500 * 10 = 15000 bytes (no clamping needed as it's below MAX_QUANTUM).
+    /// - For larger packets (avg 2000 bytes), quantum = 2000 * 10 = 20000 bytes, clamped to MAX_QUANTUM (16384 bytes).
+    /// - For small packets (avg 100 bytes), quantum = MIN_QUANTUM (1500 bytes) to ensure frequent scheduling.
+    fn recommended_quantum(&self, default_quantum: usize) -> usize {
+        const MIN_QUANTUM: usize = 1_500;
+        const MAX_QUANTUM: usize = 16 * 1024;
+        const TARGET_BURST_PACKETS: usize = 10;
+        const SMALL_PACKET_THRESHOLD: usize = 200;
+
+        match self.stats.avg_packet_size() {
+            Some(avg) => {
+                // If the flow consists of very small packets, force frequent scheduling (low latency).
+                if avg < SMALL_PACKET_THRESHOLD {
+                    return MIN_QUANTUM;
+                }
+
+                // Scale quantum linearly with packet size to maintain the target burst count.
+                let target = avg.saturating_mul(TARGET_BURST_PACKETS);
+                target.clamp(MIN_QUANTUM, MAX_QUANTUM)
+            }
+            None => default_quantum,
+        }
+    }
 }
 
 pub(crate) struct Scheduler {
     flows: HashMap<FlowId, FlowEntry>,
     ready_queue: VecDeque<FlowId>,
     ready_set: HashSet<FlowId>,
-    quantum: usize,
+    default_quantum: usize,
     tick: Duration,
-    total_bytes_sent: u64,
+    total_client_to_backend_bytes: u64,
+    total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
     max_connections: Option<usize>,
@@ -146,15 +235,25 @@ impl Handler<QuantumTick> for Scheduler {
     }
 }
 
+impl Handler<RecordDownstreamBytes> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecordDownstreamBytes, _ctx: &mut Self::Context) -> Self::Result {
+        self.total_backend_to_client_bytes += msg.bytes as u64;
+        self.ensure_global_start_time();
+    }
+}
+
 impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
             flows: HashMap::new(),
             ready_queue: VecDeque::new(),
             ready_set: HashSet::new(),
-            quantum,
+            default_quantum: quantum,
             tick,
-            total_bytes_sent: 0,
+            total_client_to_backend_bytes: 0,
+            total_backend_to_client_bytes: 0,
             global_start_time: None,
             total_ticks: 0,
             max_connections: None,
@@ -333,8 +432,10 @@ impl Handler<FlowReady> for Scheduler {
 
 impl Scheduler {
     fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
-        for flow in self.flows.values() {
-            flow.queue_addr().do_send(AddQuantum(self.quantum));
+        for (&flow_id, flow) in &self.flows {
+            let quantum = flow.recommended_quantum(self.default_quantum);
+            trace!("flow{}: assigned quantum {}", flow_id.0, quantum);
+            flow.queue_addr().do_send(AddQuantum(quantum));
         }
     }
 
@@ -403,7 +504,7 @@ impl Scheduler {
 
         let packet_len = result.packet.len();
         self.update_flow_stats(flow, packet_len);
-        self.update_global_stats(packet_len);
+        self.record_client_to_backend_bytes(packet_len);
         if result.ready_for_more {
             self.mark_flow_ready(flow);
         }
@@ -431,8 +532,12 @@ impl Scheduler {
         }
     }
 
-    fn update_global_stats(&mut self, bytes: usize) {
-        self.total_bytes_sent += bytes as u64;
+    fn record_client_to_backend_bytes(&mut self, bytes: usize) {
+        self.total_client_to_backend_bytes += bytes as u64;
+        self.ensure_global_start_time();
+    }
+
+    fn ensure_global_start_time(&mut self) {
         if self.global_start_time.is_none() {
             self.global_start_time = Some(Instant::now());
         }
@@ -480,25 +585,43 @@ impl Scheduler {
 
     fn log_stats(&self) {
         let flow_count = self.flows.len();
-        let (total_value, total_unit) = format_bytes(self.total_bytes_sent);
+        let (tx_value, tx_unit) = format_bytes(self.total_client_to_backend_bytes);
+        let (rx_value, rx_unit) = format_bytes(self.total_backend_to_client_bytes);
         let max_display = self.max_connections.map(|limit| limit.to_string());
         debug!(
-            "⏱ scheduler: ticks={}, active connections={}/{}, total={:.2} {}",
+            "⏱ scheduler: ticks={}, active connections={}/{}, total_tx={:.2} {}, total_rx={:.2} {}",
             self.total_ticks,
             flow_count,
             max_display.as_deref().unwrap_or("∞"),
-            total_value,
-            total_unit
+            tx_value,
+            tx_unit,
+            rx_value,
+            rx_unit
         );
         if let Some(global_start) = self.global_start_time {
             let elapsed = global_start.elapsed().as_secs_f64();
-            if elapsed > 0.0
-                && let Some((avg_value, avg_unit)) = format_rate(self.total_bytes_sent, elapsed)
-            {
-                debug!(
-                    "   ⤷ avg throughput: {:.2} {} over {:.2}s",
-                    avg_value, avg_unit, elapsed
-                );
+            if elapsed > 0.0 {
+                let mut segments = Vec::new();
+                if self.total_client_to_backend_bytes > 0
+                    && let Some((avg_value, avg_unit)) =
+                        format_rate(self.total_client_to_backend_bytes, elapsed)
+                {
+                    segments.push(format!("tx={:.2} {}", avg_value, avg_unit));
+                }
+                if self.total_backend_to_client_bytes > 0
+                    && let Some((avg_value, avg_unit)) =
+                        format_rate(self.total_backend_to_client_bytes, elapsed)
+                {
+                    segments.push(format!("rx={:.2} {}", avg_value, avg_unit));
+                }
+
+                if !segments.is_empty() {
+                    debug!(
+                        "   ⤷ avg throughput: {} over {:.2}s",
+                        segments.join(", "),
+                        elapsed
+                    );
+                }
             }
         }
     }
@@ -509,12 +632,21 @@ pub(super) struct InspectReply {
     pub connections: usize,
     pub ready_queue_len: usize,
     pub flow_ids: Vec<FlowId>,
+    pub total_client_to_backend_bytes: u64,
+    pub total_backend_to_client_bytes: u64,
 }
 
 #[cfg(test)]
 #[derive(Message)]
 #[rtype(result = "InspectReply")]
 pub(super) struct InspectState;
+
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(super) struct RecordUpstreamBytesTest {
+    pub bytes: usize,
+}
 
 #[cfg(test)]
 impl Handler<InspectState> for Scheduler {
@@ -525,7 +657,18 @@ impl Handler<InspectState> for Scheduler {
             connections: self.current_connection_count(),
             ready_queue_len: self.ready_queue.len(),
             flow_ids: self.flows.keys().copied().collect(),
+            total_client_to_backend_bytes: self.total_client_to_backend_bytes,
+            total_backend_to_client_bytes: self.total_backend_to_client_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+impl Handler<RecordUpstreamBytesTest> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecordUpstreamBytesTest, _ctx: &mut Context<Self>) -> Self::Result {
+        self.record_client_to_backend_bytes(msg.bytes);
     }
 }
 
@@ -533,6 +676,54 @@ impl Handler<InspectState> for Scheduler {
 mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
+
+    #[actix_rt::test]
+    async fn record_downstream_bytes_updates_totals() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10)).start();
+
+        scheduler
+            .send(RecordDownstreamBytes { bytes: 1024 })
+            .await
+            .unwrap();
+        scheduler
+            .send(RecordDownstreamBytes { bytes: 2048 })
+            .await
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.total_backend_to_client_bytes, 3072,
+            "downstream byte counter should accumulate all messages"
+        );
+        assert_eq!(
+            reply.total_client_to_backend_bytes, 0,
+            "upstream counter should remain untouched"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn record_upstream_bytes_updates_totals() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10)).start();
+
+        scheduler
+            .send(super::RecordUpstreamBytesTest { bytes: 512 })
+            .await
+            .unwrap();
+        scheduler
+            .send(super::RecordUpstreamBytesTest { bytes: 256 })
+            .await
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.total_client_to_backend_bytes, 768,
+            "upstream byte counter should accumulate all messages"
+        );
+        assert_eq!(
+            reply.total_backend_to_client_bytes, 0,
+            "downstream counter should remain untouched"
+        );
+    }
 
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
@@ -650,6 +841,115 @@ mod tests {
             flow_ids,
             vec![FlowId(1), FlowId(3)],
             "flow2 should be removed"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_recommended_quantum_selection() {
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let default_quantum = 8192;
+
+        // Case 1: No stats -> default_quantum
+        let flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            default_quantum,
+            "Should return default quantum when no stats available"
+        );
+
+        // Case 2: Small packets (< 200 bytes) -> MIN_QUANTUM (1500)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(100); // Set avg to 100
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            1500,
+            "Should return MIN_QUANTUM for small packets"
+        );
+
+        // Case 3: Normal packets -> Scaled (avg * 10)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(500); // Set avg to 500
+        // Target = 500 * 10 = 5000
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            5000,
+            "Should scale quantum for normal packets"
+        );
+
+        // Case 4: Large packets -> MAX_QUANTUM (16384)
+        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone());
+        flow.update_stats(2000); // Set avg to 2000
+        // Target = 2000 * 10 = 20000 -> Clamped to 16384
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            16384,
+            "Should clamp to MAX_QUANTUM for large packets"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_quantum_adapts_with_filtered_average() {
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let default_quantum = 4096;
+
+        let mut flow = FlowEntry::new(queue, backend_write);
+
+        // Initial tiny packets force the minimum quantum.
+        flow.update_stats(100);
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            1500,
+            "Small packets should produce MIN_QUANTUM"
+        );
+
+        // Sustained large packets should cause the EMA to rise, eventually yielding
+        // the maximum quantum due to clamping.
+        for _ in 0..25 {
+            flow.update_stats(2000);
+        }
+
+        assert_eq!(
+            flow.recommended_quantum(default_quantum),
+            16384,
+            "EMA should adapt and drive the quantum to MAX_QUANTUM after sustained large packets"
+        );
+    }
+
+    #[test]
+    fn test_flow_stats_ema() {
+        let mut stats = FlowStats::new();
+
+        // Initial state
+        assert!(stats.avg_packet_size().is_none());
+
+        // First packet: initializes average
+        stats.update(1000);
+        assert_eq!(stats.avg_packet_size(), Some(1000));
+
+        // Second packet: 2000 bytes
+        // ALPHA = 0.2
+        // avg = 1000 + 0.2 * (2000 - 1000) = 1000 + 200 = 1200
+        stats.update(2000);
+        assert_eq!(stats.avg_packet_size(), Some(1200));
+
+        // Third packet: 500 bytes
+        // avg = 1200 + 0.2 * (500 - 1200) = 1200 + 0.2 * (-700) = 1200 - 140 = 1060
+        stats.update(500);
+        assert_eq!(stats.avg_packet_size(), Some(1060));
+
+        // Convergence test: constant stream of 2000 bytes
+        // It should approach 2000.
+        for _ in 0..50 {
+            stats.update(2000);
+        }
+        // After many updates, it should be very close to 2000.
+        let avg = stats.avg_packet_size().unwrap();
+        assert!(
+            (1900..=2000).contains(&avg),
+            "Average should converge to 2000, got {}",
+            avg
         );
     }
 }
