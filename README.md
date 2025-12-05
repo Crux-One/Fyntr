@@ -50,6 +50,8 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
     ```
 
+    By default, Fyntr caps concurrent connections at 1000 (set to `0` to disable).
+
 2. Configure Your Environment:
 
     Export the following environment variables in a separate terminal.
@@ -69,14 +71,14 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     ```
 
 ## Why Fyntr?
-Managing cloud infrastructure with tools like Terraform often spawns a torrent of short-lived TCP connections.
-These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers with limited NAT table capacity, particularly on consumer-grade models, which can eventually stall operations or cause timeouts.
+When managing cloud operations using tools like Terraform, you might spawn bursts of short-lived TCP connections constantly opening and closing.
+These can lead to issues such as exhausting available ephemeral ports due to `TIME_WAIT` sockets, or overloading the NAT table on routers with limited capacity, particularly on consumer-grade NAT devices, which can freeze things up or become unresponsive.
 
-Fyntr takes a simpler approach. It doesn't pool connections; it smooths them.
-By pacing each flow through its scheduler, it prevents simultaneous bursts that could overwhelm routers,
-resulting in fewer network spikes and reduced traffic congestion.
+Fyntr takes a simpler approach. Instead of pooling connections, it evens out how active flows are serviced.
+The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
+so bursts from many parallel flows get interleaved instead of firing all at once.
 
-Under the hood, the internal scheduler—built on an actor-based concurrency model and a Deficit Round-Robin (DRR) algorithm—ensures every flow is handled fairly, even under heavy parallel load.
+This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of simultaneous connections, even though the connection count and total throughput remain the same.
 
 ## Usage with Terraform
 
