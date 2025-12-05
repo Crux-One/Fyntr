@@ -57,7 +57,7 @@ impl ConnectionLimiter {
                 loop {
                     if current >= limit {
                         warn!(
-                            "scheduler: connection rejected - max connections ({}) reached",
+                            "connection rejected - max connections ({}) reached",
                             limit
                         );
                         return Err(RegisterError::MaxConnectionsReached { max: limit });
@@ -88,7 +88,98 @@ impl ConnectionLimiter {
                 (current > 0).then_some(current - 1)
             });
         if result.is_err() {
-            warn!("scheduler: attempted to decrement connection count below zero");
+            warn!("attempted to decrement connection count below zero");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{atomic::AtomicUsize, Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn acquire_and_release_under_limit() {
+        let mut limiter = ConnectionLimiter::new();
+        limiter.set_max_connections(2);
+
+        limiter.try_acquire().expect("first acquire should succeed");
+        limiter.try_acquire().expect("second acquire should succeed");
+        assert_eq!(limiter.current(), 2);
+
+        limiter.release();
+        limiter.release();
+        assert_eq!(limiter.current(), 0);
+    }
+
+    #[test]
+    fn rejects_when_limit_reached() {
+        let mut limiter = ConnectionLimiter::new();
+        limiter.set_max_connections(1);
+
+        limiter.try_acquire().expect("first acquire should succeed");
+        let err = limiter.try_acquire().expect_err("second acquire should fail");
+        assert!(matches!(err, RegisterError::MaxConnectionsReached { max: 1 }));
+        assert_eq!(limiter.current(), 1);
+    }
+
+    #[test]
+    fn zero_max_treated_as_unlimited() {
+        let mut limiter = ConnectionLimiter::new();
+        limiter.set_max_connections(0);
+
+        for _ in 0..3 {
+            limiter.try_acquire().expect("unlimited limiter should allow acquire");
+        }
+        assert_eq!(limiter.current(), 3);
+
+        for _ in 0..3 {
+            limiter.release();
+        }
+        assert_eq!(limiter.current(), 0);
+    }
+
+    #[test]
+    fn concurrent_acquire_respects_limit() {
+        let limiter = Arc::new({
+            let mut l = ConnectionLimiter::new();
+            l.set_max_connections(3);
+            l
+        });
+
+        let attempts = 10;
+        let successes = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(attempts));
+
+        let mut handles = Vec::new();
+        for _ in 0..attempts {
+            let limiter = Arc::clone(&limiter);
+            let successes = Arc::clone(&successes);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || {
+                barrier.wait(); // start together
+                let acquired = limiter.try_acquire().is_ok();
+                if acquired {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+                barrier.wait(); // ensure all attempts recorded before releasing
+                if acquired {
+                    limiter.release();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Acquire),
+            3,
+            "only three threads should acquire concurrently"
+        );
+        assert_eq!(limiter.current(), 0);
     }
 }
