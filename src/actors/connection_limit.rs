@@ -56,10 +56,7 @@ impl ConnectionLimiter {
                 let mut current = self.current_connections.load(Ordering::Acquire);
                 loop {
                     if current >= limit {
-                        warn!(
-                            "connection rejected - max connections ({}) reached",
-                            limit
-                        );
+                        warn!("connection rejected - max connections ({}) reached", limit);
                         return Err(RegisterError::MaxConnectionsReached { max: limit });
                     }
 
@@ -82,11 +79,11 @@ impl ConnectionLimiter {
     }
 
     pub(crate) fn release(&self) {
-        let result = self
-            .current_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current > 0).then_some(current - 1)
-            });
+        let result =
+            self.current_connections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current > 0).then_some(current - 1)
+                });
         if result.is_err() {
             warn!("attempted to decrement connection count below zero");
         }
@@ -96,7 +93,7 @@ impl ConnectionLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{atomic::AtomicUsize, Arc, Barrier};
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
     use std::thread;
 
     #[test]
@@ -105,7 +102,9 @@ mod tests {
         limiter.set_max_connections(2);
 
         limiter.try_acquire().expect("first acquire should succeed");
-        limiter.try_acquire().expect("second acquire should succeed");
+        limiter
+            .try_acquire()
+            .expect("second acquire should succeed");
         assert_eq!(limiter.current(), 2);
 
         limiter.release();
@@ -119,8 +118,13 @@ mod tests {
         limiter.set_max_connections(1);
 
         limiter.try_acquire().expect("first acquire should succeed");
-        let err = limiter.try_acquire().expect_err("second acquire should fail");
-        assert!(matches!(err, RegisterError::MaxConnectionsReached { max: 1 }));
+        let err = limiter
+            .try_acquire()
+            .expect_err("second acquire should fail");
+        assert!(matches!(
+            err,
+            RegisterError::MaxConnectionsReached { max: 1 }
+        ));
         assert_eq!(limiter.current(), 1);
     }
 
@@ -130,7 +134,9 @@ mod tests {
         limiter.set_max_connections(0);
 
         for _ in 0..3 {
-            limiter.try_acquire().expect("unlimited limiter should allow acquire");
+            limiter
+                .try_acquire()
+                .expect("unlimited limiter should allow acquire");
         }
         assert_eq!(limiter.current(), 3);
 

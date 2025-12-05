@@ -247,8 +247,7 @@ impl Scheduler {
     ///
     /// A value of `0` disables the limit (treated as unlimited).
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
-        self.connection_limiter
-            .set_max_connections(max_connections);
+        self.connection_limiter.set_max_connections(max_connections);
         self
     }
 
