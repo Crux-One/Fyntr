@@ -71,14 +71,15 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     ```
 
 ## Why Fyntr?
-When managing cloud operations using tools like Terraform, you might spawn bursts of short-lived TCP connections constantly opening and closing.
+When managing cloud operations using tools like Terraform, you might spawn bursts of short-lived TCP connections rapidly opening and closing.
 These can lead to issues such as exhausting available ephemeral ports due to `TIME_WAIT` sockets, or overloading the NAT table on routers with limited capacity, particularly on consumer-grade NAT devices, which can freeze things up or become unresponsive.
 
 Fyntr takes a simpler approach. Instead of pooling connections, it evens out how active flows are serviced.
 The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
 so bursts from many parallel flows get interleaved instead of firing all at once.
 
-This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of simultaneous connections, even though the connection count and total throughput remain the same.
+This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of simultaneous connections.
+This effect is most noticeable when workloads involve many concurrent connections, and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
 
 ## Usage with Terraform
 
