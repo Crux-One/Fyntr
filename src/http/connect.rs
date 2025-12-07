@@ -113,23 +113,225 @@ struct ConnectSession {
     client_write: OwnedWriteHalf,
 }
 
-struct ValidatedSession {
-    session: ConnectSession,
-    target_host: String,
-    target_port: u16,
+struct FlowCleanup {
+    flow_id: FlowId,
+    scheduler: Addr<Scheduler>,
+    queue_tx: Option<Addr<QueueActor>>,
+    unregister_on_drop: bool,
+    disarmed: bool,
 }
 
-struct BackendConnectedSession {
-    session: ConnectSession,
-    queue_tx: Addr<QueueActor>,
-    backend_read: OwnedReadHalf,
-    backend_write: Arc<Mutex<OwnedWriteHalf>>,
+enum ConnectState {
+    Validating(ConnectSession),
+    Dialing {
+        session: ConnectSession,
+        target_host: String,
+        target_port: u16,
+    },
+    Registering {
+        session: ConnectSession,
+        queue_tx: Addr<QueueActor>,
+        backend_read: OwnedReadHalf,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+    },
+    Established {
+        session: ConnectSession,
+        queue_tx: Addr<QueueActor>,
+        backend_read: OwnedReadHalf,
+    },
+    Finished(FlowId),
 }
 
-struct RegisteredSession {
-    session: ConnectSession,
-    queue_tx: Addr<QueueActor>,
-    backend_read: OwnedReadHalf,
+impl ConnectState {
+    fn flow_id(&self) -> FlowId {
+        match self {
+            ConnectState::Validating(session)
+            | ConnectState::Dialing { session, .. }
+            | ConnectState::Registering { session, .. }
+            | ConnectState::Established { session, .. } => session.flow_id,
+            ConnectState::Finished(flow_id) => *flow_id,
+        }
+    }
+
+    fn stage_name(&self) -> &'static str {
+        match self {
+            ConnectState::Validating(_) => "validating",
+            ConnectState::Dialing { .. } => "dialing",
+            ConnectState::Registering { .. } => "registering",
+            ConnectState::Established { .. } => "established",
+            ConnectState::Finished(_) => "finished",
+        }
+    }
+
+    async fn advance(self, cleanup: &mut FlowCleanup) -> ConnectResult<ConnectState> {
+        match self {
+            ConnectState::Validating(mut session) => {
+                let request_line = read_request_line(&mut session.client_reader).await?;
+
+                if !request_line.is_http_1x() {
+                    let detail = format!(
+                        "unsupported HTTP version {} from {}",
+                        request_line.version, session.client_addr
+                    );
+                    return respond_with_status(
+                        session.flow_id,
+                        &mut session.client_write,
+                        StatusLine::VERSION_NOT_SUPPORTED,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await;
+                }
+
+                if !request_line.is_connect_method() {
+                    let detail = format!(
+                        "unsupported method {} from {}",
+                        request_line.method, session.client_addr
+                    );
+                    return respond_with_status(
+                        session.flow_id,
+                        &mut session.client_write,
+                        StatusLine::METHOD_NOT_ALLOWED,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await;
+                }
+
+                let (target_host, target_port) = request_line.parse_connect_target()?;
+                info!(
+                    "flow{}: CONNECT {}:{}",
+                    session.flow_id.0, target_host, target_port
+                );
+
+                skip_headers(&mut session.client_reader).await?;
+
+                Ok(ConnectState::Dialing {
+                    session,
+                    target_host,
+                    target_port,
+                })
+            }
+            ConnectState::Dialing {
+                mut session,
+                target_host,
+                target_port,
+            } => {
+                let backend_addr = format!("{}:{}", target_host, target_port);
+                let backend_stream = match TcpStream::connect(&backend_addr).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let detail = format!("failed to connect to {}: {}", backend_addr, e);
+                        return respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::BAD_GATEWAY,
+                            StatusLogLevel::Error,
+                            detail,
+                        )
+                        .await;
+                    }
+                };
+
+                backend_stream
+                    .set_nodelay(true)
+                    .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
+
+                info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
+
+                let (backend_read, backend_write) = backend_stream.into_split();
+                let queue_tx = QueueActor::new().start();
+                cleanup.watch_queue(queue_tx.clone());
+
+                Ok(ConnectState::Registering {
+                    session,
+                    queue_tx,
+                    backend_read,
+                    backend_write: Arc::new(Mutex::new(backend_write)),
+                })
+            }
+            ConnectState::Registering {
+                mut session,
+                queue_tx,
+                backend_read,
+                backend_write,
+            } => {
+                match session
+                    .scheduler
+                    .send(Register {
+                        flow_id: session.flow_id,
+                        queue_addr: queue_tx.clone(),
+                        backend_write: backend_write.clone(),
+                    })
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        cleanup.mark_registered();
+                        Ok(ConnectState::Established {
+                            session,
+                            queue_tx,
+                            backend_read,
+                        })
+                    }
+                    Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
+                        let detail =
+                            format!("registration rejected - max connections ({}) reached", max);
+                        respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::SERVICE_UNAVAILABLE,
+                            StatusLogLevel::Warn,
+                            detail,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        error!(
+                            "flow{}: failed to register with scheduler: {}",
+                            session.flow_id.0, e
+                        );
+                        Err(ConnectFlowError::Fatal(anyhow!(
+                            "Scheduler registration failed"
+                        )))
+                    }
+                }
+            }
+            ConnectState::Established {
+                session,
+                queue_tx,
+                backend_read,
+            } => {
+                let ConnectSession {
+                    flow_id,
+                    scheduler,
+                    client_reader,
+                    mut client_write,
+                    ..
+                } = session;
+
+                if let Err(e) = send_connect_response(&mut client_write).await {
+                    return Err(ConnectFlowError::Fatal(e));
+                }
+
+                let client_read = client_reader.into_inner();
+                let scheduler_for_client = scheduler.clone();
+
+                ClientToBackendActor::new(
+                    flow_id,
+                    client_read,
+                    queue_tx.clone(),
+                    scheduler_for_client,
+                )
+                .start();
+                BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone())
+                    .start();
+
+                cleanup.disarm();
+                Ok(ConnectState::Finished(flow_id))
+            }
+            ConnectState::Finished(flow_id) => Ok(ConnectState::Finished(flow_id)),
+        }
+    }
 }
 
 impl ConnectSession {
@@ -148,182 +350,47 @@ impl ConnectSession {
             client_write,
         }
     }
-
-    async fn validate_request(self) -> ConnectResult<ValidatedSession> {
-        let mut session = self;
-        let request_line = read_request_line(&mut session.client_reader).await?;
-
-        if !request_line.is_http_1x() {
-            let detail = format!(
-                "unsupported HTTP version {} from {}",
-                request_line.version, session.client_addr
-            );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::VERSION_NOT_SUPPORTED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
-        }
-
-        if !request_line.is_connect_method() {
-            let detail = format!(
-                "unsupported method {} from {}",
-                request_line.method, session.client_addr
-            );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::METHOD_NOT_ALLOWED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
-        }
-
-        let (target_host, target_port) = request_line.parse_connect_target()?;
-        info!(
-            "flow{}: CONNECT {}:{}",
-            session.flow_id.0, target_host, target_port
-        );
-
-        skip_headers(&mut session.client_reader).await?;
-
-        Ok(ValidatedSession {
-            session,
-            target_host,
-            target_port,
-        })
-    }
 }
 
-impl ValidatedSession {
-    async fn establish_backend_connection(self) -> ConnectResult<BackendConnectedSession> {
-        let ValidatedSession {
-            mut session,
-            target_host,
-            target_port,
-        } = self;
-
-        let backend_addr = format!("{}:{}", target_host, target_port);
-        let backend_stream = match TcpStream::connect(&backend_addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                let detail = format!("failed to connect to {}: {}", backend_addr, e);
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::BAD_GATEWAY,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await;
-            }
-        };
-
-        backend_stream
-            .set_nodelay(true)
-            .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
-
-        info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
-
-        let (backend_read, backend_write) = backend_stream.into_split();
-        let queue_tx = QueueActor::new().start();
-
-        Ok(BackendConnectedSession {
-            session,
-            queue_tx,
-            backend_read,
-            backend_write: Arc::new(Mutex::new(backend_write)),
-        })
-    }
-}
-
-impl BackendConnectedSession {
-    async fn register_flow(self) -> ConnectResult<RegisteredSession> {
-        let BackendConnectedSession {
-            mut session,
-            queue_tx,
-            backend_read,
-            backend_write,
-        } = self;
-
-        match session
-            .scheduler
-            .send(Register {
-                flow_id: session.flow_id,
-                queue_addr: queue_tx.clone(),
-                backend_write: backend_write.clone(),
-            })
-            .await
-        {
-            Ok(Ok(())) => Ok(RegisteredSession {
-                session,
-                queue_tx,
-                backend_read,
-            }),
-            Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
-                queue_tx.do_send(Close);
-                let detail = format!("registration rejected - max connections ({}) reached", max);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await
-            }
-            Err(e) => {
-                queue_tx.do_send(Close);
-                error!(
-                    "flow{}: failed to register with scheduler: {}",
-                    session.flow_id.0, e
-                );
-                Err(ConnectFlowError::Fatal(anyhow!(
-                    "Scheduler registration failed"
-                )))
-            }
-        }
-    }
-}
-
-impl RegisteredSession {
-    async fn finalize(self) -> ConnectResult<()> {
-        let RegisteredSession {
-            session,
-            queue_tx,
-            backend_read,
-        } = self;
-
-        let ConnectSession {
+impl FlowCleanup {
+    fn new(flow_id: FlowId, scheduler: Addr<Scheduler>) -> Self {
+        Self {
             flow_id,
             scheduler,
-            client_reader,
-            mut client_write,
-            ..
-        } = session;
+            queue_tx: None,
+            unregister_on_drop: false,
+            disarmed: false,
+        }
+    }
 
-        if let Err(e) = send_connect_response(&mut client_write).await {
-            queue_tx.do_send(Close);
-            if let Err(err) = scheduler.send(Unregister { flow_id }).await {
-                warn!(
-                    "flow{}: failed to unregister after handshake error: {}",
-                    flow_id.0, err
-                );
-            }
-            return Err(ConnectFlowError::Fatal(e));
+    fn watch_queue(&mut self, queue_tx: Addr<QueueActor>) {
+        self.queue_tx = Some(queue_tx);
+    }
+
+    fn mark_registered(&mut self) {
+        self.unregister_on_drop = true;
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for FlowCleanup {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
         }
 
-        let client_read = client_reader.into_inner();
+        if let Some(queue) = &self.queue_tx {
+            queue.do_send(Close);
+        }
 
-        ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler.clone())
-            .start();
-        BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone()).start();
-
-        Ok(())
+        if self.unregister_on_drop {
+            self.scheduler.do_send(Unregister {
+                flow_id: self.flow_id,
+            });
+        }
     }
 }
 
@@ -344,10 +411,26 @@ pub(crate) async fn handle_connect_proxy(
 }
 
 async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
-    let validated = session.validate_request().await?;
-    let backend_connected = validated.establish_backend_connection().await?;
-    let registered = backend_connected.register_flow().await?;
-    registered.finalize().await
+    let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
+    let mut state = ConnectState::Validating(session);
+
+    loop {
+        let flow_id = state.flow_id();
+        let current_stage = state.stage_name();
+        let next = state.advance(&mut cleanup).await?;
+        info!(
+            "flow{}: state {} -> {}",
+            flow_id.0,
+            current_stage,
+            next.stage_name()
+        );
+
+        if matches!(next, ConnectState::Finished(_)) {
+            return Ok(());
+        }
+
+        state = next;
+    }
 }
 
 #[cfg(test)]
