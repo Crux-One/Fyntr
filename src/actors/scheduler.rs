@@ -1,10 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,10 +9,15 @@ use log::{debug, info, trace, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
+    actors::{
+        connection_limit::ConnectionLimiter,
+        queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
+    },
     flow::FlowId,
     util::{format_bytes, format_rate},
 };
+
+pub(crate) use crate::actors::connection_limit::RegisterError;
 
 #[derive(Message)]
 #[rtype(result = "Result<(), RegisterError>")]
@@ -43,23 +44,6 @@ pub(crate) struct FlowReady {
 pub(crate) struct RecordDownstreamBytes {
     pub bytes: usize,
 }
-
-#[derive(Debug)]
-pub(crate) enum RegisterError {
-    MaxConnectionsReached { max: usize },
-}
-
-impl fmt::Display for RegisterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MaxConnectionsReached { max } => {
-                write!(f, "maximum connection limit ({}) reached", max)
-            }
-        }
-    }
-}
-
-impl std::error::Error for RegisterError {}
 
 /// Tracks statistics for a flow, including bytes sent, packets sent, and average packet size using a low-pass filter.
 ///
@@ -203,8 +187,7 @@ pub(crate) struct Scheduler {
     total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
-    max_connections: Option<usize>,
-    current_connections: AtomicUsize,
+    connection_limiter: ConnectionLimiter,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -256,8 +239,7 @@ impl Scheduler {
             total_backend_to_client_bytes: 0,
             global_start_time: None,
             total_ticks: 0,
-            max_connections: None,
-            current_connections: AtomicUsize::new(0),
+            connection_limiter: ConnectionLimiter::new(),
         }
     }
 
@@ -265,60 +247,24 @@ impl Scheduler {
     ///
     /// A value of `0` disables the limit (treated as unlimited).
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
-        self.max_connections = if max_connections == 0 {
-            None
-        } else {
-            Some(max_connections)
-        };
+        self.connection_limiter.set_max_connections(max_connections);
         self
     }
 
-    /// Atomically attempts to reserve a connection slot.
-    /// Returns true if a slot was reserved, false if the limit was reached.
     fn try_increment_connection_count(&self) -> Result<(), RegisterError> {
-        match self.max_connections {
-            Some(limit) => {
-                let mut current = self.current_connections.load(Ordering::Acquire);
-                loop {
-                    if current >= limit {
-                        warn!(
-                            "scheduler: connection rejected - max connections ({}) reached",
-                            limit
-                        );
-                        return Err(RegisterError::MaxConnectionsReached { max: limit });
-                    }
-
-                    match self.current_connections.compare_exchange(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => return Ok(()),
-                        Err(observed) => current = observed,
-                    }
-                }
-            }
-            None => {
-                self.current_connections.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            }
-        }
+        self.connection_limiter.try_acquire()
     }
 
     fn decrement_connection_count(&self) {
-        let result =
-            self.current_connections
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    (current > 0).then_some(current - 1)
-                });
-        if result.is_err() {
-            warn!("scheduler: attempted to decrement connection count below zero");
-        }
+        self.connection_limiter.release();
     }
 
     fn current_connection_count(&self) -> usize {
-        self.current_connections.load(Ordering::Acquire)
+        self.connection_limiter.current()
+    }
+
+    fn max_connections(&self) -> Option<usize> {
+        self.connection_limiter.max_connections()
     }
 
     fn register(
@@ -373,7 +319,7 @@ impl Handler<Register> for Scheduler {
             flow_id,
             scheduler: ctx.address(),
         });
-        match self.max_connections {
+        match self.max_connections() {
             Some(limit) => info!(
                 "flow{}: registered to scheduler (connections: {}/{})",
                 flow_id.0,
@@ -398,7 +344,7 @@ impl Handler<Unregister> for Scheduler {
     fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
         if self.unregister(msg.flow_id) {
             self.decrement_connection_count();
-            match self.max_connections {
+            match self.max_connections() {
                 Some(limit) => info!(
                     "flow{}: unregistered from scheduler (connections: {}/{})",
                     msg.flow_id.0,
@@ -587,7 +533,7 @@ impl Scheduler {
         let flow_count = self.flows.len();
         let (tx_value, tx_unit) = format_bytes(self.total_client_to_backend_bytes);
         let (rx_value, rx_unit) = format_bytes(self.total_backend_to_client_bytes);
-        let max_display = self.max_connections.map(|limit| limit.to_string());
+        let max_display = self.max_connections().map(|limit| limit.to_string());
         debug!(
             "⏱ scheduler: ticks={}, active connections={}/{}, total_tx={:.2} {}, total_rx={:.2} {}",
             self.total_ticks,

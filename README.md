@@ -22,7 +22,7 @@
 
 ## About
 Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic.
-It needs no config to launch and stays out of the way: no auth, no inspection, and a tiny runtime memory footprint (typically ~14MB RSS on macOS).
+Zero config required. Fyntr stays out of the way with no auth, no inspection, and a tiny runtime memory footprint (typically ~14MB RSS on macOS).
 Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and robust.
 
 ## Quick Start
@@ -42,13 +42,15 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     cargo run --release
     ```
 
-    Override the listener port or connection cap via CLI flags or env vars:
+    Override defaults via CLI flags or env vars:
 
     ```bash
     cargo run --release -- --port 8080 --max-connections 512
     # or
     FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
     ```
+
+    By default, Fyntr caps concurrent connections at 1000 (set to `0` to disable).
 
 2. Configure Your Environment:
 
@@ -69,14 +71,15 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     ```
 
 ## Why Fyntr?
-Managing cloud infrastructure with tools like Terraform often spawns a torrent of short-lived TCP connections.
-These can lead to issues, including `TIME_WAIT` socket exhaustion or NAT table saturation on routers with limited NAT table capacity, particularly on consumer-grade models, which can eventually stall operations or cause timeouts.
+Managing cloud operations with tools such as Terraform might spawn bursts of short-lived TCP connections rapidly opening and closing.
+The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
 
-Fyntr takes a simpler approach. It doesn't pool connections; it smooths them.
-By pacing each flow through its scheduler, it prevents simultaneous bursts that could overwhelm routers,
-resulting in fewer network spikes and reduced traffic congestion.
+Fyntr takes a simpler approach. Instead of pooling connections, it evens out how active flows are serviced.
+The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
+so packet bursts from many parallel flows get interleaved instead of firing all at once.
 
-Under the hood, the internal scheduler—built on an actor-based concurrency model and a Deficit Round-Robin (DRR) algorithm—ensures every flow is handled fairly, even under heavy parallel load.
+This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of connections.
+This effect is most noticeable when workloads involve many concurrent connections, and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
 
 ## Usage with Terraform
 
@@ -86,6 +89,9 @@ Under the hood, the internal scheduler—built on an actor-based concurrency mod
 # Set environment variables
 export HTTPS_PROXY=http://127.0.0.1:9999
 
-# Assuming your AWS credentials are managed by aws-vault
+# Standard usage
+terraform apply
+
+# Or with aws-vault wrapper
 aws-vault exec my-profile -- terraform apply
 ```
