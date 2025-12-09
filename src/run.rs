@@ -9,7 +9,7 @@ use std::{
 use actix::prelude::*;
 use anyhow::Result;
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::net::TcpListener;
 
 use crate::{actors::scheduler::Scheduler, flow::FlowId, http::connect::handle_connect_proxy};
@@ -21,6 +21,7 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 
 pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
+    check_nofile_limits(max_connections);
 
     let proxy_listen_addr = format!("127.0.0.1:{}", port);
     info!("Starting Fyntr on {}", proxy_listen_addr);
@@ -57,4 +58,35 @@ pub async fn server(port: u16, max_connections: usize) -> Result<()> {
 
 fn bootstrap() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+}
+
+fn check_nofile_limits(max_connections: usize) {
+    let (soft, hard) = if let Some((soft, hard)) = get_nofile_limits() {
+        (soft, hard)
+    } else {
+        warn!("failed to get nofile limits");
+        (u64::MAX, u64::MAX)
+    };
+
+    info!("FD limit: soft={}, hard={}", soft, hard);
+
+    if max_connections == 0 {
+        warn!(
+            "max_connections is unlimited but soft FD limit is {}; set --max-connections or raise ulimit to avoid EMFILE",
+            soft
+        );
+    } else if (max_connections as u64) > soft {
+        warn!(
+            "max_connections ({}) exceeds soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE",
+            max_connections, soft, hard
+        );
+    }
+}
+
+/// Returns the RLIMIT_NOFILE soft and hard limits, if available.
+///
+/// Soft: the current effective per-process limit (what actually applies now).
+/// Hard: the ceiling for soft; only root can raise soft beyond hard.
+fn get_nofile_limits() -> Option<(u64, u64)> {
+    rlimit::getrlimit(rlimit::Resource::NOFILE).ok()
 }

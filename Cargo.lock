@@ -278,6 +278,7 @@ dependencies = [
  "env_logger 0.11.8",
  "log",
  "quickcheck",
+ "rlimit",
  "tokio",
 ]
 
@@ -512,6 +513,15 @@ name = "regex-syntax"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3160422bbd54dd5ecfdca71e5fd59b7b8fe2b1697ab2baf64f6d05dcc66d298"
+
+[[package]]
+name = "rlimit"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "scopeguard"
