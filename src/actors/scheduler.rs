@@ -27,6 +27,11 @@ pub(crate) struct Register {
     pub backend_write: Arc<Mutex<OwnedWriteHalf>>,
 }
 
+/// Returns whether the scheduler can admit another connection right now.
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub(crate) struct CanAcceptConnection;
+
 #[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
@@ -334,6 +339,17 @@ impl Handler<Register> for Scheduler {
         };
 
         Ok(())
+    }
+}
+
+impl Handler<CanAcceptConnection> for Scheduler {
+    type Result = bool;
+
+    fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
+        match self.max_connections() {
+            Some(limit) => self.current_connection_count() < limit,
+            None => true,
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{fmt::Display, net::SocketAddr, sync::Arc};
+use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -16,7 +16,7 @@ use tokio::{
 use crate::{
     actors::{
         queue::{Close, QueueActor},
-        scheduler::{Register, RegisterError, Scheduler, Unregister},
+        scheduler::{CanAcceptConnection, Register, RegisterError, Scheduler, Unregister},
     },
     flow::{
         FlowId,
@@ -24,6 +24,7 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
 };
+use tokio::time::sleep;
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
@@ -223,11 +224,33 @@ impl ConnectState {
                 target_host,
                 target_port,
             } => {
+                // Early admission check to avoid spinning up outbound sockets when at capacity.
+                match session.scheduler.send(CanAcceptConnection).await {
+                    Ok(false) => {
+                        let detail = "scheduler at capacity before dialing";
+                        return respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::SERVICE_UNAVAILABLE,
+                            StatusLogLevel::Warn,
+                            detail,
+                        )
+                        .await;
+                    }
+                    Ok(true) => {}
+                    Err(e) => {
+                        error!("flow{}: failed to check capacity: {}", session.flow_id.0, e);
+                    }
+                }
+
                 let backend_addr = format!("{}:{}", target_host, target_port);
-                let backend_stream = match TcpStream::connect(&backend_addr).await {
+                let backend_stream = match connect_with_backoff(session.flow_id, &backend_addr)
+                    .await
+                {
                     Ok(stream) => stream,
                     Err(e) => {
-                        let detail = format!("failed to connect to {}: {}", backend_addr, e);
+                        let detail =
+                            format!("failed to connect to {} after retries: {}", backend_addr, e);
                         return respond_with_status(
                             session.flow_id,
                             &mut session.client_write,
@@ -439,6 +462,30 @@ async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
     }
 }
 
+const CONNECT_MAX_ATTEMPTS: usize = 3;
+const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
+const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
+
+async fn connect_with_backoff(flow_id: FlowId, backend_addr: &str) -> std::io::Result<TcpStream> {
+    let mut delay = CONNECT_BACKOFF_BASE;
+    for attempt in 1..=CONNECT_MAX_ATTEMPTS {
+        match TcpStream::connect(backend_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if attempt == CONNECT_MAX_ATTEMPTS => return Err(err),
+            Err(err) => {
+                warn!(
+                    "flow{}: connect attempt {}/{} to {} failed: {}; backing off {:?}",
+                    flow_id.0, attempt, CONNECT_MAX_ATTEMPTS, backend_addr, err, delay
+                );
+                sleep(delay).await;
+                delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
+            }
+        }
+    }
+
+    unreachable!("loop always returns or breaks")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,9 +605,8 @@ mod tests {
 
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
-        let backend_accept = tokio::spawn(async move {
-            let (_stream, _) = backend_listener.accept().await.unwrap();
-        });
+        // We intentionally do NOT accept here because capacity is already full; the dial should
+        // be rejected before touching the backend.
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -574,6 +620,6 @@ mod tests {
         .await;
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-        backend_accept.await.unwrap();
+        drop(backend_listener);
     }
 }
