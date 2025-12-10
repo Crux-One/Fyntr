@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 actix = "0.13"
 actix-rt = "2"
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.48", features = ["full", "test-util"] }
 anyhow = "1"
 bytes = "1.11"
 clap = { version = "4.5.53", features = ["derive", "env"] }
