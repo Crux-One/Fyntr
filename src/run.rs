@@ -72,7 +72,7 @@ fn check_nofile_limits(max_connections: usize) {
 
     if max_connections == 0 {
         warn!(
-            "max_connections is unlimited but soft FD limit is {}; set --max-connections or raise ulimit to avoid EMFILE",
+            "max_connections is unlimited but soft FD limit is {}; set a specific --max-connections limit or raise ulimit to avoid EMFILE",
             soft
         );
     } else if (max_connections as u64) > soft {
