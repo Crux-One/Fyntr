@@ -239,7 +239,15 @@ impl ConnectState {
                     }
                     Ok(true) => {}
                     Err(e) => {
-                        error!("flow{}: failed to check capacity: {}", session.flow_id.0, e);
+                        let detail = format!("failed to check capacity before dialing: {}", e);
+                        return respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::SERVICE_UNAVAILABLE,
+                            StatusLogLevel::Error,
+                            detail,
+                        )
+                        .await;
                     }
                 }
 
