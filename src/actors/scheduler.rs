@@ -763,6 +763,72 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn can_accept_connection_returns_false_when_at_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(1)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(!can_accept, "should refuse connections when at limit");
+    }
+
+    #[actix_rt::test]
+    async fn can_accept_connection_returns_true_when_below_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(2)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(can_accept, "should allow connection while under limit");
+    }
+
+    #[actix_rt::test]
+    async fn can_accept_connection_returns_true_when_unlimited() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(0)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(can_accept, "unlimited scheduler should always allow");
+    }
+
+    #[actix_rt::test]
     async fn unregister_updates_connection_count_and_ready_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(5)
