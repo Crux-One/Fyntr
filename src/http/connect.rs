@@ -683,6 +683,16 @@ mod tests {
         );
     }
 
+    fn backoff_sequence(steps: usize) -> Vec<Duration> {
+        let mut delay = CONNECT_BACKOFF_BASE;
+        let mut seq = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            seq.push(delay);
+            delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
+        }
+        seq
+    }
+
     #[test]
     fn backoff_delays_cap_at_max() {
         let delays = backoff_sequence(6);
@@ -694,15 +704,4 @@ mod tests {
         assert_eq!(delays[4], CONNECT_BACKOFF_MAX);
         assert_eq!(delays[5], CONNECT_BACKOFF_MAX);
     }
-}
-
-#[cfg(test)]
-fn backoff_sequence(steps: usize) -> Vec<Duration> {
-    let mut delay = CONNECT_BACKOFF_BASE;
-    let mut seq = Vec::with_capacity(steps);
-    for _ in 0..steps {
-        seq.push(delay);
-        delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
-    }
-    seq
 }
