@@ -46,6 +46,8 @@ impl From<std::io::Error> for ConnectFlowError {
 }
 
 #[derive(Clone, Copy)]
+/// Prebuilt HTTP status line used when responding to failed CONNECT requests.
+/// Holds the raw bytes sent to the client plus the parsed pieces for logging.
 struct StatusLine {
     raw: &'static [u8],
     code: &'static str,
@@ -113,6 +115,8 @@ struct ConnectSession {
     client_write: OwnedWriteHalf,
 }
 
+/// RAII guard that tears down queue and scheduler registrations if the flow exits early.
+/// Dropping sends `Close` to the queue and `Unregister` to the scheduler unless `disarm` was called.
 struct FlowCleanup {
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
@@ -121,6 +125,8 @@ struct FlowCleanup {
     disarmed: bool,
 }
 
+/// State machine for a CONNECT flow: Validating → Dialing → Registering → Established → Finished.
+/// Each transition advances toward a tunnel or early exit, with `Finished` marking completion.
 enum ConnectState {
     Validating(ConnectSession),
     Dialing {
