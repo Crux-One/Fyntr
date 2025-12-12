@@ -18,10 +18,12 @@ pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
+const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
+const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
 pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
-    check_nofile_limits(max_connections);
+    ensure_nofile_limits(max_connections);
 
     let proxy_listen_addr = format!("127.0.0.1:{}", port);
     info!("Starting Fyntr on {}", proxy_listen_addr);
@@ -60,14 +62,45 @@ fn bootstrap() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 }
 
-fn check_nofile_limits(max_connections: usize) {
+fn ensure_nofile_limits(max_connections: usize) {
+    let required = required_nofile(max_connections);
     let limits = get_nofile_limits();
     let (soft, hard) = limits.unwrap_or((u64::MAX, u64::MAX));
     info!("FD limit: soft={}, hard={}", soft, hard);
 
+    #[cfg(unix)]
+    if let (Some(required), Some((_, hard_limit))) = (required, limits)
+        && soft < required
+    {
+        let target_soft = required.min(hard_limit);
+        match rlimit::setrlimit(rlimit::Resource::NOFILE, target_soft, hard_limit) {
+            Ok(_) => info!("Raised soft FD limit to {}", target_soft),
+            Err(e) => warn!(
+                "failed to raise soft FD limit to {} (hard={}): {}",
+                target_soft, hard_limit, e
+            ),
+        }
+    }
+
+    // Re-check after any adjustment attempt so warnings reflect reality.
+    let limits = get_nofile_limits();
+    let (soft, hard) = limits.unwrap_or((u64::MAX, u64::MAX));
+
     for warning in nofile_warnings(max_connections, limits, soft, hard) {
         warn!("{}", warning);
     }
+}
+
+fn required_nofile(max_connections: usize) -> Option<u64> {
+    if max_connections == 0 {
+        return None;
+    }
+
+    Some(
+        (max_connections as u64)
+            .saturating_mul(FD_PER_CONNECTION)
+            .saturating_add(FD_HEADROOM),
+    )
 }
 
 /// Returns the RLIMIT_NOFILE soft and hard limits, if available.
@@ -102,6 +135,20 @@ fn nofile_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_nofile_unlimited_is_none() {
+        assert_eq!(required_nofile(0), None);
+    }
+
+    #[test]
+    fn required_nofile_scales_with_connections() {
+        assert_eq!(required_nofile(1), Some(FD_PER_CONNECTION + FD_HEADROOM));
+        assert_eq!(
+            required_nofile(10),
+            Some(10 * FD_PER_CONNECTION + FD_HEADROOM)
+        );
+    }
 
     #[test]
     fn warns_when_max_connections_unlimited() {
