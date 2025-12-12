@@ -2,7 +2,6 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
-
 use log::{error, info, warn};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -11,6 +10,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::Mutex,
+    time::sleep,
 };
 
 use crate::{
@@ -24,7 +24,6 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
 };
-use tokio::time::sleep;
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
