@@ -1,8 +1,7 @@
-use std::{fmt::Display, net::SocketAddr, sync::Arc};
+use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
-
 use log::{error, info, warn};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -11,12 +10,13 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::Mutex,
+    time::sleep,
 };
 
 use crate::{
     actors::{
         queue::{Close, QueueActor},
-        scheduler::{Register, RegisterError, Scheduler, Unregister},
+        scheduler::{CanAcceptConnection, Register, RegisterError, Scheduler, Unregister},
     },
     flow::{
         FlowId,
@@ -223,11 +223,44 @@ impl ConnectState {
                 target_host,
                 target_port,
             } => {
+                // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
+                // This is not atomic with the subsequent `Register` call; between here and registration
+                // other flows may be accepted, so this check can return a false positive. The atomic
+                // `Register` is the authoritative gatekeeper for enforcing the hard limit.
+                match session.scheduler.send(CanAcceptConnection).await {
+                    Ok(false) => {
+                        let detail = "scheduler at capacity before dialing";
+                        return respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::SERVICE_UNAVAILABLE,
+                            StatusLogLevel::Warn,
+                            detail,
+                        )
+                        .await;
+                    }
+                    Ok(true) => {}
+                    Err(e) => {
+                        let detail = format!("failed to check capacity before dialing: {}", e);
+                        return respond_with_status(
+                            session.flow_id,
+                            &mut session.client_write,
+                            StatusLine::SERVICE_UNAVAILABLE,
+                            StatusLogLevel::Error,
+                            detail,
+                        )
+                        .await;
+                    }
+                }
+
                 let backend_addr = format!("{}:{}", target_host, target_port);
-                let backend_stream = match TcpStream::connect(&backend_addr).await {
+                let backend_stream = match connect_with_backoff(session.flow_id, &backend_addr)
+                    .await
+                {
                     Ok(stream) => stream,
                     Err(e) => {
-                        let detail = format!("failed to connect to {}: {}", backend_addr, e);
+                        let detail =
+                            format!("failed to connect to {} after retries: {}", backend_addr, e);
                         return respond_with_status(
                             session.flow_id,
                             &mut session.client_write,
@@ -439,6 +472,31 @@ async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
     }
 }
 
+const CONNECT_MAX_ATTEMPTS: usize = 3;
+const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
+const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
+
+async fn connect_with_backoff(flow_id: FlowId, backend_addr: &str) -> std::io::Result<TcpStream> {
+    let mut delay = CONNECT_BACKOFF_BASE;
+    let mut attempt = 1;
+
+    loop {
+        match TcpStream::connect(backend_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if attempt == CONNECT_MAX_ATTEMPTS => return Err(err),
+            Err(err) => {
+                warn!(
+                    "flow{}: connect attempt {}/{} to {} failed: {}; backing off {:?}",
+                    flow_id.0, attempt, CONNECT_MAX_ATTEMPTS, backend_addr, err, delay
+                );
+                sleep(delay).await;
+                delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +506,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
+        task, time,
     };
 
     async fn read_response(mut stream: TcpStream) -> Vec<u8> {
@@ -558,9 +617,8 @@ mod tests {
 
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
-        let backend_accept = tokio::spawn(async move {
-            let (_stream, _) = backend_listener.accept().await.unwrap();
-        });
+        // We intentionally do NOT accept here because capacity is already full; the dial should
+        // be rejected before touching the backend.
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -574,6 +632,78 @@ mod tests {
         .await;
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-        backend_accept.await.unwrap();
+        drop(backend_listener);
+    }
+
+    #[actix_rt::test]
+    async fn connect_with_backoff_succeeds_on_first_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap();
+        let backend_addr_str = backend_addr.to_string();
+
+        let accept = async move {
+            let _ = listener.accept().await.unwrap();
+        };
+
+        let ((), stream) = tokio::join!(accept, connect_with_backoff(FlowId(1), &backend_addr_str));
+
+        assert!(stream.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_with_backoff_retries_and_respects_limit() {
+        let unreachable_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let backend_addr = format!("127.0.0.1:{}", unreachable_port);
+        let first_delay = CONNECT_BACKOFF_BASE;
+        let second_delay = CONNECT_BACKOFF_BASE.saturating_mul(2);
+        let start = time::Instant::now();
+
+        let connect_task = task::spawn({
+            let backend_addr = backend_addr.clone();
+            async move { connect_with_backoff(FlowId(1), &backend_addr).await }
+        });
+
+        task::yield_now().await;
+        time::advance(first_delay).await;
+        task::yield_now().await;
+        time::advance(second_delay).await;
+        task::yield_now().await;
+
+        let result = connect_task.await.unwrap();
+        assert!(result.is_err());
+        let elapsed = time::Instant::now() - start;
+        assert!(
+            elapsed >= first_delay + second_delay
+                && elapsed <= first_delay + second_delay + CONNECT_BACKOFF_MAX,
+            "elapsed {:?} outside expected retry window",
+            elapsed
+        );
+    }
+
+    fn backoff_sequence(steps: usize) -> Vec<Duration> {
+        let mut delay = CONNECT_BACKOFF_BASE;
+        let mut seq = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            seq.push(delay);
+            delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
+        }
+        seq
+    }
+
+    #[test]
+    fn backoff_delays_cap_at_max() {
+        let delays = backoff_sequence(6);
+
+        assert_eq!(delays[0], CONNECT_BACKOFF_BASE);
+        assert_eq!(delays[1], CONNECT_BACKOFF_BASE.saturating_mul(2));
+        assert_eq!(delays[2], CONNECT_BACKOFF_BASE.saturating_mul(4));
+        assert_eq!(delays[3], CONNECT_BACKOFF_BASE.saturating_mul(8));
+        assert_eq!(delays[4], CONNECT_BACKOFF_MAX);
+        assert_eq!(delays[5], CONNECT_BACKOFF_MAX);
     }
 }

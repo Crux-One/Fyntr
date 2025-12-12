@@ -27,6 +27,11 @@ pub(crate) struct Register {
     pub backend_write: Arc<Mutex<OwnedWriteHalf>>,
 }
 
+/// Returns whether the scheduler can admit another connection right now.
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub(crate) struct CanAcceptConnection;
+
 #[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
@@ -334,6 +339,17 @@ impl Handler<Register> for Scheduler {
         };
 
         Ok(())
+    }
+}
+
+impl Handler<CanAcceptConnection> for Scheduler {
+    type Result = bool;
+
+    fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
+        match self.max_connections() {
+            Some(limit) => self.current_connection_count() < limit,
+            None => true,
+        }
     }
 }
 
@@ -744,6 +760,72 @@ mod tests {
             result.is_ok(),
             "registration should succeed after a connection is unregistered"
         );
+    }
+
+    #[actix_rt::test]
+    async fn can_accept_connection_returns_false_when_at_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(1)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(!can_accept, "should refuse connections when at limit");
+    }
+
+    #[actix_rt::test]
+    async fn can_accept_connection_returns_true_when_below_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(2)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(can_accept, "should allow connection while under limit");
+    }
+
+    #[actix_rt::test]
+    async fn can_accept_connection_returns_true_when_unlimited() {
+        let scheduler = Scheduler::new(1024, Duration::from_millis(10))
+            .with_max_connections(0)
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
+        assert!(can_accept, "unlimited scheduler should always allow");
     }
 
     #[actix_rt::test]
