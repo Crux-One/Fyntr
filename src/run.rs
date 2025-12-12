@@ -23,6 +23,7 @@ const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
 pub async fn server(port: u16, max_connections: usize) -> Result<()> {
     bootstrap();
+    let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
     let proxy_listen_addr = format!("127.0.0.1:{}", port);
@@ -93,6 +94,26 @@ fn ensure_nofile_limits(max_connections: usize) {
     }
 }
 
+fn cap_max_connections(max_connections: usize) -> usize {
+    if max_connections == 0 {
+        return 0;
+    }
+
+    let per_conn = FD_PER_CONNECTION as usize;
+    let headroom = FD_HEADROOM as usize;
+    let max_by_fd = usize::MAX.saturating_sub(headroom).saturating_div(per_conn);
+
+    if max_connections > max_by_fd {
+        warn!(
+            "max_connections ({}) is too large; clamping to {} to avoid overflow",
+            max_connections, max_by_fd
+        );
+        max_by_fd
+    } else {
+        max_connections
+    }
+}
+
 fn required_nofile(max_connections: usize) -> Option<u64> {
     if max_connections == 0 {
         return None;
@@ -135,10 +156,12 @@ fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<St
             "max_connections is unlimited; soft FD limit is {}; set a specific --max-connections limit or raise ulimit to avoid EMFILE",
             soft
         ));
-    } else if (max_connections as u64) > soft {
+    } else if let Some(required) = required_nofile(max_connections)
+        && required > soft
+    {
         warnings.push(format!(
-            "max_connections ({}) exceeds soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE",
-            max_connections, soft, hard
+            "required FDs ({}) for max_connections ({}) exceed soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE",
+            required, max_connections, soft, hard
         ));
     }
 
@@ -178,8 +201,20 @@ mod tests {
     fn warns_when_max_connections_exceeds_soft_limit() {
         let warnings = nofile_warnings(5000, Some((4000, 8000)));
         assert!(
-            warnings.iter().any(|w| w.contains("exceeds soft FD limit")),
+            warnings.iter().any(|w| w.contains("required FDs")),
             "should warn when requested max exceeds soft limit"
+        );
+    }
+
+    #[test]
+    fn warns_when_required_fds_exceed_soft_limit_even_if_connections_do_not() {
+        // 600 connections require 600*2 + 64 = 1264 FDs, which exceeds soft=1000.
+        let warnings = nofile_warnings(600, Some((1000, 2000)));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("required FDs") && w.contains("exceed soft FD limit")),
+            "should warn based on required FDs, not raw connections"
         );
     }
 
@@ -207,6 +242,25 @@ mod tests {
         assert!(
             warnings[0].contains("failed to get nofile limits"),
             "should only warn about missing limits"
+        );
+    }
+
+    #[test]
+    fn caps_max_connections_to_avoid_overflow() {
+        let per_conn = FD_PER_CONNECTION as usize;
+        let headroom = FD_HEADROOM as usize;
+        let max_by_fd = usize::MAX.saturating_sub(headroom).saturating_div(per_conn);
+
+        assert_eq!(cap_max_connections(0), 0, "zero remains unlimited");
+        assert_eq!(
+            cap_max_connections(max_by_fd),
+            max_by_fd,
+            "value at cap is unchanged"
+        );
+        assert_eq!(
+            cap_max_connections(max_by_fd.saturating_add(1)),
+            max_by_fd,
+            "value above cap is clamped"
         );
     }
 }
