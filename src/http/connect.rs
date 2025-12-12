@@ -223,7 +223,10 @@ impl ConnectState {
                 target_host,
                 target_port,
             } => {
-                // Early admission check to avoid spinning up outbound sockets when at capacity.
+                // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
+                // This is not atomic with the subsequent `Register` call; between here and registration
+                // other flows may be accepted, so this check can return a false positive. The atomic
+                // `Register` is the authoritative gatekeeper for enforcing the hard limit.
                 match session.scheduler.send(CanAcceptConnection).await {
                     Ok(false) => {
                         let detail = "scheduler at capacity before dialing";

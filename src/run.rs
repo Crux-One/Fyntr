@@ -146,7 +146,11 @@ fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<St
     let (soft, hard) = match limits {
         Some((soft, hard)) => (soft, hard),
         None => {
-            warnings.push("failed to get nofile limits".to_string());
+            if cfg!(unix) {
+                warnings.push("failed to get nofile limits".to_string());
+            } else {
+                warnings.push("FD limit checking not available on this platform".to_string());
+            }
             return warnings;
         }
     };
@@ -227,22 +231,38 @@ mod tests {
     #[test]
     fn warns_when_limits_unavailable() {
         let warnings = nofile_warnings(100, None);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("failed to get nofile limits")),
-            "should warn when limits cannot be fetched"
-        );
+        if cfg!(unix) {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("failed to get nofile limits")),
+                "should warn when limits cannot be fetched"
+            );
+        } else {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("FD limit checking not available")),
+                "should warn when FD limits are unsupported"
+            );
+        }
     }
 
     #[test]
     fn warns_only_limits_unavailable_when_unlimited_and_no_limits() {
         let warnings = nofile_warnings(0, None);
         assert_eq!(warnings.len(), 1, "should emit a single warning");
-        assert!(
-            warnings[0].contains("failed to get nofile limits"),
-            "should only warn about missing limits"
-        );
+        if cfg!(unix) {
+            assert!(
+                warnings[0].contains("failed to get nofile limits"),
+                "should only warn about missing limits"
+            );
+        } else {
+            assert!(
+                warnings[0].contains("FD limit checking not available"),
+                "should only warn about unsupported limits"
+            );
+        }
     }
 
     #[test]
