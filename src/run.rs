@@ -65,28 +65,30 @@ fn bootstrap() {
 fn ensure_nofile_limits(max_connections: usize) {
     let required = required_nofile(max_connections);
     let limits = get_nofile_limits();
-    let (soft, hard) = limits.unwrap_or((u64::MAX, u64::MAX));
-    info!("FD limit: soft={}, hard={}", soft, hard);
-
+    // On Unix, try to raise the soft FD limit if it's below what's required
+    // for the configured max connections. This is best-effort; failure only
+    // results in warnings.
     #[cfg(unix)]
-    if let (Some(required), Some((_, hard_limit))) = (required, limits)
+    if let (Some(required), Some((soft, hard))) = (required, limits)
         && soft < required
     {
-        let target_soft = required.min(hard_limit);
-        match rlimit::setrlimit(rlimit::Resource::NOFILE, target_soft, hard_limit) {
+        let target_soft = required.min(hard);
+        match rlimit::setrlimit(rlimit::Resource::NOFILE, target_soft, hard) {
             Ok(_) => info!("Raised soft FD limit to {}", target_soft),
             Err(e) => warn!(
                 "failed to raise soft FD limit to {} (hard={}): {}",
-                target_soft, hard_limit, e
+                target_soft, hard, e
             ),
         }
     }
 
-    // Re-check after any adjustment attempt so warnings reflect reality.
+    // Re-check after any adjustment attempt so logs and warnings reflect reality.
     let limits = get_nofile_limits();
-    let (soft, hard) = limits.unwrap_or((u64::MAX, u64::MAX));
+    if let Some((soft, hard)) = limits {
+        info!("FD limits: soft={}, hard={}", soft, hard);
+    }
 
-    for warning in nofile_warnings(max_connections, limits, soft, hard) {
+    for warning in nofile_warnings(max_connections, limits) {
         warn!("{}", warning);
     }
 }
@@ -107,26 +109,37 @@ fn required_nofile(max_connections: usize) -> Option<u64> {
 ///
 /// Soft: the current effective per-process limit (what actually applies now).
 /// Hard: the ceiling for soft; only root can raise soft beyond hard.
+#[cfg(unix)]
 fn get_nofile_limits() -> Option<(u64, u64)> {
     rlimit::getrlimit(rlimit::Resource::NOFILE).ok()
 }
 
-fn nofile_warnings(
-    max_connections: usize,
-    limits: Option<(u64, u64)>,
-    soft: u64,
-    hard: u64,
-) -> Vec<String> {
+#[cfg(not(unix))]
+fn get_nofile_limits() -> Option<(u64, u64)> {
+    None
+}
+
+fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    if limits.is_none() {
-        warnings.push("failed to get nofile limits".to_string());
-    }
+    let (soft, hard) = match limits {
+        Some((soft, hard)) => (soft, hard),
+        None => {
+            warnings.push("failed to get nofile limits".to_string());
+            return warnings;
+        }
+    };
 
     if max_connections == 0 {
-        warnings.push(format!("max_connections is unlimited but soft FD limit is {}; set a specific --max-connections limit or raise ulimit to avoid EMFILE", soft));
+        warnings.push(format!(
+            "max_connections is unlimited; soft FD limit is {}; set a specific --max-connections limit or raise ulimit to avoid EMFILE",
+            soft
+        ));
     } else if (max_connections as u64) > soft {
-        warnings.push(format!("max_connections ({}) exceeds soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE", max_connections, soft, hard));
+        warnings.push(format!(
+            "max_connections ({}) exceeds soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE",
+            max_connections, soft, hard
+        ));
     }
 
     warnings
@@ -152,7 +165,7 @@ mod tests {
 
     #[test]
     fn warns_when_max_connections_unlimited() {
-        let warnings = nofile_warnings(0, Some((1024, 2048)), 1024, 2048);
+        let warnings = nofile_warnings(0, Some((1024, 2048)));
         assert!(
             warnings
                 .iter()
@@ -163,7 +176,7 @@ mod tests {
 
     #[test]
     fn warns_when_max_connections_exceeds_soft_limit() {
-        let warnings = nofile_warnings(5000, Some((4000, 8000)), 4000, 8000);
+        let warnings = nofile_warnings(5000, Some((4000, 8000)));
         assert!(
             warnings.iter().any(|w| w.contains("exceeds soft FD limit")),
             "should warn when requested max exceeds soft limit"
@@ -172,18 +185,28 @@ mod tests {
 
     #[test]
     fn no_warning_when_within_limits() {
-        let warnings = nofile_warnings(100, Some((1000, 2000)), 1000, 2000);
+        let warnings = nofile_warnings(100, Some((1000, 2000)));
         assert!(warnings.is_empty(), "no warnings expected within limits");
     }
 
     #[test]
     fn warns_when_limits_unavailable() {
-        let warnings = nofile_warnings(100, None, u64::MAX, u64::MAX);
+        let warnings = nofile_warnings(100, None);
         assert!(
             warnings
                 .iter()
                 .any(|w| w.contains("failed to get nofile limits")),
             "should warn when limits cannot be fetched"
+        );
+    }
+
+    #[test]
+    fn warns_only_limits_unavailable_when_unlimited_and_no_limits() {
+        let warnings = nofile_warnings(0, None);
+        assert_eq!(warnings.len(), 1, "should emit a single warning");
+        assert!(
+            warnings[0].contains("failed to get nofile limits"),
+            "should only warn about missing limits"
         );
     }
 }
