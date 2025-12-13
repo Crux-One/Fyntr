@@ -1,6 +1,6 @@
 [package]
 name = "fyntr"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
