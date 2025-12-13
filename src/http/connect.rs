@@ -2,7 +2,7 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::{
@@ -45,9 +45,9 @@ impl From<std::io::Error> for ConnectFlowError {
     }
 }
 
-#[derive(Clone, Copy)]
 /// Prebuilt HTTP status line used when responding to failed CONNECT requests.
 /// Holds the raw bytes sent to the client plus the parsed pieces for logging.
+#[derive(Clone, Copy)]
 struct StatusLine {
     raw: &'static [u8],
     code: &'static str,
@@ -457,7 +457,7 @@ async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
         let flow_id = state.flow_id();
         let current_stage = state.stage_name();
         let next = state.advance(&mut cleanup).await?;
-        info!(
+        debug!(
             "flow{}: state {} -> {}",
             flow_id.0,
             current_stage,
