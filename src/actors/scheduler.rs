@@ -125,8 +125,14 @@ impl FlowEntry {
         self.stats.update(bytes);
     }
 
+    /// Calculates the optimal Deficit Round Robin (DRR) quantum for this flow using the shared
+    /// strategy and any available packet statistics.
+    ///
+    /// The call remains a thin wrapper that forwards to the reusable `DrrQuantumStrategy`, keeping
+    /// the decision logic centralized while allowing each flow to supply its own packet history.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        DrrQuantumStrategy::default().recommended_quantum(self.stats.avg_packet_size(), default_quantum)
+        DrrQuantumStrategy::default()
+            .recommended_quantum(self.stats.avg_packet_size(), default_quantum)
     }
 }
 
@@ -139,6 +145,15 @@ struct QuantumConfig {
 }
 
 /// Tuning defaults chosen to balance small-packet latency against large-packet throughput.
+///
+/// * `min_quantum (1500 bytes)`: Standard Ethernet MTU, ensuring even latency-sensitive flows get
+///   at least one full-sized packet per scheduling turn.
+/// * `max_quantum (16 KiB)`: Prevents any single flow from monopolizing airtime while still
+///   amortizing scheduler overhead for bulk traffic.
+/// * `target_burst_packets (10)`: Empirically smooths throughput without making interactive
+///   traffic wait excessively between turns.
+/// * `small_packet_threshold (200 bytes)`: Heuristic cutoff for “chatty” or control-plane flows
+///   (e.g., TCP ACKs, SSH, VoIP) that benefit from shorter quanta to reduce jitter.
 const DEFAULT_QUANTUM_CONFIG: QuantumConfig = QuantumConfig {
     min_quantum: 1_500,
     max_quantum: 16 * 1024,
@@ -163,15 +178,17 @@ const DEFAULT_DRR_QUANTUM_STRATEGY: DrrQuantumStrategy = DrrQuantumStrategy {
 };
 
 impl DrrQuantumStrategy {
-    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet statistics.
+    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet
+    /// statistics.
     ///
-    /// The strategy dynamically adapts the quantum to balance the trade-off between low latency
-    /// and high throughput depending on the flow's characteristics.
-    fn recommended_quantum(
-        &self,
-        avg_packet_size: Option<usize>,
-        default_quantum: usize,
-    ) -> usize {
+    /// Strategy overview:
+    /// - If we have no packet history, fall back to the caller-provided default to avoid guessing.
+    /// - Small packets (below `small_packet_threshold`) get the minimum quantum to keep the
+    ///   scheduler cycling quickly and minimize jitter for interactive traffic.
+    /// - Otherwise we scale linearly to target `target_burst_packets` per turn and clamp the result
+    ///   between `min_quantum` and `max_quantum` so bulk flows gain efficiency without starving
+    ///   others.
+    fn recommended_quantum(&self, avg_packet_size: Option<usize>, default_quantum: usize) -> usize {
         match avg_packet_size {
             Some(avg) if avg < self.config.small_packet_threshold => self.config.min_quantum,
             Some(avg) => {
