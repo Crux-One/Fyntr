@@ -131,7 +131,7 @@ impl FlowEntry {
     /// The call remains a thin wrapper that forwards to the reusable `DrrQuantumStrategy`, keeping
     /// the decision logic centralized while allowing each flow to supply its own packet history.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        DrrQuantumStrategy::default()
+        DEFAULT_DRR_QUANTUM_STRATEGY
             .recommended_quantum(self.stats.avg_packet_size(), default_quantum)
     }
 }
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_drr_quantum_strategy_cases() {
-        let strategy = DrrQuantumStrategy::default();
+        let strategy = DEFAULT_DRR_QUANTUM_STRATEGY;
         let config = strategy.config;
         let default_quantum = 4096;
 
