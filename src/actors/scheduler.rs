@@ -166,12 +166,6 @@ struct DrrQuantumStrategy {
     config: QuantumConfig,
 }
 
-impl Default for DrrQuantumStrategy {
-    fn default() -> Self {
-        DEFAULT_DRR_QUANTUM_STRATEGY
-    }
-}
-
 /// Immutable default strategy reused by every flow to avoid repeatedly constructing the same tuning profile.
 const DEFAULT_DRR_QUANTUM_STRATEGY: DrrQuantumStrategy = DrrQuantumStrategy {
     config: DEFAULT_QUANTUM_CONFIG,
