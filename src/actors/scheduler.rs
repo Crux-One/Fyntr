@@ -272,6 +272,24 @@ impl Scheduler {
         self.connection_limiter.max_connections()
     }
 
+    fn log_connection_count(&self, flow_id: FlowId, action: &str) {
+        match self.max_connections() {
+            Some(limit) => info!(
+                "flow{}: {} (connections: {}/{})",
+                flow_id.0,
+                action,
+                self.current_connection_count(),
+                limit
+            ),
+            None => info!(
+                "flow{}: {} (connections: {})",
+                flow_id.0,
+                action,
+                self.current_connection_count()
+            ),
+        };
+    }
+
     fn register(
         &mut self,
         id: FlowId,
@@ -324,19 +342,7 @@ impl Handler<Register> for Scheduler {
             flow_id,
             scheduler: ctx.address(),
         });
-        match self.max_connections() {
-            Some(limit) => info!(
-                "flow{}: registered to scheduler (connections: {}/{})",
-                flow_id.0,
-                self.current_connection_count(),
-                limit
-            ),
-            None => info!(
-                "flow{}: registered to scheduler (connections: {})",
-                flow_id.0,
-                self.current_connection_count()
-            ),
-        };
+        self.log_connection_count(flow_id, "registered to scheduler");
 
         Ok(())
     }
@@ -360,19 +366,7 @@ impl Handler<Unregister> for Scheduler {
     fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
         if self.unregister(msg.flow_id) {
             self.decrement_connection_count();
-            match self.max_connections() {
-                Some(limit) => info!(
-                    "flow{}: unregistered from scheduler (connections: {}/{})",
-                    msg.flow_id.0,
-                    self.current_connection_count(),
-                    limit
-                ),
-                None => info!(
-                    "flow{}: unregistered from scheduler (connections: {})",
-                    msg.flow_id.0,
-                    self.current_connection_count()
-                ),
-            };
+            self.log_connection_count(msg.flow_id, "unregistered from scheduler");
         } else {
             debug!(
                 "flow{}: unregister requested but flow not found",
