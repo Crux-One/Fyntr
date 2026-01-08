@@ -934,6 +934,8 @@ mod tests {
         let config = strategy.config;
         let default_quantum = 4096;
 
+        // Validate DRR quantum selection across key regimes: no stats, small packets,
+        // burst-scaled packets, and clamped large packets.
         let cases = vec![
             (None, default_quantum, "no stats uses default"),
             (
@@ -949,7 +951,7 @@ mod tests {
                 "moderate packets scale by burst target",
             ),
             (
-                Some(config.max_quantum),
+                Some(config.max_quantum + 1),
                 config.max_quantum,
                 "large packets clamp at maximum",
             ),
