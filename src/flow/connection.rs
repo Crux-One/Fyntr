@@ -70,7 +70,7 @@ impl Actor for ClientToBackendActor {
 
                             if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
                                 info!(
-                                    "flow{}: client connection closed (total read: {:.2} {} in {:.2}s, avg: {:.2} {})",
+                                    "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
                                     flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
                                 );
                             }
