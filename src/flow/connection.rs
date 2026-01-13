@@ -169,12 +169,12 @@ impl Actor for BackendToClientActor {
 
                             if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
                                 info!(
-                                    "flow{}: backend connection closed (total read: {:.2} {} in {:.2}s, avg: {:.2} {})",
+                                    "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
                                     flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
                                 );
                             } else {
                                 info!(
-                                    "flow{}: backend connection closed (total read: {:.2} {} in {:.2}s)",
+                                    "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s)",
                                     flow_id.0, total_value, total_unit, elapsed
                                 );
                             }
