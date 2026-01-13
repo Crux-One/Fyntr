@@ -159,13 +159,29 @@ impl Actor for BackendToClientActor {
         ctx.spawn(
             async move {
                 let mut buf = vec![0u8; BUFFER_SIZE];
+                let mut total_read = 0u64;
+                let start_time = Instant::now();
                 loop {
                     match backend.read(&mut buf).await {
                         Ok(0) => {
-                            info!("flow{}: backend connection closed", flow_id.0);
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            let (total_value, total_unit) = format_bytes(total_read);
+
+                            if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
+                                info!(
+                                    "flow{}: backend connection closed (total read: {:.2} {} in {:.2}s, avg: {:.2} {})",
+                                    flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+                                );
+                            } else {
+                                info!(
+                                    "flow{}: backend connection closed (total read: {:.2} {} in {:.2}s)",
+                                    flow_id.0, total_value, total_unit, elapsed
+                                );
+                            }
                             break;
                         }
                         Ok(n) => {
+                            total_read += n as u64;
                             if let Err(e) = client.write_all(&buf[..n]).await {
                                 warn!("flow{}: client write error: {}", flow_id.0, e);
                                 break;
