@@ -199,7 +199,12 @@ pub(crate) struct Scheduler {
     ready_queue: VecDeque<FlowId>,
     ready_set: HashSet<FlowId>,
     default_quantum: usize,
-    tick: Duration,
+    /// Baseline tick interval used while flows are active.
+    tick_base: Duration,
+    /// Current tick interval (backs off while idle, resets when flows appear).
+    tick_current: Duration,
+    /// Monotonic generation counter to ignore stale scheduled ticks.
+    tick_generation: u64,
     total_client_to_backend_bytes: u64,
     total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
@@ -210,10 +215,7 @@ impl Actor for Scheduler {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let tick = self.tick;
-        ctx.run_interval(tick, |_act, ctx| {
-            ctx.address().do_send(QuantumTick);
-        });
+        self.schedule_tick(ctx);
     }
 }
 
@@ -232,6 +234,8 @@ impl Handler<QuantumTick> for Scheduler {
         if self.total_ticks.is_multiple_of(500) {
             self.log_stats();
         }
+        self.update_tick_interval();
+        self.schedule_tick(ctx);
     }
 }
 
@@ -251,7 +255,9 @@ impl Scheduler {
             ready_queue: VecDeque::new(),
             ready_set: HashSet::new(),
             default_quantum: quantum,
-            tick,
+            tick_base: tick,
+            tick_current: tick,
+            tick_generation: 0,
             total_client_to_backend_bytes: 0,
             total_backend_to_client_bytes: 0,
             global_start_time: None,
@@ -337,6 +343,35 @@ impl Scheduler {
             self.ready_queue.retain(|flow_id| *flow_id != id);
         }
     }
+
+    fn schedule_tick(&mut self, ctx: &mut <Self as Actor>::Context) {
+        // Advance the generation so any previously scheduled callbacks become stale.
+        self.tick_generation = self.tick_generation.wrapping_add(1);
+        let generation = self.tick_generation;
+        let delay = self.tick_current;
+        ctx.run_later(delay, move |act, ctx| {
+            // Only the most recently scheduled tick is allowed to fire.
+            if act.tick_generation == generation {
+                ctx.address().do_send(QuantumTick);
+            }
+        });
+    }
+
+    fn update_tick_interval(&mut self) {
+        // When there are no flows, exponentially back off the tick interval to reduce wakeups.
+        // As soon as there is activity, restore the baseline interval for low latency.
+        const MAX_IDLE_TICK_MULTIPLIER: u32 = 16;
+
+        if self.flows.is_empty() {
+            let max_idle = self.tick_base.saturating_mul(MAX_IDLE_TICK_MULTIPLIER);
+            if self.tick_current < max_idle {
+                let next = self.tick_current.saturating_mul(2);
+                self.tick_current = next.min(max_idle);
+            }
+        } else {
+            self.tick_current = self.tick_base;
+        }
+    }
 }
 
 // Handler for Register
@@ -345,6 +380,7 @@ impl Handler<Register> for Scheduler {
 
     fn handle(&mut self, msg: Register, ctx: &mut Self::Context) -> Self::Result {
         self.try_increment_connection_count()?;
+        let was_idle = self.flows.is_empty();
         let flow_id = msg.flow_id;
         let queue_addr = msg.queue_addr;
         let backend_write = msg.backend_write;
@@ -355,6 +391,10 @@ impl Handler<Register> for Scheduler {
             scheduler: ctx.address(),
         });
         self.log_connection_count(flow_id, "registered to scheduler");
+        if was_idle {
+            self.tick_current = self.tick_base;
+            ctx.address().do_send(QuantumTick);
+        }
 
         Ok(())
     }
