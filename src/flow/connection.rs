@@ -73,6 +73,11 @@ impl Actor for ClientToBackendActor {
                                     "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
                                     flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
                                 );
+                            } else {
+                                info!(
+                                    "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s)",
+                                    flow_id.0, total_value, total_unit, elapsed
+                                );
                             }
 
                             break;
