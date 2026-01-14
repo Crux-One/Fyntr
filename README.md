@@ -25,6 +25,11 @@ Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbou
 Zero config required. Fyntr stays out of the way with no auth, no inspection, and a tiny runtime memory footprint (typically ~14MB RSS on macOS).
 Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and robust.
 
+## Internals
+- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round Robin scheduling).
+- Adaptive quantum tuning (optimizes quantum size via packet size statistics).
+- FD limit guard (adjusts/warns about file descriptor limits based on max connections).
+
 ## Quick Start
 
 1. Install and run Fyntr:
