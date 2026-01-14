@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "fyntr"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "actix",
  "actix-rt",
