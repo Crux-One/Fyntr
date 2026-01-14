@@ -14,12 +14,12 @@ path = "src/main.rs"
 [dependencies]
 actix = "0.13"
 actix-rt = "2"
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 anyhow = "1"
 bytes = "1.11"
-clap = { version = "4.5.53", features = ["derive", "env"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
 env_logger = "0.11"
-log = "0.4"
+log = "0.4.29"
 
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
