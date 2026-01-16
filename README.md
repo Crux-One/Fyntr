@@ -75,6 +75,13 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     curl https://ifconfig.me
     ```
 
+## CLI Options
+
+| Option | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
+| `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set to `0` for unlimited). |
+
 ## Why Fyntr?
 Managing cloud operations with tools such as Terraform might spawn bursts of short-lived TCP connections rapidly opening and closing.
 The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
