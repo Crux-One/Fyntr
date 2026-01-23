@@ -2,7 +2,7 @@ use super::FlowId;
 
 use actix::prelude::*;
 use bytes::Bytes;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -97,29 +97,40 @@ impl Actor for ClientToBackendActor {
                     }
                 }
 
-                // Unregister this flow from the scheduler to signal completion and trigger cleanup.
-                for attempt in 1..=UNREGISTER_RETRY_LIMIT {
-                    match scheduler.send(Unregister { flow_id }).await {
-                        Ok(_) => break,
-                        Err(e) if attempt == UNREGISTER_RETRY_LIMIT => {
-                            warn!(
-                                "flow{}: failed to unregister from scheduler after {} attempts: {}",
-                                flow_id.0, attempt, e
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "flow{}: unregister attempt {}/{} failed: {}; retrying",
-                                flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, e
-                            );
-                            sleep(Duration::from_millis(UNREGISTER_RETRY_DELAY_MS)).await;
-                        }
-                    }
-                }
+                let scheduler = scheduler.clone();
+                unregister_flow(scheduler, flow_id).await;
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
         );
+    }
+}
+
+async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
+    // Unregister this flow from the scheduler to signal completion and trigger cleanup.
+    for attempt in 1..=UNREGISTER_RETRY_LIMIT {
+        match scheduler.send(Unregister { flow_id }).await {
+            Ok(_) => {
+                debug!(
+                    "flow{}: successfully unregistered from scheduler",
+                    flow_id.0
+                );
+                return;
+            }
+            Err(e) if attempt == UNREGISTER_RETRY_LIMIT => {
+                warn!(
+                    "flow{}: failed to unregister from scheduler after {} attempts: {}",
+                    flow_id.0, attempt, e
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "flow{}: unregister attempt {}/{} failed: {}; retrying",
+                    flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, e
+                );
+                sleep(Duration::from_millis(UNREGISTER_RETRY_DELAY_MS)).await;
+            }
+        }
     }
 }
 
