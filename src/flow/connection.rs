@@ -98,7 +98,6 @@ impl Actor for ClientToBackendActor {
                     }
                 }
 
-                let scheduler = scheduler.clone();
                 unregister_flow(scheduler, flow_id).await;
             }
             .into_actor(self)
