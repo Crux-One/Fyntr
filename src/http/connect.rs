@@ -169,205 +169,222 @@ impl ConnectState {
         }
     }
 
-    async fn advance(self, cleanup: &mut FlowCleanup) -> ConnectResult<ConnectState> {
-        match self {
-            ConnectState::Validating(mut session) => {
-                let request_line = read_request_line(&mut session.client_reader).await?;
+    async fn advance_validating(mut session: ConnectSession) -> ConnectResult<ConnectState> {
+        let request_line = read_request_line(&mut session.client_reader).await?;
 
-                if !request_line.is_http_1x() {
-                    let detail = format!(
-                        "unsupported HTTP version {} from {}",
-                        request_line.version, session.client_addr
-                    );
-                    return respond_with_status(
-                        session.flow_id,
-                        &mut session.client_write,
-                        StatusLine::VERSION_NOT_SUPPORTED,
-                        StatusLogLevel::Warn,
-                        detail,
-                    )
-                    .await;
-                }
+        if !request_line.is_http_1x() {
+            let detail = format!(
+                "unsupported HTTP version {} from {}",
+                request_line.version, session.client_addr
+            );
+            return respond_with_status(
+                session.flow_id,
+                &mut session.client_write,
+                StatusLine::VERSION_NOT_SUPPORTED,
+                StatusLogLevel::Warn,
+                detail,
+            )
+            .await;
+        }
 
-                if !request_line.is_connect_method() {
-                    let detail = format!(
-                        "unsupported method {} from {}",
-                        request_line.method, session.client_addr
-                    );
-                    return respond_with_status(
-                        session.flow_id,
-                        &mut session.client_write,
-                        StatusLine::METHOD_NOT_ALLOWED,
-                        StatusLogLevel::Warn,
-                        detail,
-                    )
-                    .await;
-                }
+        if !request_line.is_connect_method() {
+            let detail = format!(
+                "unsupported method {} from {}",
+                request_line.method, session.client_addr
+            );
+            return respond_with_status(
+                session.flow_id,
+                &mut session.client_write,
+                StatusLine::METHOD_NOT_ALLOWED,
+                StatusLogLevel::Warn,
+                detail,
+            )
+            .await;
+        }
 
-                let (target_host, target_port) = request_line.parse_connect_target()?;
-                info!(
-                    "flow{}: CONNECT {}:{}",
-                    session.flow_id.0, target_host, target_port
-                );
+        let (target_host, target_port) = request_line.parse_connect_target()?;
+        info!(
+            "flow{}: CONNECT {}:{}",
+            session.flow_id.0, target_host, target_port
+        );
 
-                skip_headers(&mut session.client_reader).await?;
+        skip_headers(&mut session.client_reader).await?;
 
-                Ok(ConnectState::Dialing {
-                    session,
-                    target_host,
-                    target_port,
-                })
+        Ok(ConnectState::Dialing {
+            session,
+            target_host,
+            target_port,
+        })
+    }
+
+    async fn advance_dialing(
+        mut session: ConnectSession,
+        target_host: String,
+        target_port: u16,
+        cleanup: &mut FlowCleanup,
+    ) -> ConnectResult<ConnectState> {
+        // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
+        // This is not atomic with the subsequent `Register` call; between here and registration
+        // other flows may be accepted, so this check can return a false positive. The atomic
+        // `Register` is the authoritative gatekeeper for enforcing the hard limit.
+        match session.scheduler.send(CanAcceptConnection).await {
+            Ok(false) => {
+                let detail = "scheduler at capacity before dialing";
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::SERVICE_UNAVAILABLE,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
             }
-            ConnectState::Dialing {
-                mut session,
-                target_host,
-                target_port,
-            } => {
-                // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
-                // This is not atomic with the subsequent `Register` call; between here and registration
-                // other flows may be accepted, so this check can return a false positive. The atomic
-                // `Register` is the authoritative gatekeeper for enforcing the hard limit.
-                match session.scheduler.send(CanAcceptConnection).await {
-                    Ok(false) => {
-                        let detail = "scheduler at capacity before dialing";
-                        return respond_with_status(
-                            session.flow_id,
-                            &mut session.client_write,
-                            StatusLine::SERVICE_UNAVAILABLE,
-                            StatusLogLevel::Warn,
-                            detail,
-                        )
-                        .await;
-                    }
-                    Ok(true) => {}
-                    Err(e) => {
-                        let detail = format!("failed to check capacity before dialing: {}", e);
-                        return respond_with_status(
-                            session.flow_id,
-                            &mut session.client_write,
-                            StatusLine::SERVICE_UNAVAILABLE,
-                            StatusLogLevel::Error,
-                            detail,
-                        )
-                        .await;
-                    }
-                }
+            Ok(true) => {}
+            Err(e) => {
+                let detail = format!("failed to check capacity before dialing: {}", e);
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::SERVICE_UNAVAILABLE,
+                    StatusLogLevel::Error,
+                    detail,
+                )
+                .await;
+            }
+        }
 
-                let backend_addr = format!("{}:{}", target_host, target_port);
-                let backend_stream = match connect_with_backoff(session.flow_id, &backend_addr)
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        let detail =
-                            format!("failed to connect to {} after retries: {}", backend_addr, e);
-                        return respond_with_status(
-                            session.flow_id,
-                            &mut session.client_write,
-                            StatusLine::BAD_GATEWAY,
-                            StatusLogLevel::Error,
-                            detail,
-                        )
-                        .await;
-                    }
-                };
+        let backend_addr = format!("{}:{}", target_host, target_port);
+        let backend_stream = match connect_with_backoff(session.flow_id, &backend_addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let detail = format!("failed to connect to {} after retries: {}", backend_addr, e);
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::BAD_GATEWAY,
+                    StatusLogLevel::Error,
+                    detail,
+                )
+                .await;
+            }
+        };
 
-                backend_stream
-                    .set_nodelay(true)
-                    .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
+        backend_stream
+            .set_nodelay(true)
+            .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
 
-                info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
+        info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
 
-                let (backend_read, backend_write) = backend_stream.into_split();
-                let queue_tx = QueueActor::new().start();
-                cleanup.watch_queue(queue_tx.clone());
+        let (backend_read, backend_write) = backend_stream.into_split();
+        let queue_tx = QueueActor::new().start();
+        cleanup.watch_queue(queue_tx.clone());
 
-                Ok(ConnectState::Registering {
+        Ok(ConnectState::Registering {
+            session,
+            queue_tx,
+            backend_read,
+            backend_write: Arc::new(Mutex::new(backend_write)),
+        })
+    }
+
+    async fn advance_registering(
+        mut session: ConnectSession,
+        queue_tx: Addr<QueueActor>,
+        backend_read: OwnedReadHalf,
+        backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        cleanup: &mut FlowCleanup,
+    ) -> ConnectResult<ConnectState> {
+        match session
+            .scheduler
+            .send(Register {
+                flow_id: session.flow_id,
+                queue_addr: queue_tx.clone(),
+                backend_write: backend_write.clone(),
+            })
+            .await
+        {
+            Ok(Ok(())) => {
+                cleanup.mark_registered();
+                Ok(ConnectState::Established {
                     session,
                     queue_tx,
                     backend_read,
-                    backend_write: Arc::new(Mutex::new(backend_write)),
                 })
             }
+            Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
+                let detail = format!("registration rejected - max connections ({}) reached", max);
+                respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::SERVICE_UNAVAILABLE,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await
+            }
+            Err(e) => {
+                error!(
+                    "flow{}: failed to register with scheduler: {}",
+                    session.flow_id.0, e
+                );
+                Err(ConnectFlowError::Fatal(anyhow!(
+                    "Scheduler registration failed"
+                )))
+            }
+        }
+    }
+
+    async fn advance_established(
+        session: ConnectSession,
+        queue_tx: Addr<QueueActor>,
+        backend_read: OwnedReadHalf,
+        cleanup: &mut FlowCleanup,
+    ) -> ConnectResult<ConnectState> {
+        let ConnectSession {
+            flow_id,
+            scheduler,
+            client_reader,
+            mut client_write,
+            ..
+        } = session;
+
+        if let Err(e) = send_connect_response(&mut client_write).await {
+            return Err(ConnectFlowError::Fatal(e));
+        }
+
+        let client_read = client_reader.into_inner();
+        let scheduler_for_client = scheduler.clone();
+
+        ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler_for_client)
+            .start();
+        BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone()).start();
+
+        cleanup.disarm();
+        Ok(ConnectState::Finished(flow_id))
+    }
+
+    async fn advance(self, cleanup: &mut FlowCleanup) -> ConnectResult<ConnectState> {
+        match self {
+            ConnectState::Validating(session) => Self::advance_validating(session).await,
+            ConnectState::Dialing {
+                session,
+                target_host,
+                target_port,
+            } => Self::advance_dialing(session, target_host, target_port, cleanup).await,
             ConnectState::Registering {
-                mut session,
+                session,
                 queue_tx,
                 backend_read,
                 backend_write,
             } => {
-                match session
-                    .scheduler
-                    .send(Register {
-                        flow_id: session.flow_id,
-                        queue_addr: queue_tx.clone(),
-                        backend_write: backend_write.clone(),
-                    })
+                Self::advance_registering(session, queue_tx, backend_read, backend_write, cleanup)
                     .await
-                {
-                    Ok(Ok(())) => {
-                        cleanup.mark_registered();
-                        Ok(ConnectState::Established {
-                            session,
-                            queue_tx,
-                            backend_read,
-                        })
-                    }
-                    Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
-                        let detail =
-                            format!("registration rejected - max connections ({}) reached", max);
-                        respond_with_status(
-                            session.flow_id,
-                            &mut session.client_write,
-                            StatusLine::SERVICE_UNAVAILABLE,
-                            StatusLogLevel::Warn,
-                            detail,
-                        )
-                        .await
-                    }
-                    Err(e) => {
-                        error!(
-                            "flow{}: failed to register with scheduler: {}",
-                            session.flow_id.0, e
-                        );
-                        Err(ConnectFlowError::Fatal(anyhow!(
-                            "Scheduler registration failed"
-                        )))
-                    }
-                }
             }
             ConnectState::Established {
                 session,
                 queue_tx,
                 backend_read,
-            } => {
-                let ConnectSession {
-                    flow_id,
-                    scheduler,
-                    client_reader,
-                    mut client_write,
-                    ..
-                } = session;
-
-                if let Err(e) = send_connect_response(&mut client_write).await {
-                    return Err(ConnectFlowError::Fatal(e));
-                }
-
-                let client_read = client_reader.into_inner();
-                let scheduler_for_client = scheduler.clone();
-
-                ClientToBackendActor::new(
-                    flow_id,
-                    client_read,
-                    queue_tx.clone(),
-                    scheduler_for_client,
-                )
-                .start();
-                BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone())
-                    .start();
-
-                cleanup.disarm();
-                Ok(ConnectState::Finished(flow_id))
-            }
+            } => Self::advance_established(session, queue_tx, backend_read, cleanup).await,
             ConnectState::Finished(flow_id) => Ok(ConnectState::Finished(flow_id)),
         }
     }
@@ -433,6 +450,39 @@ impl Drop for FlowCleanup {
     }
 }
 
+struct ConnectStateMachine {
+    state: ConnectState,
+    cleanup: FlowCleanup,
+}
+
+impl ConnectStateMachine {
+    fn new(session: ConnectSession) -> Self {
+        let cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
+        let state = ConnectState::Validating(session);
+        Self { state, cleanup }
+    }
+
+    async fn run(mut self) -> ConnectResult<()> {
+        loop {
+            let flow_id = self.state.flow_id();
+            let current_stage = self.state.stage_name();
+            let next = self.state.advance(&mut self.cleanup).await?;
+            debug!(
+                "flow{}: state {} -> {}",
+                flow_id.0,
+                current_stage,
+                next.stage_name()
+            );
+
+            if matches!(next, ConnectState::Finished(_)) {
+                return Ok(());
+            }
+
+            self.state = next;
+        }
+    }
+}
+
 /// Handle the CONNECT method and operate as an HTTPS proxy
 pub(crate) async fn handle_connect_proxy(
     client_stream: TcpStream,
@@ -450,26 +500,7 @@ pub(crate) async fn handle_connect_proxy(
 }
 
 async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
-    let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
-    let mut state = ConnectState::Validating(session);
-
-    loop {
-        let flow_id = state.flow_id();
-        let current_stage = state.stage_name();
-        let next = state.advance(&mut cleanup).await?;
-        debug!(
-            "flow{}: state {} -> {}",
-            flow_id.0,
-            current_stage,
-            next.stage_name()
-        );
-
-        if matches!(next, ConnectState::Finished(_)) {
-            return Ok(());
-        }
-
-        state = next;
-    }
+    ConnectStateMachine::new(session).run().await
 }
 
 const CONNECT_MAX_ATTEMPTS: usize = 3;

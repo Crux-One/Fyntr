@@ -21,12 +21,13 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic.
-Zero server config required. Fyntr stays out of the way with no auth, no inspection, and a tiny runtime memory footprint (typically ~14MB RSS on macOS).
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic to keep connections stable on constrained networks.
+No server-side changes required. Fyntr stays out of the way with no auth, no inspection.
+It keeps a tiny runtime memory footprint (typically ~14MB RSS on macOS).
 Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and robust.
 
 ## Internals
-- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round Robin scheduling).
+- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round-Robin scheduling).
 - Adaptive quantum tuning (optimizes quantum size via packet size statistics).
 - FD limit guard (validates file descriptor limits against max connection settings).
 
@@ -75,6 +76,13 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
     curl https://ifconfig.me
     ```
 
+## CLI Options
+
+| Option | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
+| `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set to `0` for unlimited). |
+
 ## Why Fyntr?
 Managing cloud operations with tools such as Terraform might spawn bursts of short-lived TCP connections rapidly opening and closing.
 The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
@@ -83,8 +91,8 @@ Fyntr takes a simpler approach. Instead of pooling connections, it evens out how
 The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
 so packet bursts from many parallel flows get interleaved instead of firing all at once.
 
-This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of connections.
-This effect is most noticeable when workloads involve many concurrent connections, and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
+This smoothing makes it less likely for small routers to choke their CPUs during connection bursts.
+This effect is most noticeable when workloads involve many concurrent connections and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
 
 ## Usage with Terraform
 
