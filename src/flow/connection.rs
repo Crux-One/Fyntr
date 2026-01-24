@@ -20,6 +20,7 @@ use crate::{
 const BUFFER_SIZE: usize = 8 * 1024; // 8 KB
 const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
+const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
 
 pub(crate) struct ClientToBackendActor {
     flow_id: FlowId,
@@ -108,6 +109,8 @@ impl Actor for ClientToBackendActor {
 
 async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
     // Unregister this flow from the scheduler to signal completion and trigger cleanup.
+    let mut delay = Duration::from_millis(UNREGISTER_RETRY_DELAY_MS);
+    let max_delay = Duration::from_secs(UNREGISTER_RETRY_MAX_DELAY_SECS);
     for attempt in 1..=UNREGISTER_RETRY_LIMIT {
         match scheduler.send(Unregister { flow_id }).await {
             Ok(_) => {
@@ -128,7 +131,8 @@ async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
                     "flow{}: unregister attempt {}/{} failed: {}; retrying",
                     flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, e
                 );
-                sleep(Duration::from_millis(UNREGISTER_RETRY_DELAY_MS)).await;
+                sleep(delay).await;
+                delay = delay.saturating_mul(2).min(max_delay);
             }
         }
     }
