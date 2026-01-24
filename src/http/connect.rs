@@ -450,6 +450,39 @@ impl Drop for FlowCleanup {
     }
 }
 
+struct ConnectStateMachine {
+    state: ConnectState,
+    cleanup: FlowCleanup,
+}
+
+impl ConnectStateMachine {
+    fn new(session: ConnectSession) -> Self {
+        let cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
+        let state = ConnectState::Validating(session);
+        Self { state, cleanup }
+    }
+
+    async fn run(mut self) -> ConnectResult<()> {
+        loop {
+            let flow_id = self.state.flow_id();
+            let current_stage = self.state.stage_name();
+            let next = self.state.advance(&mut self.cleanup).await?;
+            debug!(
+                "flow{}: state {} -> {}",
+                flow_id.0,
+                current_stage,
+                next.stage_name()
+            );
+
+            if matches!(next, ConnectState::Finished(_)) {
+                return Ok(());
+            }
+
+            self.state = next;
+        }
+    }
+}
+
 /// Handle the CONNECT method and operate as an HTTPS proxy
 pub(crate) async fn handle_connect_proxy(
     client_stream: TcpStream,
@@ -467,26 +500,7 @@ pub(crate) async fn handle_connect_proxy(
 }
 
 async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
-    let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
-    let mut state = ConnectState::Validating(session);
-
-    loop {
-        let flow_id = state.flow_id();
-        let current_stage = state.stage_name();
-        let next = state.advance(&mut cleanup).await?;
-        debug!(
-            "flow{}: state {} -> {}",
-            flow_id.0,
-            current_stage,
-            next.stage_name()
-        );
-
-        if matches!(next, ConnectState::Finished(_)) {
-            return Ok(());
-        }
-
-        state = next;
-    }
+    ConnectStateMachine::new(session).run().await
 }
 
 const CONNECT_MAX_ATTEMPTS: usize = 3;
