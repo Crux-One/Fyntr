@@ -21,12 +21,13 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic.
-Zero server config required. Fyntr stays out of the way with no auth, no inspection, and a tiny runtime memory footprint (typically ~14MB RSS on macOS).
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic to keep connections stable on constrained networks.
+No server-side changes required. Fyntr stays out of the way with no auth, no inspection.
+It keeps a tiny runtime memory footprint (typically ~14MB RSS on macOS).
 Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and robust.
 
 ## Internals
-- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round Robin scheduling).
+- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round-Robin scheduling).
 - Adaptive quantum tuning (optimizes quantum size via packet size statistics).
 - FD limit guard (validates file descriptor limits against max connection settings).
 
@@ -90,8 +91,8 @@ Fyntr takes a simpler approach. Instead of pooling connections, it evens out how
 The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
 so packet bursts from many parallel flows get interleaved instead of firing all at once.
 
-This smoothing of peaks makes it less likely for small routers to choke their CPU during bursts of connections.
-This effect is most noticeable when workloads involve many concurrent connections, and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
+This smoothing makes it less likely for small routers to choke their CPUs during connection bursts.
+This effect is most noticeable when workloads involve many concurrent connections and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
 
 ## Usage with Terraform
 
