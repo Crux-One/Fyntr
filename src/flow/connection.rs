@@ -1,7 +1,7 @@
 use super::FlowId;
 
 use actix::prelude::*;
-use bytes::Bytes;
+use bytes::BytesMut;
 use log::{debug, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -59,12 +59,12 @@ impl Actor for ClientToBackendActor {
 
         ctx.spawn(
             async move {
-                let mut buf = vec![0u8; BUFFER_SIZE];
+                let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
 
                 loop {
-                    match client.read(&mut buf).await {
+                    match client.read_buf(&mut buf).await {
                         Ok(0) => {
                             let elapsed = start_time.elapsed().as_secs_f64();
                             let (total_value, total_unit) = format_bytes(total_read);
@@ -85,7 +85,7 @@ impl Actor for ClientToBackendActor {
                         }
                         Ok(n) => {
                             total_read += n as u64;
-                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            let chunk = buf.split_to(n).freeze();
                             if let Err(e) = queue_tx.send(Enqueue(chunk)).await {
                                 warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
                                 break;
