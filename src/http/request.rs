@@ -16,15 +16,17 @@ impl RequestLine {
     /// Parse the request line into method, target, and version fields.
     /// Example: "CONNECT api.aws.amazon.com:443 HTTP/1.1"
     pub(crate) fn parse(line: &str) -> Result<Self> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 3 {
-            return Err(anyhow!("Invalid request line: {}", line));
-        }
+        let mut parts = line.split_whitespace();
+        let (method, target, version) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(method), Some(target), Some(version), None) => (method, target, version),
+                _ => return Err(anyhow!("Invalid request line: {}", line)),
+            };
 
         Ok(RequestLine {
-            method: parts[0].to_string(),
-            target: parts[1].to_string(),
-            version: parts[2].to_string(),
+            method: method.to_string(),
+            target: target.to_string(),
+            version: version.to_string(),
         })
     }
 
@@ -40,20 +42,20 @@ impl RequestLine {
 
     /// Extracts the host and port from the CONNECT target.
     /// Example: "api.aws.amazon.com:443" -> ("api.aws.amazon.com", 443)
+    /// Note: IPv6 bracket form (e.g., "[2001:db8::1]:443") is not supported.
     pub(crate) fn parse_connect_target(&self) -> Result<(String, u16)> {
         if !self.is_connect_method() {
             return Err(anyhow!("Not a CONNECT request"));
         }
 
-        let parts: Vec<&str> = self.target.split(':').collect();
-        if parts.len() != 2 {
-            return Err(anyhow!("Invalid CONNECT target: {}", self.target));
-        }
-
-        let host = parts[0].to_string();
-        let port = parts[1]
+        let (host, port) = self
+            .target
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Invalid CONNECT target: {}", self.target))?;
+        let host = host.to_string();
+        let port = port
             .parse::<u16>()
-            .map_err(|_| anyhow!("Invalid port: {}", parts[1]))?;
+            .map_err(|_| anyhow!("Invalid port: {}", port))?;
 
         Ok((host, port))
     }
