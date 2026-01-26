@@ -121,6 +121,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_line_rejects_too_many_parts() {
+        let err = RequestLine::parse("CONNECT host:443 HTTP/1.1 extra").unwrap_err();
+        assert!(err.to_string().contains("Invalid request line"));
+    }
+
+    #[test]
     fn test_parse_connect_target() {
         let line = "CONNECT api.aws.amazon.com:443 HTTP/1.1";
         let req = RequestLine::parse(line).unwrap();
