@@ -21,15 +21,14 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic to keep connections stable on constrained networks.
-No server-side changes required. Fyntr stays out of the way with no auth, no inspection.
-It keeps a tiny runtime memory footprint (typically ~14MB RSS on macOS).
-Its internal actor-driven scheduler relays encrypted traffic transparently without terminating TLS, making bursty workloads more predictable and robust.
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic, stabilizing connections on constrained networks.
+No server-side changes required, no auth, no inspection.
+Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
 
 ## Internals
-- Traffic shaping (prevents burst congestion by interleaving packets via Deficit Round-Robin scheduling).
-- Adaptive quantum tuning (optimizes quantum size via packet size statistics).
-- FD limit guard (validates file descriptor limits against max connection settings).
+- Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
+- Adaptive quantum tuning: Optimizes quantum size via packet size statistics to reduce latency spikes and improve throughput.
+- FD limit guard: Validates file descriptor limits against max connection settings.
 
 ## Quick Start
 
@@ -52,7 +51,8 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
 
     ```bash
     cargo run --release -- --port 8080 --max-connections 512
-    # or
+
+    # Or use environment variables
     FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
     ```
 
@@ -84,15 +84,15 @@ Its internal actor-driven scheduler relays encrypted traffic transparently witho
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set to `0` for unlimited). |
 
 ## Why Fyntr?
-Managing cloud operations with tools such as Terraform might spawn bursts of short-lived TCP connections rapidly opening and closing.
+Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.
 The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
 
-Fyntr takes a simpler approach. Instead of pooling connections, it evens out how active flows are serviced.
-The scheduler uses Deficit Round-Robin (DRR) to distribute sending opportunities across flows fairly,
-so packet bursts from many parallel flows get interleaved instead of firing all at once.
+Rather than relying on connection pooling, Fyntr regulates the traffic itself.
+Its scheduler uses DRR to distribute sending opportunities across active flows fairly,
+so packet bursts from many parallel flows get interleaved instead of letting them fire all at once.
 
-This smoothing makes it less likely for small routers to choke their CPUs during connection bursts.
-This effect is most noticeable when workloads involve many concurrent connections and where CPU scheduling pressure, rather than bandwidth, is the primary bottleneck.
+This smoothing reduces CPU pressure on routers during connection storms.
+This effect is most critical when scheduling overhead, rather than bandwidth, is the primary bottleneck.
 
 ## Usage with Terraform
 
@@ -105,6 +105,6 @@ export HTTPS_PROXY=http://127.0.0.1:9999
 # Standard usage
 terraform apply
 
-# Or with aws-vault wrapper
+# Or use aws-vault wrapper
 aws-vault exec my-profile -- terraform apply
 ```
