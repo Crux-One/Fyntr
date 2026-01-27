@@ -12,7 +12,12 @@ use env_logger::Env;
 use log::{error, info, warn};
 use tokio::net::TcpListener;
 
-use crate::{actors::scheduler::Scheduler, flow::FlowId, http::connect::handle_connect_proxy};
+use crate::{
+    actors::scheduler::Scheduler,
+    flow::FlowId,
+    http::connect::handle_connect_proxy,
+    limits::{MaxConnections, max_connections_from_raw, max_connections_value},
+};
 
 pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
@@ -21,7 +26,7 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
-pub async fn server(port: u16, max_connections: usize) -> Result<()> {
+pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
     bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
@@ -63,7 +68,7 @@ fn bootstrap() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 }
 
-fn ensure_nofile_limits(max_connections: usize) {
+fn ensure_nofile_limits(max_connections: MaxConnections) {
     let required = required_nofile(max_connections);
     let limits = get_nofile_limits();
     // On Unix, try to raise the soft FD limit if it's below what's required
@@ -94,11 +99,8 @@ fn ensure_nofile_limits(max_connections: usize) {
     }
 }
 
-fn cap_max_connections(max_connections: usize) -> usize {
-    if max_connections == 0 {
-        return 0;
-    }
-
+fn cap_max_connections(max_connections: MaxConnections) -> MaxConnections {
+    let max_connections = max_connections?.get();
     let per_conn = FD_PER_CONNECTION as usize;
     let headroom = FD_HEADROOM as usize;
     let max_by_fd = usize::MAX.saturating_sub(headroom).saturating_div(per_conn);
@@ -108,22 +110,18 @@ fn cap_max_connections(max_connections: usize) -> usize {
             "max_connections ({}) is too large; clamping to {} to avoid overflow",
             max_connections, max_by_fd
         );
-        max_by_fd
+        max_connections_from_raw(max_by_fd)
     } else {
-        max_connections
+        max_connections_from_raw(max_connections)
     }
 }
 
-fn required_nofile(max_connections: usize) -> Option<u64> {
-    if max_connections == 0 {
-        return None;
-    }
-
-    Some(
-        (max_connections as u64)
+fn required_nofile(max_connections: MaxConnections) -> Option<u64> {
+    max_connections_value(max_connections).map(|max| {
+        (max as u64)
             .saturating_mul(FD_PER_CONNECTION)
-            .saturating_add(FD_HEADROOM),
-    )
+            .saturating_add(FD_HEADROOM)
+    })
 }
 
 /// Returns the RLIMIT_NOFILE soft and hard limits, if available.
@@ -140,7 +138,7 @@ fn get_nofile_limits() -> Option<(u64, u64)> {
     None
 }
 
-fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<String> {
+fn nofile_warnings(max_connections: MaxConnections, limits: Option<(u64, u64)>) -> Vec<String> {
     let mut warnings = Vec::new();
 
     let (soft, hard) = match limits {
@@ -155,7 +153,7 @@ fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<St
         }
     };
 
-    if max_connections == 0 {
+    if max_connections.is_none() {
         warnings.push(format!(
             "max_connections is unlimited; soft FD limit is {}; set a specific --max-connections limit or raise ulimit to avoid EMFILE",
             soft
@@ -163,6 +161,7 @@ fn nofile_warnings(max_connections: usize, limits: Option<(u64, u64)>) -> Vec<St
     } else if let Some(required) = required_nofile(max_connections)
         && required > soft
     {
+        let max_connections = max_connections_value(max_connections).unwrap_or(0);
         warnings.push(format!(
             "required FDs ({}) for max_connections ({}) exceed soft FD limit (soft={}, hard={}); increase ulimit or lower max_connections to avoid EMFILE",
             required, max_connections, soft, hard
@@ -178,21 +177,24 @@ mod tests {
 
     #[test]
     fn required_nofile_unlimited_is_none() {
-        assert_eq!(required_nofile(0), None);
+        assert_eq!(required_nofile(max_connections_from_raw(0)), None);
     }
 
     #[test]
     fn required_nofile_scales_with_connections() {
-        assert_eq!(required_nofile(1), Some(FD_PER_CONNECTION + FD_HEADROOM));
         assert_eq!(
-            required_nofile(10),
+            required_nofile(max_connections_from_raw(1)),
+            Some(FD_PER_CONNECTION + FD_HEADROOM)
+        );
+        assert_eq!(
+            required_nofile(max_connections_from_raw(10)),
             Some(10 * FD_PER_CONNECTION + FD_HEADROOM)
         );
     }
 
     #[test]
     fn warns_when_max_connections_unlimited() {
-        let warnings = nofile_warnings(0, Some((1024, 2048)));
+        let warnings = nofile_warnings(max_connections_from_raw(0), Some((1024, 2048)));
         assert!(
             warnings
                 .iter()
@@ -203,7 +205,7 @@ mod tests {
 
     #[test]
     fn warns_when_max_connections_exceeds_soft_limit() {
-        let warnings = nofile_warnings(5000, Some((4000, 8000)));
+        let warnings = nofile_warnings(max_connections_from_raw(5000), Some((4000, 8000)));
         assert!(
             warnings.iter().any(|w| w.contains("required FDs")),
             "should warn when requested max exceeds soft limit"
@@ -213,7 +215,7 @@ mod tests {
     #[test]
     fn warns_when_required_fds_exceed_soft_limit_even_if_connections_do_not() {
         // 600 connections require 600*2 + 64 = 1264 FDs, which exceeds soft=1000.
-        let warnings = nofile_warnings(600, Some((1000, 2000)));
+        let warnings = nofile_warnings(max_connections_from_raw(600), Some((1000, 2000)));
         assert!(
             warnings
                 .iter()
@@ -224,13 +226,13 @@ mod tests {
 
     #[test]
     fn no_warning_when_within_limits() {
-        let warnings = nofile_warnings(100, Some((1000, 2000)));
+        let warnings = nofile_warnings(max_connections_from_raw(100), Some((1000, 2000)));
         assert!(warnings.is_empty(), "no warnings expected within limits");
     }
 
     #[test]
     fn warns_when_limits_unavailable() {
-        let warnings = nofile_warnings(100, None);
+        let warnings = nofile_warnings(max_connections_from_raw(100), None);
         if cfg!(unix) {
             assert!(
                 warnings
@@ -250,7 +252,7 @@ mod tests {
 
     #[test]
     fn warns_only_limits_unavailable_when_unlimited_and_no_limits() {
-        let warnings = nofile_warnings(0, None);
+        let warnings = nofile_warnings(max_connections_from_raw(0), None);
         assert_eq!(warnings.len(), 1, "should emit a single warning");
         if cfg!(unix) {
             assert!(
@@ -271,15 +273,15 @@ mod tests {
         let headroom = FD_HEADROOM as usize;
         let max_by_fd = usize::MAX.saturating_sub(headroom).saturating_div(per_conn);
 
-        assert_eq!(cap_max_connections(0), 0, "zero remains unlimited");
+        assert_eq!(cap_max_connections(None), None, "none remains unlimited");
         assert_eq!(
-            cap_max_connections(max_by_fd),
-            max_by_fd,
+            cap_max_connections(max_connections_from_raw(max_by_fd)),
+            max_connections_from_raw(max_by_fd),
             "value at cap is unchanged"
         );
         assert_eq!(
-            cap_max_connections(max_by_fd.saturating_add(1)),
-            max_by_fd,
+            cap_max_connections(max_connections_from_raw(max_by_fd.saturating_add(1))),
+            max_connections_from_raw(max_by_fd),
             "value above cap is clamped"
         );
     }

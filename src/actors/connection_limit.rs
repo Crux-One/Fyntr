@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use log::warn;
 
+use crate::limits::MaxConnections;
+
 #[derive(Debug)]
 pub(crate) enum RegisterError {
     MaxConnectionsReached { max: usize },
@@ -22,7 +24,7 @@ impl std::error::Error for RegisterError {}
 /// Tracks and enforces a maximum number of concurrent connections.
 #[derive(Debug)]
 pub(crate) struct ConnectionLimiter {
-    max_connections: Option<usize>,
+    max_connections: MaxConnections,
     current_connections: AtomicUsize,
 }
 
@@ -34,15 +36,11 @@ impl ConnectionLimiter {
         }
     }
 
-    pub(crate) fn set_max_connections(&mut self, max_connections: usize) {
-        self.max_connections = if max_connections == 0 {
-            None
-        } else {
-            Some(max_connections)
-        };
+    pub(crate) fn set_max_connections(&mut self, max_connections: MaxConnections) {
+        self.max_connections = max_connections;
     }
 
-    pub(crate) fn max_connections(&self) -> Option<usize> {
+    pub(crate) fn max_connections(&self) -> MaxConnections {
         self.max_connections
     }
 
@@ -53,6 +51,7 @@ impl ConnectionLimiter {
     pub(crate) fn try_acquire(&self) -> Result<(), RegisterError> {
         match self.max_connections {
             Some(limit) => {
+                let limit = limit.get();
                 let mut current = self.current_connections.load(Ordering::Acquire);
                 loop {
                     if current >= limit {
@@ -93,13 +92,14 @@ impl ConnectionLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::max_connections_from_raw;
     use std::sync::{Arc, Barrier, atomic::AtomicUsize};
     use std::thread;
 
     #[test]
     fn acquire_and_release_under_limit() {
         let mut limiter = ConnectionLimiter::new();
-        limiter.set_max_connections(2);
+        limiter.set_max_connections(max_connections_from_raw(2));
 
         limiter.try_acquire().expect("first acquire should succeed");
         limiter
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn rejects_when_limit_reached() {
         let mut limiter = ConnectionLimiter::new();
-        limiter.set_max_connections(1);
+        limiter.set_max_connections(max_connections_from_raw(1));
 
         limiter.try_acquire().expect("first acquire should succeed");
         let err = limiter
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn zero_max_treated_as_unlimited() {
         let mut limiter = ConnectionLimiter::new();
-        limiter.set_max_connections(0);
+        limiter.set_max_connections(max_connections_from_raw(0));
 
         for _ in 0..3 {
             limiter
@@ -150,7 +150,7 @@ mod tests {
     fn concurrent_acquire_respects_limit() {
         let limiter = Arc::new({
             let mut l = ConnectionLimiter::new();
-            l.set_max_connections(3);
+            l.set_max_connections(max_connections_from_raw(3));
             l
         });
 
