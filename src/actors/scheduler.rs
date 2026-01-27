@@ -11,7 +11,7 @@ use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Inst
 use crate::{
     actors::{
         connection_limit::ConnectionLimiter,
-        queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor},
+        queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
     },
     flow::FlowId,
     util::{format_bytes, format_rate},
@@ -534,7 +534,8 @@ impl Scheduler {
         let mut queue_needs_cleanup = false;
 
         for &id in ids {
-            if self.flows.remove(&id).is_some() {
+            if let Some(entry) = self.flows.remove(&id) {
+                entry.queue_addr().do_send(StopNow);
                 removed_count += 1;
                 // Also clean up ready state
                 if self.ready_set.remove(&id) {
@@ -644,6 +645,7 @@ impl Handler<RecordUpstreamBytesTest> for Scheduler {
 mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
+    use tokio::time::sleep;
 
     #[actix_rt::test]
     async fn record_downstream_bytes_updates_totals() {
@@ -876,6 +878,47 @@ mod tests {
             vec![FlowId(1), FlowId(3)],
             "flow2 should be removed"
         );
+    }
+
+    #[actix_rt::test]
+    async fn unregister_stops_queue_actor() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(99),
+                queue_addr: queue.clone(),
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        scheduler
+            .send(Unregister {
+                flow_id: FlowId(99),
+            })
+            .await
+            .unwrap();
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if queue
+                .send(Dequeue {
+                    max_bytes: usize::MAX,
+                })
+                .await
+                .is_err()
+            {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(stopped, "queue actor should stop after unregister");
     }
 
     #[actix_rt::test]

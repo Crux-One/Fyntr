@@ -26,6 +26,10 @@ pub(crate) struct Dequeue {
 #[rtype(result = "()")]
 pub(crate) struct Close;
 
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct StopNow;
+
 #[derive(Debug)]
 pub(crate) struct DequeueResult {
     pub packet: Bytes,
@@ -197,6 +201,16 @@ impl Handler<Close> for QueueActor {
         if self.state.close() {
             ctx.stop();
         }
+    }
+}
+
+// StopNow
+impl Handler<StopNow> for QueueActor {
+    type Result = ();
+
+    fn handle(&mut self, _msg: StopNow, ctx: &mut Self::Context) -> Self::Result {
+        self.state.buf.clear();
+        ctx.stop();
     }
 }
 
