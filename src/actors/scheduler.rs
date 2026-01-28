@@ -14,6 +14,7 @@ use crate::{
         queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
     },
     flow::FlowId,
+    limits::{MaxConnections, max_connections_display},
     util::{format_bytes, format_rate},
 };
 
@@ -262,8 +263,8 @@ impl Scheduler {
 
     /// Configure the scheduler with a maximum concurrent connection limit.
     ///
-    /// A value of `0` disables the limit (treated as unlimited).
-    pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Use `None` to allow unlimited connections.
+    pub(crate) fn with_max_connections(mut self, max_connections: MaxConnections) -> Self {
         self.connection_limiter.set_max_connections(max_connections);
         self
     }
@@ -280,7 +281,7 @@ impl Scheduler {
         self.connection_limiter.current()
     }
 
-    fn max_connections(&self) -> Option<usize> {
+    fn max_connections(&self) -> MaxConnections {
         self.connection_limiter.max_connections()
     }
 
@@ -365,7 +366,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
 
     fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
         match self.max_connections() {
-            Some(limit) => self.current_connection_count() < limit,
+            Some(limit) => self.current_connection_count() < limit.get(),
             None => true,
         }
     }
@@ -557,16 +558,10 @@ impl Scheduler {
         let flow_count = self.flows.len();
         let (tx_value, tx_unit) = format_bytes(self.total_client_to_backend_bytes);
         let (rx_value, rx_unit) = format_bytes(self.total_backend_to_client_bytes);
-        let max_display = self.max_connections().map(|limit| limit.to_string());
+        let max_display = max_connections_display(self.max_connections());
         debug!(
             "⏱ scheduler: ticks={}, active connections={}/{}, total_tx={:.2} {}, total_rx={:.2} {}",
-            self.total_ticks,
-            flow_count,
-            max_display.as_deref().unwrap_or("∞"),
-            tx_value,
-            tx_unit,
-            rx_value,
-            rx_unit
+            self.total_ticks, flow_count, max_display, tx_value, tx_unit, rx_value, rx_unit
         );
         if let Some(global_start) = self.global_start_time {
             let elapsed = global_start.elapsed().as_secs_f64();
@@ -645,6 +640,7 @@ impl Handler<RecordUpstreamBytesTest> for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::max_connections_from_raw;
     use crate::test_utils::make_backend_write;
     use tokio::time::sleep;
 
@@ -699,7 +695,7 @@ mod tests {
     #[actix_rt::test]
     async fn register_respects_max_connection_limit() {
         let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(1)
+            .with_max_connections(max_connections_from_raw(1))
             .start();
 
         let queue1 = QueueActor::new().start();
@@ -733,7 +729,7 @@ mod tests {
     #[actix_rt::test]
     async fn register_allows_new_connection_after_unregister() {
         let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(1)
+            .with_max_connections(max_connections_from_raw(1))
             .start();
 
         let queue1 = QueueActor::new().start();
@@ -774,7 +770,7 @@ mod tests {
     #[actix_rt::test]
     async fn can_accept_connection_returns_false_when_at_capacity() {
         let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(1)
+            .with_max_connections(max_connections_from_raw(1))
             .start();
 
         let queue = QueueActor::new().start();
@@ -796,7 +792,7 @@ mod tests {
     #[actix_rt::test]
     async fn can_accept_connection_returns_true_when_below_capacity() {
         let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(2)
+            .with_max_connections(max_connections_from_raw(2))
             .start();
 
         let queue = QueueActor::new().start();
@@ -818,7 +814,7 @@ mod tests {
     #[actix_rt::test]
     async fn can_accept_connection_returns_true_when_unlimited() {
         let scheduler = Scheduler::new(1024, Duration::from_millis(10))
-            .with_max_connections(0)
+            .with_max_connections(max_connections_from_raw(0))
             .start();
 
         let queue = QueueActor::new().start();
@@ -840,7 +836,7 @@ mod tests {
     #[actix_rt::test]
     async fn unregister_updates_connection_count_and_ready_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
-            .with_max_connections(5)
+            .with_max_connections(max_connections_from_raw(5))
             .start();
 
         for id in [FlowId(1), FlowId(2), FlowId(3)] {
