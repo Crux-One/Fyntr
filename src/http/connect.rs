@@ -438,7 +438,11 @@ impl Drop for FlowCleanup {
             return;
         }
 
-        if let Some(queue) = &self.queue_tx {
+        // Once registered, the scheduler owns queue cleanup on Unregister.
+        // Avoid racing a graceful Close with a StopNow triggered by Unregister.
+        if !self.unregister_on_drop
+            && let Some(queue) = &self.queue_tx
+        {
             queue.do_send(Close);
         }
 
@@ -531,6 +535,7 @@ async fn connect_with_backoff(flow_id: FlowId, backend_addr: &str) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::max_connections_from_raw;
     use crate::test_utils::make_backend_write;
     use std::{future::Future, time::Duration};
 
@@ -631,7 +636,7 @@ mod tests {
     #[actix_rt::test]
     async fn returns_503_when_scheduler_is_at_capacity() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
-            .with_max_connections(1)
+            .with_max_connections(max_connections_from_raw(1))
             .start();
 
         let queue = QueueActor::new().start();

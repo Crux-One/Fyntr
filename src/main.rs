@@ -1,5 +1,8 @@
 use clap::Parser;
-use fyntr::run::{self, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
+use fyntr::{
+    limits::max_connections_from_raw,
+    run::{self, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT},
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -17,5 +20,5 @@ struct Cli {
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    run::server(cli.port, cli.max_connections).await
+    run::server(cli.port, max_connections_from_raw(cli.max_connections)).await
 }

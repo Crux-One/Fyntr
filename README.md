@@ -56,7 +56,7 @@ Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an acto
     FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
     ```
 
-    By default, Fyntr caps concurrent connections at 1000 (set to `0` to disable).
+    By default, Fyntr caps concurrent connections at 1000 (set `0` for unlimited).
 
 2. Configure Your Environment:
 
@@ -81,7 +81,7 @@ Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an acto
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
-| `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set to `0` for unlimited). |
+| `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
 ## Why Fyntr?
 Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.
