@@ -24,7 +24,16 @@ pub(crate) struct Dequeue {
 
 #[derive(Message)]
 #[rtype(result = "()")]
+/// Gracefully close the queue: mark it as closing, drain all queued data, then stop.
+/// Use this when you want in-flight and queued packets to be delivered before shutdown.
 pub(crate) struct Close;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+/// Immediately stop the queue and drop any queued data without draining.
+/// Use this instead of [`Close`] when a fast, best-effort shutdown is required.
+/// Used by the scheduler on Unregister to forcibly tear down the queue.
+pub(crate) struct StopNow;
 
 #[derive(Debug)]
 pub(crate) struct DequeueResult {
@@ -83,6 +92,10 @@ impl QueueState {
     pub(crate) fn close(&mut self) -> bool {
         self.closing = true;
         self.buf.is_empty()
+    }
+
+    pub(crate) fn stop_now(&mut self) {
+        self.buf.clear();
     }
 }
 
@@ -200,6 +213,16 @@ impl Handler<Close> for QueueActor {
     }
 }
 
+// StopNow
+impl Handler<StopNow> for QueueActor {
+    type Result = ();
+
+    fn handle(&mut self, _msg: StopNow, ctx: &mut Self::Context) -> Self::Result {
+        self.state.stop_now();
+        ctx.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +264,19 @@ mod tests {
         // After stopping, sending messages to the actor should fail (either error or None).
         let res = addr.send(Dequeue { max_bytes: 1024 }).await;
         assert_actor_stopped_or_empty(res);
+    }
+
+    #[actix_rt::test]
+    async fn test_stop_now_drops_buffer_and_stops() {
+        let addr = QueueActor::new().start();
+
+        let data = Bytes::from_static(b"payload");
+        addr.do_send(Enqueue(data));
+
+        addr.do_send(StopNow);
+
+        let res = addr.send(Dequeue { max_bytes: 1024 }).await;
+        assert!(res.is_err(), "queue actor should stop immediately");
     }
 
     #[actix_rt::test]

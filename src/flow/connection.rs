@@ -219,3 +219,68 @@ impl Actor for BackendToClientActor {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actors::{
+        queue::{Dequeue, QueueActor},
+        scheduler::{Register, Scheduler},
+    };
+    use crate::test_utils::make_backend_write;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        time::{Duration, sleep},
+    };
+
+    async fn build_server_read_half() -> OwnedReadHalf {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        drop(client);
+
+        let server = accept_handle.await.unwrap();
+        let (read_half, _write_half) = server.into_split();
+        read_half
+    }
+
+    #[actix_rt::test]
+    async fn client_disconnect_triggers_unregister_and_queue_stop() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(5),
+                queue_addr: queue.clone(),
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let client_read = build_server_read_half().await;
+        ClientToBackendActor::new(FlowId(5), client_read, queue.clone(), scheduler).start();
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            stopped,
+            "queue should stop after client disconnect unregisters flow"
+        );
+    }
+}

@@ -438,7 +438,11 @@ impl Drop for FlowCleanup {
             return;
         }
 
-        if let Some(queue) = &self.queue_tx {
+        // Once registered, the scheduler owns queue cleanup on Unregister.
+        // Avoid racing a graceful Close with a StopNow triggered by Unregister.
+        if !self.unregister_on_drop
+            && let Some(queue) = &self.queue_tx
+        {
             queue.do_send(Close);
         }
 
