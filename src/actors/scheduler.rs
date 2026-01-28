@@ -923,6 +923,45 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn dequeue_error_triggers_unregister() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(7),
+                queue_addr: queue.clone(),
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        queue.do_send(StopNow);
+        scheduler
+            .send(FlowReady { flow_id: FlowId(7) })
+            .await
+            .unwrap();
+        scheduler.send(QuantumTick).await.unwrap();
+
+        let mut unregistered = false;
+        for _ in 0..20 {
+            let reply = scheduler.send(super::InspectState).await.unwrap();
+            if reply.connections == 0 && reply.flow_ids.is_empty() {
+                unregistered = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            unregistered,
+            "flow should be unregistered after dequeue error"
+        );
+    }
+
+    #[actix_rt::test]
     async fn test_recommended_quantum_selection() {
         let queue = QueueActor::new().start();
         let backend_write = make_backend_write().await;
