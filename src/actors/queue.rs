@@ -93,6 +93,10 @@ impl QueueState {
         self.closing = true;
         self.buf.is_empty()
     }
+
+    pub(crate) fn stop_now(&mut self) {
+        self.buf.clear();
+    }
 }
 
 pub(crate) struct QueueActor {
@@ -214,7 +218,7 @@ impl Handler<StopNow> for QueueActor {
     type Result = ();
 
     fn handle(&mut self, _msg: StopNow, ctx: &mut Self::Context) -> Self::Result {
-        self.state.buf.clear();
+        self.state.stop_now();
         ctx.stop();
     }
 }

@@ -535,6 +535,7 @@ impl Scheduler {
 
         for &id in ids {
             if let Some(entry) = self.flows.remove(&id) {
+                debug!("flow{}: stopping queue on unregister", id.0);
                 entry.queue_addr().do_send(StopNow);
                 removed_count += 1;
                 // Also clean up ready state
