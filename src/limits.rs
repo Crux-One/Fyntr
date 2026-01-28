@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-pub(crate) type MaxConnections = Option<NonZeroUsize>;
+pub type MaxConnections = Option<NonZeroUsize>;
 
 #[inline]
 pub fn max_connections_from_raw(raw: usize) -> MaxConnections {
