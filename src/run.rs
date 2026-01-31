@@ -1,4 +1,5 @@
 use std::{
+    net::{IpAddr, Ipv4Addr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -21,17 +22,18 @@ use crate::{
 
 pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
-pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
+pub async fn server(bind: IpAddr, port: u16, max_connections: MaxConnections) -> Result<()> {
     bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    let proxy_listen_addr = format!("127.0.0.1:{}", port);
+    let proxy_listen_addr = format!("{}:{}", bind, port);
     info!("Starting Fyntr on {}", proxy_listen_addr);
     let listener = TcpListener::bind(proxy_listen_addr).await?;
 

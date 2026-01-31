@@ -80,6 +80,7 @@ Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an acto
 
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
+| `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
