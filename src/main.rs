@@ -25,7 +25,7 @@ struct Cli {
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    run::server(
+    run::server_with_bind(
         cli.bind,
         cli.port,
         max_connections_from_raw(cli.max_connections),

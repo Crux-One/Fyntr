@@ -28,7 +28,15 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
-pub async fn server(bind: IpAddr, port: u16, max_connections: MaxConnections) -> Result<()> {
+pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
+    server_with_bind(DEFAULT_BIND, port, max_connections).await
+}
+
+pub async fn server_with_bind(
+    bind: IpAddr,
+    port: u16,
+    max_connections: MaxConnections,
+) -> Result<()> {
     bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
