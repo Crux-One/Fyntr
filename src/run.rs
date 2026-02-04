@@ -42,6 +42,12 @@ pub async fn server_with_bind(
     ensure_nofile_limits(max_connections);
 
     let proxy_listen_addr = SocketAddr::new(bind, port);
+    if !bind.is_loopback() {
+        warn!(
+            "binding to a non-loopback address ({}) without auth may expose an open proxy; use a firewall or bind to loopback to restrict access",
+            bind
+        );
+    }
     info!("Starting Fyntr on {}", proxy_listen_addr);
     let listener = TcpListener::bind(proxy_listen_addr).await?;
 
