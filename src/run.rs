@@ -41,8 +41,8 @@ pub async fn server_with_bind(
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    let proxy_listen_addr = SocketAddr::new(bind, port);
-    if !bind.is_loopback() {
+    let (proxy_listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+    if should_warn {
         warn!(
             "binding to a non-loopback address ({}) without auth may expose an open proxy; use a firewall or bind to loopback to restrict access",
             bind
@@ -78,6 +78,12 @@ pub async fn server_with_bind(
             }
         });
     }
+}
+
+fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
+    let listen_addr = SocketAddr::new(bind, port);
+    let should_warn = !bind.is_loopback();
+    (listen_addr, should_warn)
 }
 
 fn bootstrap() {
@@ -300,5 +306,41 @@ mod tests {
             max_connections_from_raw(max_by_fd),
             "value above cap is clamped"
         );
+    }
+
+    #[test]
+    fn listen_addr_loopback_ipv4_no_warning() {
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(!should_warn, "loopback should not warn");
+    }
+
+    #[test]
+    fn listen_addr_non_loopback_ipv4_warns() {
+        let bind = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(should_warn, "non-loopback should warn");
+    }
+
+    #[test]
+    fn listen_addr_loopback_ipv6_no_warning() {
+        let bind = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(!should_warn, "loopback should not warn");
+    }
+
+    #[test]
+    fn listen_addr_non_loopback_ipv6_warns() {
+        let bind = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(should_warn, "non-loopback should warn");
     }
 }
