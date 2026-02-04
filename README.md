@@ -23,7 +23,8 @@
 ## About
 Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic, stabilizing connections on constrained networks.
 No server-side changes required, no auth, no inspection.
-Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
+
+Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS and <1MB private memory on Windows) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
 
 ## Internals
 - Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
@@ -80,7 +81,7 @@ Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an acto
 
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
-| `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. |
+| `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
