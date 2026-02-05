@@ -44,7 +44,7 @@ pub async fn server_with_bind(
     let (proxy_listen_addr, should_warn) = listen_addr_and_warn(bind, port);
     if should_warn {
         warn!(
-            "binding to a non-loopback address ({}) without auth may expose an open proxy; use a firewall or bind to loopback to restrict access",
+            "binding to a non-loopback address ({}) without auth may allow anyone on the network to use this proxy; use a firewall or bind to loopback to restrict access",
             bind
         );
     }
