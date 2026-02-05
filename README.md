@@ -23,7 +23,8 @@
 ## About
 Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic, stabilizing connections on constrained networks.
 No server-side changes required, no auth, no inspection.
-Fyntr runs with a tiny footprint (typically <14MB RSS on macOS) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
+
+Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS and <1MB private memory on Windows) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
 
 ## Internals
 - Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
