@@ -1,6 +1,6 @@
 [package]
 name = "fyntr"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
@@ -16,13 +16,13 @@ actix = "0.13"
 actix-rt = "2"
 tokio = { version = "1.49", features = ["full"] }
 anyhow = "1"
-bytes = "1.11"
-clap = { version = "4.5.54", features = ["derive", "env"] }
+bytes = "1.11.1"
+clap = { version = "4.5.57", features = ["derive", "env"] }
 env_logger = "0.11"
 log = "0.4.29"
 
 [target.'cfg(unix)'.dependencies]
-rlimit = "0.10"
+rlimit = "0.11.0"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["test-util"] }

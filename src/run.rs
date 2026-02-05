@@ -1,4 +1,5 @@
 use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -21,17 +22,32 @@ use crate::{
 
 pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
 pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
+    server_with_bind(DEFAULT_BIND, port, max_connections).await
+}
+
+pub async fn server_with_bind(
+    bind: IpAddr,
+    port: u16,
+    max_connections: MaxConnections,
+) -> Result<()> {
     bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    let proxy_listen_addr = format!("127.0.0.1:{}", port);
+    let (proxy_listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+    if should_warn {
+        warn!(
+            "binding to a non-loopback address ({}) without auth may allow anyone on the network to use this proxy; use a firewall or bind to loopback to restrict access",
+            bind
+        );
+    }
     info!("Starting Fyntr on {}", proxy_listen_addr);
     let listener = TcpListener::bind(proxy_listen_addr).await?;
 
@@ -62,6 +78,12 @@ pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
             }
         });
     }
+}
+
+fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
+    let listen_addr = SocketAddr::new(bind, port);
+    let should_warn = !bind.is_loopback();
+    (listen_addr, should_warn)
 }
 
 fn bootstrap() {
@@ -284,5 +306,41 @@ mod tests {
             max_connections_from_raw(max_by_fd),
             "value above cap is clamped"
         );
+    }
+
+    #[test]
+    fn listen_addr_loopback_ipv4_no_warning() {
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(!should_warn, "loopback should not warn");
+    }
+
+    #[test]
+    fn listen_addr_non_loopback_ipv4_warns() {
+        let bind = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(should_warn, "non-loopback should warn");
+    }
+
+    #[test]
+    fn listen_addr_loopback_ipv6_no_warning() {
+        let bind = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(!should_warn, "loopback should not warn");
+    }
+
+    #[test]
+    fn listen_addr_non_loopback_ipv6_warns() {
+        let bind = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let port = 9999;
+        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
+        assert_eq!(listen_addr, SocketAddr::new(bind, port));
+        assert!(should_warn, "non-loopback should warn");
     }
 }
