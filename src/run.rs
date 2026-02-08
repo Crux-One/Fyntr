@@ -300,7 +300,8 @@ fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
 }
 
 fn bootstrap() {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    // Best-effort init; ignore if a logger is already configured by the caller.
+    let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
 }
 
 fn ensure_nofile_limits(max_connections: MaxConnections) {
