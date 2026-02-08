@@ -11,7 +11,7 @@ use actix::prelude::*;
 use anyhow::{Context, Result, anyhow};
 use env_logger::Env;
 use log::{error, info, warn};
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{net::{TcpListener, lookup_host}, sync::oneshot, task::JoinHandle};
 
 use crate::{
     actors::scheduler::Scheduler,
@@ -35,12 +35,18 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
-    fn resolve(self) -> Result<IpAddr> {
+    async fn resolve(self, port: u16) -> Result<IpAddr> {
         match self {
             BindAddress::Ip(addr) => Ok(addr),
-            BindAddress::Host(host) => host
-                .parse::<IpAddr>()
-                .with_context(|| format!("invalid bind address: {}", host)),
+            BindAddress::Host(host) => {
+                let mut addrs = lookup_host((host.as_str(), port))
+                    .await
+                    .with_context(|| format!("failed to resolve bind hostname: {}", host))?;
+                addrs
+                    .next()
+                    .map(|addr| addr.ip())
+                    .with_context(|| format!("no bind addresses found for hostname: {}", host))
+            }
         }
     }
 }
@@ -163,13 +169,13 @@ impl ServerBuilder {
     }
 
     pub async fn start(self) -> Result<ServerHandle> {
-        let bind = self.bind.resolve()?;
+        let bind = self.bind.resolve(self.port).await?;
         let max_connections = self.max_connections.resolve();
         start_with_bind(bind, self.port, max_connections).await
     }
 
     pub async fn run(self) -> Result<()> {
-        let bind = self.bind.resolve()?;
+        let bind = self.bind.resolve(self.port).await?;
         let max_connections = self.max_connections.resolve();
         server_with_bind(bind, self.port, max_connections).await
     }
