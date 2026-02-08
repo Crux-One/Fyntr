@@ -117,13 +117,6 @@ impl ServerHandle {
         }
     }
 
-    pub async fn wait(mut self) -> Result<()> {
-        self.shutdown_tx.take();
-        match self.join_handle.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!("server task join failed: {}", err)),
-        }
-    }
 }
 
 pub struct ServerBuilder {
