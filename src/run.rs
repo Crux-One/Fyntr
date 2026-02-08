@@ -38,17 +38,26 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
-    async fn resolve(self, port: u16) -> Result<IpAddr> {
+    async fn resolve(self, port: u16) -> Result<Vec<SocketAddr>> {
         match self {
-            BindAddress::Ip(addr) => Ok(addr),
+            BindAddress::Ip(addr) => Ok(vec![SocketAddr::new(addr, port)]),
             BindAddress::Host(host) => {
-                let mut addrs = lookup_host((host.as_str(), port))
+                let resolved: Vec<SocketAddr> = lookup_host((host.as_str(), port))
                     .await
-                    .with_context(|| format!("failed to resolve bind hostname: {}", host))?;
-                addrs
-                    .next()
-                    .map(|addr| addr.ip())
-                    .with_context(|| format!("no bind addresses found for hostname: {}", host))
+                    .with_context(|| format!("failed to resolve bind hostname: {}", host))?
+                    .collect();
+
+                let (ipv4_addrs, ipv6_addrs): (Vec<_>, Vec<_>) =
+                    resolved.into_iter().partition(|addr| addr.is_ipv4());
+
+                // Prefer IPv4 addresses but retain IPv6 as a fallback.
+                let mut addrs = ipv4_addrs;
+                addrs.extend(ipv6_addrs);
+
+                if addrs.is_empty() {
+                    return Err(anyhow!("no bind addresses found for hostname: {}", host));
+                }
+                Ok(addrs)
             }
         }
     }
@@ -142,13 +151,13 @@ impl ServerBuilder {
     }
 
     pub async fn start(self) -> Result<ServerHandle> {
-        let bind = self.bind.resolve(self.port).await?;
-        start_with_bind(bind, self.port, self.max_connections).await
+        let bind_addrs = self.bind.resolve(self.port).await?;
+        start_with_addrs(bind_addrs, self.max_connections).await
     }
 
     pub async fn run(self) -> Result<()> {
-        let bind = self.bind.resolve(self.port).await?;
-        server_with_bind(bind, self.port, self.max_connections).await
+        let bind_addrs = self.bind.resolve(self.port).await?;
+        server_with_addrs(bind_addrs, self.max_connections).await
     }
 }
 
@@ -165,8 +174,7 @@ pub async fn server_with_bind(
     port: u16,
     max_connections: MaxConnections,
 ) -> Result<()> {
-    let (listener, max_connections) = prepare_listener(bind, port, max_connections).await?;
-    run_server(listener, max_connections, None).await
+    server_with_addrs(vec![SocketAddr::new(bind, port)], max_connections).await
 }
 
 pub async fn start(port: u16, max_connections: MaxConnections) -> Result<ServerHandle> {
@@ -178,7 +186,22 @@ pub async fn start_with_bind(
     port: u16,
     max_connections: MaxConnections,
 ) -> Result<ServerHandle> {
-    let (listener, max_connections) = prepare_listener(bind, port, max_connections).await?;
+    start_with_addrs(vec![SocketAddr::new(bind, port)], max_connections).await
+}
+
+async fn server_with_addrs(
+    bind_addrs: Vec<SocketAddr>,
+    max_connections: MaxConnections,
+) -> Result<()> {
+    let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
+    run_server(listener, max_connections, None).await
+}
+
+async fn start_with_addrs(
+    bind_addrs: Vec<SocketAddr>,
+    max_connections: MaxConnections,
+) -> Result<ServerHandle> {
+    let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
     let listen_addr = listener
         .local_addr()
         .context("failed to resolve listen address")?;
@@ -193,26 +216,49 @@ pub async fn start_with_bind(
 }
 
 async fn prepare_listener(
-    bind: IpAddr,
-    port: u16,
+    bind_addrs: Vec<SocketAddr>,
     max_connections: MaxConnections,
 ) -> Result<(TcpListener, MaxConnections)> {
+    if bind_addrs.is_empty() {
+        return Err(anyhow!("no bind addresses resolved"));
+    }
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    let (proxy_listen_addr, should_warn) = listen_addr_and_warn(bind, port);
-    if should_warn {
+    let bind_addrs_display = format_bind_addrs(&bind_addrs);
+    if should_warn_for_addrs(&bind_addrs) {
         warn!(
             "binding to a non-loopback address ({}) without auth may allow anyone on the network to use this proxy; use a firewall or bind to loopback to restrict access",
-            bind
+            bind_addrs_display
         );
     }
-    let listener = TcpListener::bind(proxy_listen_addr).await?;
-    let bound_addr = listener
-        .local_addr()
-        .context("failed to resolve listen address")?;
-    info!("Starting Fyntr on {}", bound_addr);
-    Ok((listener, max_connections))
+
+    let mut last_err = None;
+    for addr in bind_addrs {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let bound_addr = listener
+                    .local_addr()
+                    .context("failed to resolve listen address")?;
+                info!("Starting Fyntr on {}", bound_addr);
+                return Ok((listener, max_connections));
+            }
+            Err(err) => last_err = Some((addr, err)),
+        }
+    }
+
+    if let Some((addr, err)) = last_err {
+        Err(anyhow!(
+            "failed to bind to any resolved address (last error on {}): {}",
+            addr,
+            err
+        ))
+    } else {
+        Err(anyhow!(
+            "failed to bind to any resolved address ({})",
+            bind_addrs_display
+        ))
+    }
 }
 
 async fn run_server(
@@ -263,10 +309,16 @@ async fn run_server(
     Ok(())
 }
 
-fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
-    let listen_addr = SocketAddr::new(bind, port);
-    let should_warn = !bind.is_loopback();
-    (listen_addr, should_warn)
+fn should_warn_for_addrs(addrs: &[SocketAddr]) -> bool {
+    addrs.iter().any(|addr| !addr.ip().is_loopback())
+}
+
+fn format_bind_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn ensure_nofile_limits(max_connections: MaxConnections) {
@@ -511,38 +563,32 @@ mod tests {
     }
 
     #[test]
-    fn listen_addr_loopback_ipv4_no_warning() {
-        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let port = 9999;
-        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
-        assert_eq!(listen_addr, SocketAddr::new(bind, port));
-        assert!(!should_warn, "loopback should not warn");
+    fn listen_addrs_loopback_ipv4_no_warning() {
+        let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999)];
+        assert!(!should_warn_for_addrs(&addrs), "loopback should not warn");
     }
 
     #[test]
-    fn listen_addr_non_loopback_ipv4_warns() {
-        let bind = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-        let port = 9999;
-        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
-        assert_eq!(listen_addr, SocketAddr::new(bind, port));
-        assert!(should_warn, "non-loopback should warn");
+    fn listen_addrs_non_loopback_ipv4_warns() {
+        let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9999)];
+        assert!(should_warn_for_addrs(&addrs), "non-loopback should warn");
     }
 
     #[test]
-    fn listen_addr_loopback_ipv6_no_warning() {
-        let bind = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
-        let port = 9999;
-        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
-        assert_eq!(listen_addr, SocketAddr::new(bind, port));
-        assert!(!should_warn, "loopback should not warn");
+    fn listen_addrs_loopback_ipv6_no_warning() {
+        let addrs = vec![SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            9999,
+        )];
+        assert!(!should_warn_for_addrs(&addrs), "loopback should not warn");
     }
 
     #[test]
-    fn listen_addr_non_loopback_ipv6_warns() {
-        let bind = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
-        let port = 9999;
-        let (listen_addr, should_warn) = listen_addr_and_warn(bind, port);
-        assert_eq!(listen_addr, SocketAddr::new(bind, port));
-        assert!(should_warn, "non-loopback should warn");
+    fn listen_addrs_non_loopback_ipv6_warns() {
+        let addrs = vec![SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            9999,
+        )];
+        assert!(should_warn_for_addrs(&addrs), "non-loopback should warn");
     }
 }
