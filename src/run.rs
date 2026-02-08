@@ -62,13 +62,21 @@ impl From<IpAddr> for BindAddress {
 
 impl From<&str> for BindAddress {
     fn from(value: &str) -> Self {
-        BindAddress::Host(value.to_string())
+        if let Ok(addr) = value.parse::<IpAddr>() {
+            addr.into()
+        } else {
+            BindAddress::Host(value.to_string())
+        }
     }
 }
 
 impl From<String> for BindAddress {
     fn from(value: String) -> Self {
-        BindAddress::Host(value)
+        if let Ok(addr) = value.parse::<IpAddr>() {
+            addr.into()
+        } else {
+            BindAddress::Host(value)
+        }
     }
 }
 
