@@ -403,6 +403,7 @@ fn nofile_warnings(max_connections: MaxConnections, limits: Option<(u64, u64)>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
 
     #[test]
     fn required_nofile_unlimited_is_none() {
@@ -494,6 +495,11 @@ mod tests {
         assert_ne!(listen_addr.port(), 0, "expected OS-assigned port");
 
         handle.shutdown().await.expect("shutdown");
+        let connect_result = TcpStream::connect(listen_addr).await;
+        assert!(
+            connect_result.is_err(),
+            "expected connection to fail after shutdown"
+        );
     }
 
     #[test]
