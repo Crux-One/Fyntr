@@ -9,7 +9,6 @@ use std::{
 
 use actix::prelude::*;
 use anyhow::{Context, Result, anyhow};
-use env_logger::Env;
 use log::{error, info, warn};
 use tokio::{
     net::{TcpListener, lookup_host},
@@ -222,7 +221,6 @@ async fn prepare_listener(
     port: u16,
     max_connections: MaxConnections,
 ) -> Result<(TcpListener, MaxConnections)> {
-    bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
@@ -293,11 +291,6 @@ fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
     let listen_addr = SocketAddr::new(bind, port);
     let should_warn = !bind.is_loopback();
     (listen_addr, should_warn)
-}
-
-fn bootstrap() {
-    // Best-effort init; ignore if a logger is already configured by the caller.
-    let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
 }
 
 fn ensure_nofile_limits(max_connections: MaxConnections) {
