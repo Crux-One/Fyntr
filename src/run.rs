@@ -72,33 +72,6 @@ impl From<String> for BindAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum MaxConnectionsInput {
-    Raw(usize),
-    Limit(MaxConnections),
-}
-
-impl MaxConnectionsInput {
-    fn resolve(self) -> MaxConnections {
-        match self {
-            MaxConnectionsInput::Raw(raw) => max_connections_from_raw(raw),
-            MaxConnectionsInput::Limit(limit) => limit,
-        }
-    }
-}
-
-impl From<usize> for MaxConnectionsInput {
-    fn from(value: usize) -> Self {
-        MaxConnectionsInput::Raw(value)
-    }
-}
-
-impl From<MaxConnections> for MaxConnectionsInput {
-    fn from(value: MaxConnections) -> Self {
-        MaxConnectionsInput::Limit(value)
-    }
-}
-
 pub struct ServerHandle {
     listen_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -124,7 +97,7 @@ impl ServerHandle {
 pub struct ServerBuilder {
     bind: BindAddress,
     port: u16,
-    max_connections: MaxConnectionsInput,
+    max_connections: MaxConnections,
 }
 
 impl Default for ServerBuilder {
@@ -138,7 +111,7 @@ impl ServerBuilder {
         Self {
             bind: BindAddress::from(DEFAULT_BIND),
             port: DEFAULT_PORT,
-            max_connections: MaxConnectionsInput::from(DEFAULT_MAX_CONNECTIONS),
+            max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
         }
     }
 
@@ -155,24 +128,19 @@ impl ServerBuilder {
         self
     }
 
-    pub fn max_connections<M>(mut self, max_connections: M) -> Self
-    where
-        M: Into<MaxConnectionsInput>,
-    {
-        self.max_connections = max_connections.into();
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections_from_raw(max_connections);
         self
     }
 
     pub async fn start(self) -> Result<ServerHandle> {
         let bind = self.bind.resolve(self.port).await?;
-        let max_connections = self.max_connections.resolve();
-        start_with_bind(bind, self.port, max_connections).await
+        start_with_bind(bind, self.port, self.max_connections).await
     }
 
     pub async fn run(self) -> Result<()> {
         let bind = self.bind.resolve(self.port).await?;
-        let max_connections = self.max_connections.resolve();
-        server_with_bind(bind, self.port, max_connections).await
+        server_with_bind(bind, self.port, self.max_connections).await
     }
 }
 
