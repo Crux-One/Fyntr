@@ -82,7 +82,7 @@ Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS
 ```rust
 use fyntr::run;
 
-#[actix_rt::main]
+#[actix::main]
 async fn main() -> anyhow::Result<()> {
     let handle = run::builder()
         .bind("127.0.0.1")
