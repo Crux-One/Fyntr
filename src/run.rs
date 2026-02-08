@@ -11,7 +11,11 @@ use actix::prelude::*;
 use anyhow::{Context, Result, anyhow};
 use env_logger::Env;
 use log::{error, info, warn};
-use tokio::{net::{TcpListener, lookup_host}, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::{TcpListener, lookup_host},
+    sync::oneshot,
+    task::JoinHandle,
+};
 
 use crate::{
     actors::scheduler::Scheduler,
@@ -116,7 +120,6 @@ impl ServerHandle {
             Err(err) => Err(anyhow!("server task join failed: {}", err)),
         }
     }
-
 }
 
 pub struct ServerBuilder {
