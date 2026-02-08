@@ -77,12 +77,35 @@ Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS
     curl https://ifconfig.me
     ```
 
+## Library Usage
+
+```rust
+use fyntr::run;
+
+#[actix_rt::main]
+async fn main() -> anyhow::Result<()> {
+    let handle = run::builder()
+        .bind("127.0.0.1")
+        .port(0) // 0 lets the OS pick an available port
+        .max_connections(512)
+        .start()
+        .await?;
+
+    println!("Fyntr listening on {}", handle.listen_addr());
+
+    // ... run your app ...
+
+    handle.shutdown().await?;
+    Ok(())
+}
+```
+
 ## CLI Options
 
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
 | `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
-| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
+| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
 ## Why Fyntr?
