@@ -8,10 +8,10 @@ use std::{
 };
 
 use actix::prelude::*;
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use env_logger::Env;
 use log::{error, info, warn};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::{
     actors::scheduler::Scheduler,
@@ -28,6 +28,157 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
+#[derive(Debug, Clone)]
+pub enum BindAddress {
+    Ip(IpAddr),
+    Host(String),
+}
+
+impl BindAddress {
+    fn resolve(self) -> Result<IpAddr> {
+        match self {
+            BindAddress::Ip(addr) => Ok(addr),
+            BindAddress::Host(host) => host
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid bind address: {}", host)),
+        }
+    }
+}
+
+impl From<IpAddr> for BindAddress {
+    fn from(value: IpAddr) -> Self {
+        BindAddress::Ip(value)
+    }
+}
+
+impl From<&str> for BindAddress {
+    fn from(value: &str) -> Self {
+        BindAddress::Host(value.to_string())
+    }
+}
+
+impl From<String> for BindAddress {
+    fn from(value: String) -> Self {
+        BindAddress::Host(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MaxConnectionsInput {
+    Raw(usize),
+    Limit(MaxConnections),
+}
+
+impl MaxConnectionsInput {
+    fn resolve(self) -> MaxConnections {
+        match self {
+            MaxConnectionsInput::Raw(raw) => max_connections_from_raw(raw),
+            MaxConnectionsInput::Limit(limit) => limit,
+        }
+    }
+}
+
+impl From<usize> for MaxConnectionsInput {
+    fn from(value: usize) -> Self {
+        MaxConnectionsInput::Raw(value)
+    }
+}
+
+impl From<MaxConnections> for MaxConnectionsInput {
+    fn from(value: MaxConnections) -> Self {
+        MaxConnectionsInput::Limit(value)
+    }
+}
+
+pub struct ServerHandle {
+    listen_addr: SocketAddr,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    join_handle: JoinHandle<Result<()>>,
+}
+
+impl ServerHandle {
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        match self.join_handle.await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("server task join failed: {}", err)),
+        }
+    }
+
+    pub async fn wait(mut self) -> Result<()> {
+        self.shutdown_tx.take();
+        match self.join_handle.await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("server task join failed: {}", err)),
+        }
+    }
+}
+
+pub struct ServerBuilder {
+    bind: BindAddress,
+    port: u16,
+    max_connections: MaxConnectionsInput,
+}
+
+impl Default for ServerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerBuilder {
+    pub fn new() -> Self {
+        Self {
+            bind: BindAddress::from(DEFAULT_BIND),
+            port: DEFAULT_PORT,
+            max_connections: MaxConnectionsInput::from(DEFAULT_MAX_CONNECTIONS),
+        }
+    }
+
+    pub fn bind<B>(mut self, bind: B) -> Self
+    where
+        B: Into<BindAddress>,
+    {
+        self.bind = bind.into();
+        self
+    }
+
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    pub fn max_connections<M>(mut self, max_connections: M) -> Self
+    where
+        M: Into<MaxConnectionsInput>,
+    {
+        self.max_connections = max_connections.into();
+        self
+    }
+
+    pub async fn start(self) -> Result<ServerHandle> {
+        let bind = self.bind.resolve()?;
+        let max_connections = self.max_connections.resolve();
+        start_with_bind(bind, self.port, max_connections).await
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let bind = self.bind.resolve()?;
+        let max_connections = self.max_connections.resolve();
+        server_with_bind(bind, self.port, max_connections).await
+    }
+}
+
+pub fn builder() -> ServerBuilder {
+    ServerBuilder::new()
+}
+
 pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
     server_with_bind(DEFAULT_BIND, port, max_connections).await
 }
@@ -37,6 +188,38 @@ pub async fn server_with_bind(
     port: u16,
     max_connections: MaxConnections,
 ) -> Result<()> {
+    let (listener, max_connections) = prepare_listener(bind, port, max_connections).await?;
+    run_server(listener, max_connections, None).await
+}
+
+pub async fn start(port: u16, max_connections: MaxConnections) -> Result<ServerHandle> {
+    start_with_bind(DEFAULT_BIND, port, max_connections).await
+}
+
+pub async fn start_with_bind(
+    bind: IpAddr,
+    port: u16,
+    max_connections: MaxConnections,
+) -> Result<ServerHandle> {
+    let (listener, max_connections) = prepare_listener(bind, port, max_connections).await?;
+    let listen_addr = listener
+        .local_addr()
+        .context("failed to resolve listen address")?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let join_handle = actix::spawn(run_server(listener, max_connections, Some(shutdown_rx)));
+
+    Ok(ServerHandle {
+        listen_addr,
+        shutdown_tx: Some(shutdown_tx),
+        join_handle,
+    })
+}
+
+async fn prepare_listener(
+    bind: IpAddr,
+    port: u16,
+    max_connections: MaxConnections,
+) -> Result<(TcpListener, MaxConnections)> {
     bootstrap();
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
@@ -48,9 +231,19 @@ pub async fn server_with_bind(
             bind
         );
     }
-    info!("Starting Fyntr on {}", proxy_listen_addr);
     let listener = TcpListener::bind(proxy_listen_addr).await?;
+    let bound_addr = listener
+        .local_addr()
+        .context("failed to resolve listen address")?;
+    info!("Starting Fyntr on {}", bound_addr);
+    Ok((listener, max_connections))
+}
 
+async fn run_server(
+    listener: TcpListener,
+    max_connections: MaxConnections,
+    mut shutdown_rx: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
     // Start the scheduler
     let quantum = DEFAULT_QUANTUM;
     let tick = Duration::from_millis(DEFAULT_TICK_MS);
@@ -62,7 +255,19 @@ pub async fn server_with_bind(
     let flow_counter = Arc::new(AtomicUsize::new(1));
 
     loop {
-        let (client_stream, client_addr) = listener.accept().await?;
+        let accept_result = if let Some(rx) = shutdown_rx.as_mut() {
+            tokio::select! {
+                _ = rx => {
+                    info!("Shutdown signal received; stopping server loop");
+                    break;
+                }
+                accept = listener.accept() => accept,
+            }
+        } else {
+            listener.accept().await
+        };
+
+        let (client_stream, client_addr) = accept_result?;
         let flow_id = FlowId(flow_counter.fetch_add(1, Ordering::SeqCst));
 
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
@@ -78,6 +283,8 @@ pub async fn server_with_bind(
             }
         });
     }
+
+    Ok(())
 }
 
 fn listen_addr_and_warn(bind: IpAddr, port: u16) -> (SocketAddr, bool) {
@@ -270,6 +477,23 @@ mod tests {
                 "should warn when FD limits are unsupported"
             );
         }
+    }
+
+    #[actix_rt::test]
+    async fn builder_start_shutdown_smoke() {
+        let handle = builder()
+            .bind("127.0.0.1")
+            .port(0)
+            .max_connections(1)
+            .start()
+            .await
+            .expect("start");
+
+        let listen_addr = handle.listen_addr();
+        assert!(listen_addr.ip().is_loopback(), "expected loopback bind");
+        assert_ne!(listen_addr.port(), 0, "expected OS-assigned port");
+
+        handle.shutdown().await.expect("shutdown");
     }
 
     #[test]
