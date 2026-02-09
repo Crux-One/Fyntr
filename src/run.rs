@@ -91,7 +91,7 @@ impl From<String> for BindAddress {
 
 pub struct ServerHandle {
     listen_addr: SocketAddr,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<Result<()>>,
 }
 
@@ -100,10 +100,9 @@ impl ServerHandle {
         self.listen_addr
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+    /// Stops accepting new connections but does not terminate in-flight tasks.
+    pub async fn shutdown(self) -> Result<()> {
+        let _ = self.shutdown_tx.send(());
         match self.join_handle.await {
             Ok(result) => result,
             Err(err) => Err(anyhow!("server task join failed: {}", err)),
@@ -210,7 +209,7 @@ async fn start_with_addrs(
 
     Ok(ServerHandle {
         listen_addr,
-        shutdown_tx: Some(shutdown_tx),
+        shutdown_tx,
         join_handle,
     })
 }
