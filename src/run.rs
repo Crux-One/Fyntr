@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    actors::scheduler::Scheduler,
+    actors::scheduler::{Scheduler, Shutdown as SchedulerShutdown},
     flow::FlowId,
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
@@ -280,6 +280,7 @@ async fn run_server(
             tokio::select! {
                 _ = rx => {
                     info!("Shutdown signal received; stopping server loop");
+                    scheduler.do_send(SchedulerShutdown);
                     break;
                 }
                 accept = listener.accept() => accept,

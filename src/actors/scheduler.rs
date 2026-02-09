@@ -223,6 +223,10 @@ impl Actor for Scheduler {
 #[rtype(result = "()")]
 pub(crate) struct QuantumTick;
 
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct Shutdown;
+
 impl Handler<QuantumTick> for Scheduler {
     type Result = ();
 
@@ -233,6 +237,14 @@ impl Handler<QuantumTick> for Scheduler {
         if self.total_ticks.is_multiple_of(500) {
             self.log_stats();
         }
+    }
+}
+
+impl Handler<Shutdown> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, _msg: Shutdown, ctx: &mut Self::Context) -> Self::Result {
+        ctx.stop();
     }
 }
 
