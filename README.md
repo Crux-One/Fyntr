@@ -79,10 +79,15 @@ Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS
 
 ## Library Usage
 
+Requires [`actix-rt`][10] and [`anyhow`][11] in your application's dependencies.
+
+[10]:https://docs.rs/crate/actix-rt/latest
+[11]:https://docs.rs/crate/anyhow/latest
+
 ```rust
 use fyntr::run;
 
-#[actix::main]
+#[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
     let handle = run::builder()
         .bind("127.0.0.1")

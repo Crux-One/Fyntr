@@ -1,6 +1,6 @@
 use fyntr::run;
 
-#[actix::main]
+#[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
     let handle = run::builder()
         .bind("127.0.0.1")
