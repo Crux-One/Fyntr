@@ -318,7 +318,7 @@ async fn run_server(
             tokio::select! {
                 biased;
                 _ = rx => {
-                    info!("Shutdown signal received; stopping accept loop and draining active flows");
+                    info!("Shutdown signal received; stopping accept loop and requesting scheduler shutdown");
                     scheduler.do_send(SchedulerShutdown);
                     break;
                 }
