@@ -227,14 +227,6 @@ async fn prepare_listener(
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    let bind_addrs_display = format_bind_addrs(&bind_addrs);
-    if should_warn_for_addrs(&bind_addrs) {
-        warn!(
-            "binding to a non-loopback address ({}) without auth may allow anyone on the network to use this proxy; use a firewall or bind to loopback to restrict access",
-            bind_addrs_display
-        );
-    }
-
     let mut last_err = None;
     for addr in bind_addrs {
         match TcpListener::bind(addr).await {
@@ -242,6 +234,7 @@ async fn prepare_listener(
                 let bound_addr = listener
                     .local_addr()
                     .context("failed to resolve listen address")?;
+                maybe_warn_non_loopback(bound_addr);
                 info!("Starting Fyntr on {}", bound_addr);
                 return Ok((listener, max_connections));
             }
@@ -306,16 +299,13 @@ async fn run_server(
     Ok(())
 }
 
-fn should_warn_for_addrs(addrs: &[SocketAddr]) -> bool {
-    addrs.iter().any(|addr| !addr.ip().is_loopback())
-}
-
-fn format_bind_addrs(addrs: &[SocketAddr]) -> String {
-    addrs
-        .iter()
-        .map(|addr| addr.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+fn maybe_warn_non_loopback(addr: SocketAddr) {
+    if !addr.ip().is_loopback() {
+        warn!(
+            "binding to a non-loopback address ({}) without auth may allow anyone on the network to use this proxy; use a firewall or bind to loopback to restrict access",
+            addr
+        );
+    }
 }
 
 fn ensure_nofile_limits(max_connections: MaxConnections) {
@@ -557,36 +547,6 @@ mod tests {
             max_connections_from_raw(max_by_fd),
             "value above cap is clamped"
         );
-    }
-
-    #[test]
-    fn listen_addrs_loopback_ipv4_no_warning() {
-        let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999)];
-        assert!(!should_warn_for_addrs(&addrs), "loopback should not warn");
-    }
-
-    #[test]
-    fn listen_addrs_non_loopback_ipv4_warns() {
-        let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9999)];
-        assert!(should_warn_for_addrs(&addrs), "non-loopback should warn");
-    }
-
-    #[test]
-    fn listen_addrs_loopback_ipv6_no_warning() {
-        let addrs = vec![SocketAddr::new(
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            9999,
-        )];
-        assert!(!should_warn_for_addrs(&addrs), "loopback should not warn");
-    }
-
-    #[test]
-    fn listen_addrs_non_loopback_ipv6_warns() {
-        let addrs = vec![SocketAddr::new(
-            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            9999,
-        )];
-        assert!(should_warn_for_addrs(&addrs), "non-loopback should warn");
     }
 
     #[test]
