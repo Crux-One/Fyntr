@@ -98,9 +98,12 @@ fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// Handle to a running server instance.
 ///
 /// Use this to inspect the listen address or to initiate shutdown.
+///
+/// Dropping the handle without calling [`shutdown`] will *not* wait for the server task to finish.
+/// A best-effort shutdown signal is sent on drop, but in-flight tasks may still continue briefly.
 pub struct ServerHandle {
     listen_addr: SocketAddr,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<Result<()>>,
 }
 
@@ -111,11 +114,21 @@ impl ServerHandle {
     }
 
     /// Stops accepting new connections but does not terminate in-flight tasks.
-    pub async fn shutdown(self) -> Result<()> {
-        let _ = self.shutdown_tx.send(());
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         match self.join_handle.await {
             Ok(result) => result,
             Err(err) => Err(anyhow!("server task join failed: {}", err)),
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
         }
     }
 }
@@ -244,7 +257,7 @@ async fn start_with_addrs(
 
     Ok(ServerHandle {
         listen_addr,
-        shutdown_tx,
+        shutdown_tx: Some(shutdown_tx),
         join_handle,
     })
 }
