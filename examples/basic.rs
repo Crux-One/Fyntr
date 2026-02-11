@@ -1,7 +1,11 @@
 use fyntr::run;
+use env_logger;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
+    // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
+    env_logger::init();
+
     let handle = run::builder()
         .bind("127.0.0.1")
         .port(0) // 0 lets the OS pick an available port

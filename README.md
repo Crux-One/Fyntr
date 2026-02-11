@@ -79,16 +79,17 @@ Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS
 
 ## Library Usage
 
-Requires [`actix-rt`][10] and [`anyhow`][11] in your application's dependencies.
-
-[10]:https://docs.rs/crate/actix-rt/latest
-[11]:https://docs.rs/crate/anyhow/latest
+Requires [`actix-rt`][10] and [`anyhow`][11] in your application's dependencies. For logging, add [`env_logger`][12] (optional but recommended).
 
 ```rust
 use fyntr::run;
+use env_logger;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
+    // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
+    env_logger::init();
+
     let handle = run::builder()
         .bind("127.0.0.1")
         .port(0) // 0 lets the OS pick an available port
@@ -104,6 +105,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+[10]:https://docs.rs/crate/actix-rt/latest
+[11]:https://docs.rs/crate/anyhow/latest
+[12]:https://docs.rs/crate/env_logger/latest
 
 ## CLI Options
 
