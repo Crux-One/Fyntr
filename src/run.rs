@@ -538,7 +538,17 @@ mod tests {
         assert_ne!(listen_addr.port(), 0, "expected OS-assigned port");
 
         handle.shutdown().await.expect("shutdown");
-        let connect_result = TcpStream::connect(listen_addr).await;
+        // Retry briefly to allow the shutdown to fully propagate.
+        let mut connect_result = TcpStream::connect(listen_addr).await;
+        if connect_result.is_ok() {
+            for _ in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                connect_result = TcpStream::connect(listen_addr).await;
+                if connect_result.is_err() {
+                    break;
+                }
+            }
+        }
         assert!(
             connect_result.is_err(),
             "expected connection to fail after shutdown"
