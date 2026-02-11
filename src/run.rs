@@ -46,13 +46,7 @@ impl BindAddress {
                     .await
                     .with_context(|| format!("failed to resolve bind hostname: {}", host))?
                     .collect();
-
-                let (ipv4_addrs, ipv6_addrs): (Vec<_>, Vec<_>) =
-                    resolved.into_iter().partition(|addr| addr.is_ipv4());
-
-                // Prefer IPv4 addresses but retain IPv6 as a fallback.
-                let mut addrs = ipv4_addrs;
-                addrs.extend(ipv6_addrs);
+                let addrs = order_bind_addrs(resolved);
 
                 if addrs.is_empty() {
                     return Err(anyhow!("no bind addresses found for hostname: {}", host));
@@ -87,6 +81,15 @@ impl From<String> for BindAddress {
             BindAddress::Host(value)
         }
     }
+}
+
+fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let (ipv4_addrs, ipv6_addrs): (Vec<_>, Vec<_>) =
+        addrs.into_iter().partition(|addr| addr.is_ipv4());
+    // Prefer IPv4 addresses but retain IPv6 as a fallback.
+    let mut ordered = ipv4_addrs;
+    ordered.extend(ipv6_addrs);
+    ordered
 }
 
 pub struct ServerHandle {
@@ -584,5 +587,26 @@ mod tests {
             9999,
         )];
         assert!(should_warn_for_addrs(&addrs), "non-loopback should warn");
+    }
+
+    #[test]
+    fn order_bind_addrs_prefers_ipv4_first() {
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 9999),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 9999),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9999),
+        ];
+
+        let ordered = order_bind_addrs(addrs);
+
+        assert!(
+            ordered.iter().take(2).all(|addr| addr.is_ipv4()),
+            "expected IPv4 addresses to come first"
+        );
+        assert!(
+            ordered.iter().skip(2).all(|addr| addr.is_ipv6()),
+            "expected IPv6 addresses after IPv4"
+        );
     }
 }
