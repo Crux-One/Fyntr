@@ -206,6 +206,7 @@ pub(crate) struct Scheduler {
     global_start_time: Option<Instant>,
     total_ticks: u64,
     connection_limiter: ConnectionLimiter,
+    shutdown_requested: bool,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -244,7 +245,10 @@ impl Handler<Shutdown> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, _msg: Shutdown, ctx: &mut Self::Context) -> Self::Result {
-        ctx.stop();
+        self.shutdown_requested = true;
+        if self.flows.is_empty() {
+            ctx.stop();
+        }
     }
 }
 
@@ -270,6 +274,7 @@ impl Scheduler {
             global_start_time: None,
             total_ticks: 0,
             connection_limiter: ConnectionLimiter::new(),
+            shutdown_requested: false,
         }
     }
 
@@ -388,7 +393,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
 impl Handler<Unregister> for Scheduler {
     type Result = ();
 
-    fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: Unregister, ctx: &mut Self::Context) -> Self::Result {
         if self.unregister(msg.flow_id) {
             self.decrement_connection_count();
             self.log_connection_count(msg.flow_id, "unregistered from scheduler");
@@ -397,6 +402,10 @@ impl Handler<Unregister> for Scheduler {
                 "flow{}: unregister requested but flow not found",
                 msg.flow_id.0
             );
+        }
+
+        if self.shutdown_requested && self.flows.is_empty() {
+            ctx.stop();
         }
     }
 }
