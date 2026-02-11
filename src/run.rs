@@ -246,18 +246,12 @@ async fn prepare_listener(
         }
     }
 
-    if let Some((addr, err)) = last_err {
-        Err(anyhow!(
-            "failed to bind to any resolved address (last error on {}): {}",
-            addr,
-            err
-        ))
-    } else {
-        Err(anyhow!(
-            "failed to bind to any resolved address ({})",
-            bind_addrs_display
-        ))
-    }
+    let (addr, err) = last_err.expect("bind attempts should yield at least one error");
+    Err(anyhow!(
+        "failed to bind to any resolved address (last error on {}): {}",
+        addr,
+        err
+    ))
 }
 
 async fn run_server(
