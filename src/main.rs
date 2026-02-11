@@ -1,4 +1,5 @@
 use clap::Parser;
+use env_logger::Env;
 use fyntr::{
     limits::max_connections_from_raw,
     run::{self, DEFAULT_BIND, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT},
@@ -23,6 +24,7 @@ struct Cli {
 
 #[actix_rt::main]
 async fn main() -> Result<(), anyhow::Error> {
+    let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
     let cli = Cli::parse();
 
     run::server_with_bind(
