@@ -31,6 +31,9 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
+/// Address to bind the server to (IP or hostname).
+///
+/// Hostnames are resolved at start time.
 #[derive(Debug, Clone)]
 pub enum BindAddress {
     Ip(IpAddr),
@@ -92,6 +95,9 @@ fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     ordered
 }
 
+/// Handle to a running server instance.
+///
+/// Use this to inspect the listen address or to initiate shutdown.
 pub struct ServerHandle {
     listen_addr: SocketAddr,
     shutdown_tx: oneshot::Sender<()>,
@@ -99,6 +105,7 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Returns the socket address the server is listening on.
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
@@ -113,6 +120,7 @@ impl ServerHandle {
     }
 }
 
+/// Builder for configuring and starting a server instance.
 pub struct ServerBuilder {
     bind: BindAddress,
     port: u16,
@@ -134,6 +142,7 @@ impl ServerBuilder {
         }
     }
 
+    /// Sets the bind address (IP address or hostname).
     pub fn bind<B>(mut self, bind: B) -> Self
     where
         B: Into<BindAddress>,
@@ -142,27 +151,36 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the port to listen on.
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
+    /// Sets the maximum number of concurrent connections (0 for unlimited).
     pub fn max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections_from_raw(max_connections);
         self
     }
 
+    /// Starts the server and returns a handle for shutdown.
+    ///
+    /// Returns an error if address resolution or binding fails.
     pub async fn start(self) -> Result<ServerHandle> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         start_with_addrs(bind_addrs, self.max_connections).await
     }
 
+    /// Runs the server to completion without returning a handle.
+    ///
+    /// Returns an error if address resolution or binding fails.
     pub async fn run(self) -> Result<()> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         server_with_addrs(bind_addrs, self.max_connections).await
     }
 }
 
+/// Creates a new `ServerBuilder` with default settings.
 pub fn builder() -> ServerBuilder {
     ServerBuilder::new()
 }
