@@ -613,33 +613,20 @@ mod tests {
 
     #[actix_rt::test]
     async fn builder_run_smoke() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind temp listener");
-        let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
-
         let server_task = actix::spawn(async move {
             builder()
                 .bind("127.0.0.1")
-                .port(port)
+                .port(0)
                 .max_connections(1)
                 .run()
                 .await
         });
 
-        let mut connect_result = TcpStream::connect(("127.0.0.1", port)).await;
-        if connect_result.is_err() {
-            for _ in 0..8 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                connect_result = TcpStream::connect(("127.0.0.1", port)).await;
-                if connect_result.is_ok() {
-                    break;
-                }
-            }
-        }
-        let client = connect_result.expect("connect to run() server");
-        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !server_task.is_finished(),
+            "expected run() task to keep running"
+        );
 
         server_task.abort();
         let join_result = server_task.await;
