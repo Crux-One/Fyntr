@@ -104,7 +104,7 @@ fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 pub struct ServerHandle {
     listen_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    join_handle: JoinHandle<Result<()>>,
+    join_handle: Option<JoinHandle<Result<()>>>,
 }
 
 impl ServerHandle {
@@ -118,9 +118,12 @@ impl ServerHandle {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        match self.join_handle.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!("server task join failed: {}", err)),
+        match self.join_handle.take() {
+            Some(handle) => match handle.await {
+                Ok(result) => result,
+                Err(err) => Err(anyhow!("server task join failed: {}", err)),
+            },
+            None => Ok(()),
         }
     }
 }
@@ -258,7 +261,7 @@ async fn start_with_addrs(
     Ok(ServerHandle {
         listen_addr,
         shutdown_tx: Some(shutdown_tx),
-        join_handle,
+        join_handle: Some(join_handle),
     })
 }
 
