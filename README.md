@@ -83,7 +83,6 @@ Requires [`actix-rt`][10] and [`anyhow`][11] in your application's dependencies.
 
 ```rust
 use fyntr::run;
-use env_logger;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {

@@ -1,5 +1,4 @@
 use fyntr::run;
-use env_logger;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
