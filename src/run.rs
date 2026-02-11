@@ -540,6 +540,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bind_address_from_str_parses_ip_or_host() {
+        match BindAddress::from("127.0.0.1") {
+            BindAddress::Ip(addr) => assert!(addr.is_loopback()),
+            _ => panic!("expected IPv4 loopback to parse as BindAddress::Ip"),
+        }
+
+        match BindAddress::from("::1") {
+            BindAddress::Ip(addr) => assert!(addr.is_loopback()),
+            _ => panic!("expected IPv6 loopback to parse as BindAddress::Ip"),
+        }
+
+        match BindAddress::from("localhost") {
+            BindAddress::Host(host) => assert_eq!(host, "localhost"),
+            _ => panic!("expected hostname to parse as BindAddress::Host"),
+        }
+    }
+
+    #[test]
+    fn bind_address_from_string_parses_ip_or_host() {
+        let v4 = "127.0.0.1".to_string();
+        match BindAddress::from(v4) {
+            BindAddress::Ip(addr) => assert!(addr.is_loopback()),
+            _ => panic!("expected IPv4 loopback to parse as BindAddress::Ip"),
+        }
+
+        let v6 = "::1".to_string();
+        match BindAddress::from(v6) {
+            BindAddress::Ip(addr) => assert!(addr.is_loopback()),
+            _ => panic!("expected IPv6 loopback to parse as BindAddress::Ip"),
+        }
+
+        let host = "localhost".to_string();
+        match BindAddress::from(host) {
+            BindAddress::Host(value) => assert_eq!(value, "localhost"),
+            _ => panic!("expected hostname to parse as BindAddress::Host"),
+        }
+    }
+
     #[actix_rt::test]
     async fn builder_start_shutdown_smoke() {
         let handle = builder()
@@ -569,6 +608,44 @@ mod tests {
         assert!(
             connect_result.is_err(),
             "expected connection to fail after shutdown"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn builder_run_smoke() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temp listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let server_task = actix::spawn(async move {
+            builder()
+                .bind("127.0.0.1")
+                .port(port)
+                .max_connections(1)
+                .run()
+                .await
+        });
+
+        let mut connect_result = TcpStream::connect(("127.0.0.1", port)).await;
+        if connect_result.is_err() {
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                connect_result = TcpStream::connect(("127.0.0.1", port)).await;
+                if connect_result.is_ok() {
+                    break;
+                }
+            }
+        }
+        let client = connect_result.expect("connect to run() server");
+        drop(client);
+
+        server_task.abort();
+        let join_result = server_task.await;
+        assert!(
+            join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+            "expected run() task to be cancelled"
         );
     }
 
