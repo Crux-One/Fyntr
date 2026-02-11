@@ -316,6 +316,7 @@ async fn run_server(
     loop {
         let accept_result = if let Some(rx) = shutdown_rx.as_mut() {
             tokio::select! {
+                biased;
                 _ = rx => {
                     info!("Shutdown signal received; stopping accept loop and draining active flows");
                     scheduler.do_send(SchedulerShutdown);
