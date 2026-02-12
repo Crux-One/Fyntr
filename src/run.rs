@@ -17,7 +17,9 @@ use tokio::{
 };
 
 use crate::{
-    actors::scheduler::{Scheduler, Shutdown as SchedulerShutdown},
+    actors::scheduler::{
+        ConnectionTaskFinished, ConnectionTaskStarted, Scheduler, Shutdown as SchedulerShutdown,
+    },
     flow::FlowId,
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
@@ -30,6 +32,23 @@ const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
+
+struct ConnectionTaskGuard {
+    scheduler: Addr<Scheduler>,
+}
+
+impl ConnectionTaskGuard {
+    fn new(scheduler: Addr<Scheduler>) -> Self {
+        scheduler.do_send(ConnectionTaskStarted);
+        Self { scheduler }
+    }
+}
+
+impl Drop for ConnectionTaskGuard {
+    fn drop(&mut self) {
+        self.scheduler.do_send(ConnectionTaskFinished);
+    }
+}
 
 /// Address to bind the server to (IP or hostname).
 ///
@@ -334,12 +353,15 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        let connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            if let Err(e) =
-                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
-            {
+            let result = handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await;
+            // Keep the guard alive across the await so pending_connection_tasks
+            // is decremented only after the connection task truly finishes.
+            drop(connection_task_guard);
+            if let Err(e) = result {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
         });
