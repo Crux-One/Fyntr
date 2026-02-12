@@ -10,7 +10,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::Mutex,
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -71,12 +71,19 @@ impl StatusLine {
     );
     const BAD_GATEWAY: StatusLine =
         Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
+    const REQUEST_TIMEOUT: StatusLine =
+        Self::new(b"HTTP/1.1 408 Request Timeout\r\n\r\n", "408", "Request Timeout");
     const SERVICE_UNAVAILABLE: StatusLine = Self::new(
         b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "503",
         "Service Unavailable",
     );
 }
+
+#[cfg(not(test))]
+const CONNECT_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const CONNECT_REQUEST_LINE_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
 enum StatusLogLevel {
@@ -170,7 +177,29 @@ impl ConnectState {
     }
 
     async fn advance_validating(mut session: ConnectSession) -> ConnectResult<ConnectState> {
-        let request_line = read_request_line(&mut session.client_reader).await?;
+        let request_line = match timeout(
+            CONNECT_REQUEST_LINE_TIMEOUT,
+            read_request_line(&mut session.client_reader),
+        )
+        .await
+        {
+            Ok(Ok(request_line)) => request_line,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                let detail = format!(
+                    "timed out waiting for request line from {} after {:?}",
+                    session.client_addr, CONNECT_REQUEST_LINE_TIMEOUT
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::REQUEST_TIMEOUT,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+        };
 
         if !request_line.is_http_1x() {
             let detail = format!(
@@ -669,6 +698,21 @@ mod tests {
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
         drop(backend_listener);
+    }
+
+    #[actix_rt::test]
+    async fn returns_408_when_request_line_times_out() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let client = TcpStream::connect(addr).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
     }
 
     #[actix_rt::test]
