@@ -353,10 +353,11 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        let connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            let _connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
+            let _connection_task_guard = connection_task_guard;
             if let Err(e) =
                 handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
             {
