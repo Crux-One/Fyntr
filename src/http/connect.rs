@@ -71,8 +71,11 @@ impl StatusLine {
     );
     const BAD_GATEWAY: StatusLine =
         Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
-    const REQUEST_TIMEOUT: StatusLine =
-        Self::new(b"HTTP/1.1 408 Request Timeout\r\n\r\n", "408", "Request Timeout");
+    const REQUEST_TIMEOUT: StatusLine = Self::new(
+        b"HTTP/1.1 408 Request Timeout\r\n\r\n",
+        "408",
+        "Request Timeout",
+    );
     const SERVICE_UNAVAILABLE: StatusLine = Self::new(
         b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "503",
