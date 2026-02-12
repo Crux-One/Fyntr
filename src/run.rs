@@ -357,10 +357,11 @@ async fn run_server(
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            let _connection_task_guard = connection_task_guard;
-            if let Err(e) =
-                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
-            {
+            let result = handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await;
+            // Keep the guard alive across the await so pending_connection_tasks
+            // is decremented only after the connection task truly finishes.
+            drop(connection_task_guard);
+            if let Err(e) = result {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
         });
