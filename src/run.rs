@@ -336,10 +336,10 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
-        scheduler.do_send(ConnectionTaskStarted);
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
+            scheduler.do_send(ConnectionTaskStarted);
             let scheduler_for_flow = scheduler.clone();
             if let Err(e) =
                 handle_connect_proxy(client_stream, client_addr, flow_id, scheduler_for_flow).await
