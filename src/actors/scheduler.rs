@@ -273,11 +273,10 @@ impl Handler<ConnectionTaskFinished> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, _msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
-        if self.pending_connection_tasks > 0 {
-            self.pending_connection_tasks -= 1;
-        } else {
+        if self.pending_connection_tasks == 0 {
             warn!("connection task finished but pending counter is already zero");
         }
+        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
 
         if self.should_stop() {
             ctx.stop();
