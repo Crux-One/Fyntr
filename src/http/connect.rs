@@ -83,10 +83,7 @@ impl StatusLine {
     );
 }
 
-#[cfg(not(test))]
 const CONNECT_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const CONNECT_REQUEST_LINE_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
 enum StatusLogLevel {
@@ -727,34 +724,44 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_408_when_request_line_times_out() {
+        time::pause();
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response = drive_proxy(listener, scheduler, async move {
+        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
             let client = TcpStream::connect(addr).await.unwrap();
             read_response(client).await
-        })
-        .await;
+        }));
+
+        task::yield_now().await;
+        time::advance(CONNECT_REQUEST_LINE_TIMEOUT + Duration::from_millis(1)).await;
+        task::yield_now().await;
+        let response = response_task.await.unwrap();
 
         assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
     }
 
     #[actix_rt::test]
     async fn returns_408_when_connect_headers_time_out() {
+        time::pause();
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response = drive_proxy(listener, scheduler, async move {
+        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
             client
                 .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
                 .await
                 .unwrap();
             read_response(client).await
-        })
-        .await;
+        }));
+
+        task::yield_now().await;
+        time::advance(CONNECT_REQUEST_LINE_TIMEOUT + Duration::from_millis(1)).await;
+        task::yield_now().await;
+        let response = response_task.await.unwrap();
 
         assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
     }
