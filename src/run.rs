@@ -99,7 +99,7 @@ fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 ///
 /// Use this to inspect the listen address or to initiate shutdown.
 ///
-/// Dropping the handle without calling [`shutdown`] will *not* wait for the server task to finish.
+/// Dropping the handle without calling [`Self::shutdown`] will *not* wait for the server task to finish.
 /// A best-effort shutdown signal is sent on drop, but in-flight tasks may still continue briefly.
 pub struct ServerHandle {
     listen_addr: SocketAddr,
