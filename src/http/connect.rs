@@ -1,4 +1,4 @@
-use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt::Display, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -117,6 +117,36 @@ async fn respond_with_status<T>(
     Err(ConnectFlowError::ResponseSent)
 }
 
+async fn await_with_timeout_response<T, F>(
+    flow_id: FlowId,
+    client_addr: SocketAddr,
+    writer: &mut OwnedWriteHalf,
+    phase: &str,
+    fut: F,
+) -> ConnectResult<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match timeout(CONNECT_REQUEST_LINE_TIMEOUT, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            let detail = format!(
+                "timed out waiting for {} from {} after {:?}",
+                phase, client_addr, CONNECT_REQUEST_LINE_TIMEOUT
+            );
+            respond_with_status(
+                flow_id,
+                writer,
+                StatusLine::REQUEST_TIMEOUT,
+                StatusLogLevel::Warn,
+                detail,
+            )
+            .await
+        }
+    }
+}
+
 struct ConnectSession {
     flow_id: FlowId,
     client_addr: SocketAddr,
@@ -180,29 +210,14 @@ impl ConnectState {
     }
 
     async fn advance_validating(mut session: ConnectSession) -> ConnectResult<ConnectState> {
-        let request_line = match timeout(
-            CONNECT_REQUEST_LINE_TIMEOUT,
+        let request_line = await_with_timeout_response(
+            session.flow_id,
+            session.client_addr,
+            &mut session.client_write,
+            "request line",
             read_request_line(&mut session.client_reader),
         )
-        .await
-        {
-            Ok(Ok(request_line)) => request_line,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                let detail = format!(
-                    "timed out waiting for request line from {} after {:?}",
-                    session.client_addr, CONNECT_REQUEST_LINE_TIMEOUT
-                );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::REQUEST_TIMEOUT,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
-            }
-        };
+        .await?;
 
         if !request_line.is_http_1x() {
             let detail = format!(
@@ -240,29 +255,14 @@ impl ConnectState {
             session.flow_id.0, target_host, target_port
         );
 
-        match timeout(
-            CONNECT_REQUEST_LINE_TIMEOUT,
+        await_with_timeout_response(
+            session.flow_id,
+            session.client_addr,
+            &mut session.client_write,
+            "CONNECT headers",
             skip_headers(&mut session.client_reader),
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                let detail = format!(
-                    "timed out waiting for CONNECT headers from {} after {:?}",
-                    session.client_addr, CONNECT_REQUEST_LINE_TIMEOUT
-                );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::REQUEST_TIMEOUT,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
-            }
-        }
+        .await?;
 
         Ok(ConnectState::Dialing {
             session,
