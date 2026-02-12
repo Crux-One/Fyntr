@@ -1,4 +1,4 @@
-use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt::Display, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -10,7 +10,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::Mutex,
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -71,12 +71,19 @@ impl StatusLine {
     );
     const BAD_GATEWAY: StatusLine =
         Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
+    const REQUEST_TIMEOUT: StatusLine = Self::new(
+        b"HTTP/1.1 408 Request Timeout\r\n\r\n",
+        "408",
+        "Request Timeout",
+    );
     const SERVICE_UNAVAILABLE: StatusLine = Self::new(
         b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "503",
         "Service Unavailable",
     );
 }
+
+const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 enum StatusLogLevel {
@@ -105,6 +112,36 @@ async fn respond_with_status<T>(
     writer.write_all(status.raw).await?;
     writer.flush().await?;
     Err(ConnectFlowError::ResponseSent)
+}
+
+async fn await_with_timeout_response<T, F>(
+    flow_id: FlowId,
+    client_addr: SocketAddr,
+    writer: &mut OwnedWriteHalf,
+    phase: &str,
+    fut: F,
+) -> ConnectResult<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match timeout(CONNECT_HANDSHAKE_TIMEOUT, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            let detail = format!(
+                "timed out waiting for {} from {} after {:?}",
+                phase, client_addr, CONNECT_HANDSHAKE_TIMEOUT
+            );
+            respond_with_status(
+                flow_id,
+                writer,
+                StatusLine::REQUEST_TIMEOUT,
+                StatusLogLevel::Warn,
+                detail,
+            )
+            .await
+        }
+    }
 }
 
 struct ConnectSession {
@@ -170,7 +207,14 @@ impl ConnectState {
     }
 
     async fn advance_validating(mut session: ConnectSession) -> ConnectResult<ConnectState> {
-        let request_line = read_request_line(&mut session.client_reader).await?;
+        let request_line = await_with_timeout_response(
+            session.flow_id,
+            session.client_addr,
+            &mut session.client_write,
+            "request line",
+            read_request_line(&mut session.client_reader),
+        )
+        .await?;
 
         if !request_line.is_http_1x() {
             let detail = format!(
@@ -208,7 +252,14 @@ impl ConnectState {
             session.flow_id.0, target_host, target_port
         );
 
-        skip_headers(&mut session.client_reader).await?;
+        await_with_timeout_response(
+            session.flow_id,
+            session.client_addr,
+            &mut session.client_write,
+            "CONNECT headers",
+            skip_headers(&mut session.client_reader),
+        )
+        .await?;
 
         Ok(ConnectState::Dialing {
             session,
@@ -669,6 +720,50 @@ mod tests {
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
         drop(backend_listener);
+    }
+
+    #[actix_rt::test]
+    async fn returns_408_when_request_line_times_out() {
+        time::pause();
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
+            let client = TcpStream::connect(addr).await.unwrap();
+            read_response(client).await
+        }));
+
+        task::yield_now().await;
+        time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
+        task::yield_now().await;
+        let response = response_task.await.unwrap();
+
+        assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_408_when_connect_headers_time_out() {
+        time::pause();
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        }));
+
+        task::yield_now().await;
+        time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
+        task::yield_now().await;
+        let response = response_task.await.unwrap();
+
+        assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
     }
 
     #[actix_rt::test]

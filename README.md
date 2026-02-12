@@ -24,7 +24,7 @@
 Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic, stabilizing connections on constrained networks.
 No server-side changes required, no auth, no inspection.
 
-Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS and <1MB private memory on Windows) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
+Fyntr starts with a small memory profile (~2.4MB peak memory footprint on macOS via `/usr/bin/time -l`, and ~1MB private memory on Windows) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
 
 ## Internals
 - Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
@@ -77,12 +77,44 @@ Fyntr runs with a tiny initial memory footprint after startup (<3MB RSS on macOS
     curl https://ifconfig.me
     ```
 
+## Library Usage
+
+Requires [`actix-rt`][10] and [`anyhow`][11] in your application's dependencies. For logging, add [`env_logger`][12] (optional but recommended).
+
+```rust
+use fyntr::run;
+
+#[actix_rt::main]
+async fn main() -> anyhow::Result<()> {
+    // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
+    env_logger::init();
+
+    let handle = run::builder()
+        .bind("127.0.0.1")
+        .port(0) // 0 lets the OS pick an available port
+        .max_connections(512)
+        .start()
+        .await?;
+
+    println!("Fyntr listening on {}", handle.listen_addr());
+
+    // ... run your app ...
+
+    handle.shutdown().await?;
+    Ok(())
+}
+```
+
+[10]:https://docs.rs/crate/actix-rt/latest
+[11]:https://docs.rs/crate/anyhow/latest
+[12]:https://docs.rs/crate/env_logger/latest
+
 ## CLI Options
 
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
 | `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
-| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on. |
+| `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
 ## Why Fyntr?
