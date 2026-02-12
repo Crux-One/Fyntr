@@ -83,7 +83,7 @@ impl StatusLine {
     );
 }
 
-const CONNECT_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 enum StatusLogLevel {
@@ -124,13 +124,13 @@ async fn await_with_timeout_response<T, F>(
 where
     F: Future<Output = anyhow::Result<T>>,
 {
-    match timeout(CONNECT_REQUEST_LINE_TIMEOUT, fut).await {
+    match timeout(CONNECT_HANDSHAKE_TIMEOUT, fut).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => {
             let detail = format!(
                 "timed out waiting for {} from {} after {:?}",
-                phase, client_addr, CONNECT_REQUEST_LINE_TIMEOUT
+                phase, client_addr, CONNECT_HANDSHAKE_TIMEOUT
             );
             respond_with_status(
                 flow_id,
@@ -735,7 +735,7 @@ mod tests {
         }));
 
         task::yield_now().await;
-        time::advance(CONNECT_REQUEST_LINE_TIMEOUT + Duration::from_millis(1)).await;
+        time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
         task::yield_now().await;
         let response = response_task.await.unwrap();
 
@@ -759,7 +759,7 @@ mod tests {
         }));
 
         task::yield_now().await;
-        time::advance(CONNECT_REQUEST_LINE_TIMEOUT + Duration::from_millis(1)).await;
+        time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
         task::yield_now().await;
         let response = response_task.await.unwrap();
 
