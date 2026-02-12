@@ -207,6 +207,7 @@ pub(crate) struct Scheduler {
     total_ticks: u64,
     connection_limiter: ConnectionLimiter,
     shutdown_requested: bool,
+    pending_connection_tasks: usize,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -228,6 +229,14 @@ pub(crate) struct QuantumTick;
 #[rtype(result = "()")]
 pub(crate) struct Shutdown;
 
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct ConnectionTaskStarted;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct ConnectionTaskFinished;
+
 impl Handler<QuantumTick> for Scheduler {
     type Result = ();
 
@@ -246,7 +255,31 @@ impl Handler<Shutdown> for Scheduler {
 
     fn handle(&mut self, _msg: Shutdown, ctx: &mut Self::Context) -> Self::Result {
         self.shutdown_requested = true;
-        if self.flows.is_empty() {
+        if self.should_stop() {
+            ctx.stop();
+        }
+    }
+}
+
+impl Handler<ConnectionTaskStarted> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ConnectionTaskStarted, _ctx: &mut Self::Context) -> Self::Result {
+        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
+    }
+}
+
+impl Handler<ConnectionTaskFinished> for Scheduler {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
+        if self.pending_connection_tasks > 0 {
+            self.pending_connection_tasks -= 1;
+        } else {
+            warn!("connection task finished but pending counter is already zero");
+        }
+
+        if self.should_stop() {
             ctx.stop();
         }
     }
@@ -275,6 +308,7 @@ impl Scheduler {
             total_ticks: 0,
             connection_limiter: ConnectionLimiter::new(),
             shutdown_requested: false,
+            pending_connection_tasks: 0,
         }
     }
 
@@ -300,6 +334,10 @@ impl Scheduler {
 
     fn max_connections(&self) -> MaxConnections {
         self.connection_limiter.max_connections()
+    }
+
+    fn should_stop(&self) -> bool {
+        self.shutdown_requested && self.flows.is_empty() && self.pending_connection_tasks == 0
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
@@ -404,7 +442,7 @@ impl Handler<Unregister> for Scheduler {
             );
         }
 
-        if self.shutdown_requested && self.flows.is_empty() {
+        if self.should_stop() {
             ctx.stop();
         }
     }
@@ -620,6 +658,7 @@ pub(super) struct InspectReply {
     pub flow_ids: Vec<FlowId>,
     pub total_client_to_backend_bytes: u64,
     pub total_backend_to_client_bytes: u64,
+    pub pending_connection_tasks: usize,
 }
 
 #[cfg(test)]
@@ -645,6 +684,7 @@ impl Handler<InspectState> for Scheduler {
             flow_ids: self.flows.keys().copied().collect(),
             total_client_to_backend_bytes: self.total_client_to_backend_bytes,
             total_backend_to_client_bytes: self.total_backend_to_client_bytes,
+            pending_connection_tasks: self.pending_connection_tasks,
         })
     }
 }
@@ -937,6 +977,36 @@ mod tests {
         }
 
         assert!(stopped, "queue actor should stop after unregister");
+    }
+
+    #[actix_rt::test]
+    async fn shutdown_waits_for_pending_connection_tasks() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        scheduler.send(ConnectionTaskStarted).await.unwrap();
+        scheduler.send(Shutdown).await.unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.pending_connection_tasks, 1,
+            "pending tasks should remain tracked during shutdown"
+        );
+
+        scheduler.send(ConnectionTaskFinished).await.unwrap();
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if scheduler.send(CanAcceptConnection).await.is_err() {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            stopped,
+            "scheduler should stop once shutdown is requested and pending tasks drain"
+        );
     }
 
     #[actix_rt::test]

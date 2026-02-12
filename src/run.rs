@@ -17,7 +17,9 @@ use tokio::{
 };
 
 use crate::{
-    actors::scheduler::{Scheduler, Shutdown as SchedulerShutdown},
+    actors::scheduler::{
+        ConnectionTaskFinished, ConnectionTaskStarted, Scheduler, Shutdown as SchedulerShutdown,
+    },
     flow::FlowId,
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
@@ -334,14 +336,17 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        scheduler.do_send(ConnectionTaskStarted);
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
+            let scheduler_for_flow = scheduler.clone();
             if let Err(e) =
-                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
+                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler_for_flow).await
             {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
+            scheduler.do_send(ConnectionTaskFinished);
         });
     }
 
