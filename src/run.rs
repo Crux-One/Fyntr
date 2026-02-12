@@ -33,6 +33,23 @@ const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
+struct ConnectionTaskGuard {
+    scheduler: Addr<Scheduler>,
+}
+
+impl ConnectionTaskGuard {
+    fn new(scheduler: Addr<Scheduler>) -> Self {
+        scheduler.do_send(ConnectionTaskStarted);
+        Self { scheduler }
+    }
+}
+
+impl Drop for ConnectionTaskGuard {
+    fn drop(&mut self) {
+        self.scheduler.do_send(ConnectionTaskFinished);
+    }
+}
+
 /// Address to bind the server to (IP or hostname).
 ///
 /// Hostnames are resolved at start time.
@@ -339,14 +356,12 @@ async fn run_server(
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            scheduler.do_send(ConnectionTaskStarted);
-            let scheduler_for_flow = scheduler.clone();
+            let _connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
             if let Err(e) =
-                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler_for_flow).await
+                handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await
             {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
-            scheduler.do_send(ConnectionTaskFinished);
         });
     }
 
