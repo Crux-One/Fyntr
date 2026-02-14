@@ -217,20 +217,30 @@ impl ServerBuilder {
         self
     }
 
-    /// Starts the server and returns a handle for shutdown.
+    /// Runs the server in the background and returns a handle for shutdown.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn start(self) -> Result<ServerHandle> {
+    pub async fn background(self) -> Result<ServerHandle> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         start_with_addrs(bind_addrs, self.max_connections).await
     }
 
-    /// Runs the server to completion without returning a handle.
+    /// Runs the server in the foreground to completion without returning a handle.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn run(self) -> Result<()> {
+    pub async fn foreground(self) -> Result<()> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         server_with_addrs(bind_addrs, self.max_connections).await
+    }
+
+    #[deprecated(note = "use background() instead")]
+    pub async fn start(self) -> Result<ServerHandle> {
+        self.background().await
+    }
+
+    #[deprecated(note = "use foreground() instead")]
+    pub async fn run(self) -> Result<()> {
+        self.foreground().await
     }
 }
 
@@ -615,9 +625,9 @@ mod tests {
             .bind("127.0.0.1")
             .port(0)
             .max_connections(1)
-            .start()
+            .background()
             .await
-            .expect("start");
+            .expect("background");
 
         let listen_addr = handle.listen_addr();
         assert!(listen_addr.ip().is_loopback(), "expected loopback bind");
@@ -648,21 +658,21 @@ mod tests {
                 .bind("127.0.0.1")
                 .port(0)
                 .max_connections(1)
-                .run()
+                .foreground()
                 .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !server_task.is_finished(),
-            "expected run() task to keep running"
+            "expected foreground() task to keep running"
         );
 
         server_task.abort();
         let join_result = server_task.await;
         assert!(
             join_result.is_err() && join_result.unwrap_err().is_cancelled(),
-            "expected run() task to be cancelled"
+            "expected foreground() task to be cancelled"
         );
     }
 

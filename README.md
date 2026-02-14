@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .bind("127.0.0.1")
         .port(0) // 0 lets the OS pick an available port
         .max_connections(512)
-        .start()
+        .background()
         .await?;
 
     println!("Fyntr listening on {}", handle.listen_addr());

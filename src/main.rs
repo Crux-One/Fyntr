@@ -27,6 +27,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .bind(cli.bind)
         .port(cli.port)
         .max_connections(cli.max_connections)
-        .run()
+        .foreground()
         .await
 }
