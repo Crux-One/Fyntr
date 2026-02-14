@@ -1,5 +1,8 @@
 use std::{
+    convert::Infallible,
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -60,6 +63,13 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
+    fn parse(value: &str) -> Self {
+        match value.parse::<IpAddr>() {
+            Ok(addr) => BindAddress::Ip(addr),
+            Err(_) => BindAddress::Host(value.to_string()),
+        }
+    }
+
     async fn resolve(self, port: u16) -> Result<Vec<SocketAddr>> {
         match self {
             BindAddress::Ip(addr) => Ok(vec![SocketAddr::new(addr, port)]),
@@ -79,6 +89,23 @@ impl BindAddress {
     }
 }
 
+impl fmt::Display for BindAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindAddress::Ip(addr) => write!(f, "{}", addr),
+            BindAddress::Host(host) => f.write_str(host),
+        }
+    }
+}
+
+impl FromStr for BindAddress {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self::parse(s))
+    }
+}
+
 impl From<IpAddr> for BindAddress {
     fn from(value: IpAddr) -> Self {
         BindAddress::Ip(value)
@@ -87,21 +114,13 @@ impl From<IpAddr> for BindAddress {
 
 impl From<&str> for BindAddress {
     fn from(value: &str) -> Self {
-        if let Ok(addr) = value.parse::<IpAddr>() {
-            addr.into()
-        } else {
-            BindAddress::Host(value.to_string())
-        }
+        Self::parse(value)
     }
 }
 
 impl From<String> for BindAddress {
     fn from(value: String) -> Self {
-        if let Ok(addr) = value.parse::<IpAddr>() {
-            addr.into()
-        } else {
-            BindAddress::Host(value)
-        }
+        Self::parse(&value)
     }
 }
 
@@ -599,6 +618,15 @@ mod tests {
             BindAddress::Host(value) => assert_eq!(value, "localhost"),
             _ => panic!("expected hostname to parse as BindAddress::Host"),
         }
+    }
+
+    #[test]
+    fn bind_address_from_str_trait_parses_ip_or_host() {
+        let ip: BindAddress = "127.0.0.1".parse().expect("infallible parse");
+        assert!(matches!(ip, BindAddress::Ip(addr) if addr.is_loopback()));
+
+        let host: BindAddress = "localhost".parse().expect("infallible parse");
+        assert!(matches!(host, BindAddress::Host(value) if value == "localhost"));
     }
 
     #[actix_rt::test]
