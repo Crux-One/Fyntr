@@ -23,7 +23,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
     let cli = Cli::parse();
 
-    run::builder()
+    run::server()
         .bind(cli.bind)
         .port(cli.port)
         .max_connections(cli.max_connections)

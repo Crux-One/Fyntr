@@ -245,7 +245,7 @@ impl ServerBuilder {
 }
 
 /// Creates a new `ServerBuilder` with default settings.
-pub fn builder() -> ServerBuilder {
+pub fn server() -> ServerBuilder {
     ServerBuilder::new()
 }
 
@@ -603,7 +603,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn builder_start_shutdown_smoke() {
-        let handle = builder()
+        let handle = server()
             .bind("127.0.0.1")
             .port(0)
             .max_connections(1)
@@ -636,7 +636,7 @@ mod tests {
     #[actix_rt::test]
     async fn builder_run_smoke() {
         let server_task = actix::spawn(async move {
-            builder()
+            server()
                 .bind("127.0.0.1")
                 .port(0)
                 .max_connections(1)
