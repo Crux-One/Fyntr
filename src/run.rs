@@ -249,24 +249,6 @@ pub fn builder() -> ServerBuilder {
     ServerBuilder::new()
 }
 
-/// Starts the proxy server on `DEFAULT_BIND` and returns a handle for shutdown.
-///
-/// The returned `ServerHandle` can be used to stop accepting new connections.
-pub async fn start(port: u16, max_connections: MaxConnections) -> Result<ServerHandle> {
-    start_with_bind(DEFAULT_BIND, port, max_connections).await
-}
-
-/// Starts the proxy server bound to the given IP address and port.
-///
-/// The returned `ServerHandle` can be used to stop accepting new connections.
-pub async fn start_with_bind(
-    bind: IpAddr,
-    port: u16,
-    max_connections: MaxConnections,
-) -> Result<ServerHandle> {
-    start_with_addrs(vec![SocketAddr::new(bind, port)], max_connections).await
-}
-
 async fn server_with_addrs(
     bind_addrs: Vec<SocketAddr>,
     max_connections: MaxConnections,
