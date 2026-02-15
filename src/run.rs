@@ -101,6 +101,8 @@ impl fmt::Display for BindAddress {
 pub enum BindAddressParseError {
     Empty,
     ContainsPort,
+    HostTooLong,
+    InvalidHostChars,
 }
 
 impl fmt::Display for BindAddressParseError {
@@ -109,6 +111,10 @@ impl fmt::Display for BindAddressParseError {
             Self::Empty => f.write_str("bind address must not be empty"),
             Self::ContainsPort => {
                 f.write_str("bind address must not include a port; use --port/FYNTR_PORT")
+            }
+            Self::HostTooLong => f.write_str("bind hostname must be 253 characters or fewer"),
+            Self::InvalidHostChars => {
+                f.write_str("bind hostname contains invalid characters; allowed: a-z A-Z 0-9 . -")
             }
         }
     }
@@ -133,6 +139,17 @@ impl FromStr for BindAddress {
 
         if s.parse::<SocketAddr>().is_ok() {
             return Err(BindAddressParseError::ContainsPort);
+        }
+
+        if s.len() > 253 {
+            return Err(BindAddressParseError::HostTooLong);
+        }
+
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(BindAddressParseError::InvalidHostChars);
         }
 
         Ok(BindAddress::Host(s.to_string()))
@@ -658,6 +675,20 @@ mod tests {
         assert!(matches!(
             bracketed_v6_with_port,
             BindAddressParseError::ContainsPort
+        ));
+
+        let too_long = format!("{}.example.com", "a".repeat(242));
+        let too_long_err = too_long
+            .parse::<BindAddress>()
+            .expect_err("hostname > 253 chars should fail");
+        assert!(matches!(too_long_err, BindAddressParseError::HostTooLong));
+
+        let invalid_chars = "local_host"
+            .parse::<BindAddress>()
+            .expect_err("hostname with invalid chars should fail");
+        assert!(matches!(
+            invalid_chars,
+            BindAddressParseError::InvalidHostChars
         ));
     }
 
