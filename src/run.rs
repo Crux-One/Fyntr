@@ -693,7 +693,7 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn builder_start_shutdown_smoke() {
+    async fn server_background_shutdown_smoke() {
         let handle = server()
             .bind("127.0.0.1")
             .port(0)
@@ -725,7 +725,7 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn builder_run_smoke() {
+    async fn server_foreground_smoke() {
         let server_task = actix::spawn(async move {
             server()
                 .bind("127.0.0.1")
