@@ -120,7 +120,10 @@ impl From<&str> for BindAddress {
 
 impl From<String> for BindAddress {
     fn from(value: String) -> Self {
-        Self::parse(&value)
+        match value.parse::<IpAddr>() {
+            Ok(addr) => BindAddress::Ip(addr),
+            Err(_) => BindAddress::Host(value),
+        }
     }
 }
 
