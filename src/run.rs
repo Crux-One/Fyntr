@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
@@ -98,11 +97,45 @@ impl fmt::Display for BindAddress {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindAddressParseError {
+    Empty,
+    ContainsPort,
+}
+
+impl fmt::Display for BindAddressParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("bind address must not be empty"),
+            Self::ContainsPort => {
+                f.write_str("bind address must not include a port; use --port/FYNTR_PORT")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BindAddressParseError {}
+
+// Parsed by clap for --bind / FYNTR_BIND.
 impl FromStr for BindAddress {
-    type Err = Infallible;
+    type Err = BindAddressParseError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(Self::parse(s))
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Err(BindAddressParseError::Empty);
+        }
+
+        if let Ok(addr) = s.parse::<IpAddr>() {
+            return Ok(BindAddress::Ip(addr));
+        }
+
+        if s.parse::<SocketAddr>().is_ok() {
+            return Err(BindAddressParseError::ContainsPort);
+        }
+
+        Ok(BindAddress::Host(s.to_string()))
     }
 }
 
@@ -597,11 +630,35 @@ mod tests {
 
     #[test]
     fn bind_address_from_str_trait_parses_ip_or_host() {
-        let ip: BindAddress = "127.0.0.1".parse().expect("infallible parse");
+        let ip: BindAddress = "127.0.0.1".parse().expect("valid parse");
         assert!(matches!(ip, BindAddress::Ip(addr) if addr.is_loopback()));
 
-        let host: BindAddress = "localhost".parse().expect("infallible parse");
+        let host: BindAddress = "localhost".parse().expect("valid parse");
         assert!(matches!(host, BindAddress::Host(value) if value == "localhost"));
+    }
+
+    #[test]
+    fn bind_address_from_str_trait_rejects_empty_or_port() {
+        let empty = "".parse::<BindAddress>().expect_err("empty should fail");
+        assert!(matches!(empty, BindAddressParseError::Empty));
+
+        let whitespace = "   "
+            .parse::<BindAddress>()
+            .expect_err("whitespace should fail");
+        assert!(matches!(whitespace, BindAddressParseError::Empty));
+
+        let with_port = "127.0.0.1:9999"
+            .parse::<BindAddress>()
+            .expect_err("ip with port should fail");
+        assert!(matches!(with_port, BindAddressParseError::ContainsPort));
+
+        let bracketed_v6_with_port = "[::1]:9999"
+            .parse::<BindAddress>()
+            .expect_err("ipv6 with port should fail");
+        assert!(matches!(
+            bracketed_v6_with_port,
+            BindAddressParseError::ContainsPort
+        ));
     }
 
     #[actix_rt::test]
