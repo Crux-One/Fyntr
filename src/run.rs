@@ -62,10 +62,57 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
-    fn parse(value: &str) -> Self {
-        match value.parse::<IpAddr>() {
-            Ok(addr) => BindAddress::Ip(addr),
-            Err(_) => BindAddress::Host(value.to_string()),
+    fn validate_hostname(host: &str) -> std::result::Result<(), BindAddressParseError> {
+        if host.parse::<SocketAddr>().is_ok() {
+            return Err(BindAddressParseError::ContainsPort);
+        }
+
+        if host.len() > 253 {
+            return Err(BindAddressParseError::HostTooLong);
+        }
+
+        if !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(BindAddressParseError::InvalidHostChars);
+        }
+
+        Ok(())
+    }
+
+    fn parse_trimmed(value: &str) -> std::result::Result<Self, BindAddressParseError> {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            return Err(BindAddressParseError::Empty);
+        }
+
+        if let Ok(addr) = trimmed.parse::<IpAddr>() {
+            return Ok(BindAddress::Ip(addr));
+        }
+
+        Self::validate_hostname(trimmed)?;
+        Ok(BindAddress::Host(trimmed.to_string()))
+    }
+
+    fn parse_owned(value: String) -> std::result::Result<Self, BindAddressParseError> {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            return Err(BindAddressParseError::Empty);
+        }
+
+        if let Ok(addr) = trimmed.parse::<IpAddr>() {
+            return Ok(BindAddress::Ip(addr));
+        }
+
+        Self::validate_hostname(trimmed)?;
+
+        if trimmed.len() == value.len() {
+            Ok(BindAddress::Host(value))
+        } else {
+            Ok(BindAddress::Host(trimmed.to_string()))
         }
     }
 
@@ -127,32 +174,7 @@ impl FromStr for BindAddress {
     type Err = BindAddressParseError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let s = s.trim();
-
-        if s.is_empty() {
-            return Err(BindAddressParseError::Empty);
-        }
-
-        if let Ok(addr) = s.parse::<IpAddr>() {
-            return Ok(BindAddress::Ip(addr));
-        }
-
-        if s.parse::<SocketAddr>().is_ok() {
-            return Err(BindAddressParseError::ContainsPort);
-        }
-
-        if s.len() > 253 {
-            return Err(BindAddressParseError::HostTooLong);
-        }
-
-        if !s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        {
-            return Err(BindAddressParseError::InvalidHostChars);
-        }
-
-        Ok(BindAddress::Host(s.to_string()))
+        Self::parse_trimmed(s)
     }
 }
 
@@ -164,16 +186,16 @@ impl From<IpAddr> for BindAddress {
 
 impl From<&str> for BindAddress {
     fn from(value: &str) -> Self {
-        Self::parse(value)
+        Self::parse_trimmed(value)
+            .expect("invalid bind address in BindAddress::from(&str); use BindAddress::from_str for fallible parsing")
     }
 }
 
 impl From<String> for BindAddress {
     fn from(value: String) -> Self {
-        match value.parse::<IpAddr>() {
-            Ok(addr) => BindAddress::Ip(addr),
-            Err(_) => BindAddress::Host(value),
-        }
+        Self::parse_owned(value).expect(
+            "invalid bind address in BindAddress::from(String); use BindAddress::from_str for fallible parsing",
+        )
     }
 }
 
@@ -690,6 +712,12 @@ mod tests {
             invalid_chars,
             BindAddressParseError::InvalidHostChars
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid bind address in BindAddress::from(&str)")]
+    fn bind_address_from_str_panics_on_invalid_whitespace_input() {
+        let _ = BindAddress::from("   ");
     }
 
     #[actix_rt::test]
