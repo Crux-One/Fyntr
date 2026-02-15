@@ -62,8 +62,17 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
+    fn looks_like_host_with_port(host: &str) -> bool {
+        match host.rsplit_once(':') {
+            Some((name, port)) if !name.is_empty() && !name.contains(':') => {
+                !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+            }
+            _ => false,
+        }
+    }
+
     fn validate_hostname(host: &str) -> std::result::Result<(), BindAddressParseError> {
-        if host.parse::<SocketAddr>().is_ok() {
+        if host.parse::<SocketAddr>().is_ok() || Self::looks_like_host_with_port(host) {
             return Err(BindAddressParseError::ContainsPort);
         }
 
@@ -696,6 +705,22 @@ mod tests {
             .expect_err("ipv6 with port should fail");
         assert!(matches!(
             bracketed_v6_with_port,
+            BindAddressParseError::ContainsPort
+        ));
+
+        let host_with_port = "localhost:9999"
+            .parse::<BindAddress>()
+            .expect_err("hostname with port should fail");
+        assert!(matches!(
+            host_with_port,
+            BindAddressParseError::ContainsPort
+        ));
+
+        let host_with_out_of_range_port = "example.com:65536"
+            .parse::<BindAddress>()
+            .expect_err("hostname with out-of-range port should fail");
+        assert!(matches!(
+            host_with_out_of_range_port,
             BindAddressParseError::ContainsPort
         ));
 
