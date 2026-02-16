@@ -681,6 +681,9 @@ mod tests {
         let ip: BindAddress = "127.0.0.1".parse().expect("valid parse");
         assert!(matches!(ip, BindAddress::Ip(addr) if addr.is_loopback()));
 
+        let ipv6: BindAddress = "::1".parse().expect("valid parse");
+        assert!(matches!(ipv6, BindAddress::Ip(addr) if addr.is_loopback()));
+
         let host: BindAddress = "localhost".parse().expect("valid parse");
         assert!(matches!(host, BindAddress::Host(value) if value == "localhost"));
     }
