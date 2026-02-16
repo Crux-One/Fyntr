@@ -1,5 +1,7 @@
 use std::{
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -60,6 +62,69 @@ pub enum BindAddress {
 }
 
 impl BindAddress {
+    fn looks_like_host_with_port(host: &str) -> bool {
+        match host.rsplit_once(':') {
+            Some((name, port)) if !name.is_empty() && !name.contains(':') => {
+                !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+            }
+            _ => false,
+        }
+    }
+
+    fn validate_hostname(host: &str) -> std::result::Result<(), BindAddressParseError> {
+        if host.parse::<SocketAddr>().is_ok() || Self::looks_like_host_with_port(host) {
+            return Err(BindAddressParseError::ContainsPort);
+        }
+
+        if host.len() > 253 {
+            return Err(BindAddressParseError::HostTooLong);
+        }
+
+        if !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(BindAddressParseError::InvalidHostChars);
+        }
+
+        Ok(())
+    }
+
+    fn parse_trimmed(value: &str) -> std::result::Result<Self, BindAddressParseError> {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            return Err(BindAddressParseError::Empty);
+        }
+
+        if let Ok(addr) = trimmed.parse::<IpAddr>() {
+            return Ok(BindAddress::Ip(addr));
+        }
+
+        Self::validate_hostname(trimmed)?;
+        Ok(BindAddress::Host(trimmed.to_string()))
+    }
+
+    fn parse_owned(value: String) -> std::result::Result<Self, BindAddressParseError> {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            return Err(BindAddressParseError::Empty);
+        }
+
+        if let Ok(addr) = trimmed.parse::<IpAddr>() {
+            return Ok(BindAddress::Ip(addr));
+        }
+
+        Self::validate_hostname(trimmed)?;
+
+        if trimmed.len() == value.len() {
+            Ok(BindAddress::Host(value))
+        } else {
+            Ok(BindAddress::Host(trimmed.to_string()))
+        }
+    }
+
     async fn resolve(self, port: u16) -> Result<Vec<SocketAddr>> {
         match self {
             BindAddress::Ip(addr) => Ok(vec![SocketAddr::new(addr, port)]),
@@ -79,6 +144,49 @@ impl BindAddress {
     }
 }
 
+impl fmt::Display for BindAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindAddress::Ip(addr) => write!(f, "{}", addr),
+            BindAddress::Host(host) => f.write_str(host),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindAddressParseError {
+    Empty,
+    ContainsPort,
+    HostTooLong,
+    InvalidHostChars,
+}
+
+impl fmt::Display for BindAddressParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("bind address must not be empty"),
+            Self::ContainsPort => {
+                f.write_str("bind address must not include a port; use --port/FYNTR_PORT")
+            }
+            Self::HostTooLong => f.write_str("bind hostname must be 253 characters or fewer"),
+            Self::InvalidHostChars => {
+                f.write_str("bind hostname contains invalid characters; allowed: a-z A-Z 0-9 . -")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BindAddressParseError {}
+
+// Parsed by clap for --bind / FYNTR_BIND.
+impl FromStr for BindAddress {
+    type Err = BindAddressParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse_trimmed(s)
+    }
+}
+
 impl From<IpAddr> for BindAddress {
     fn from(value: IpAddr) -> Self {
         BindAddress::Ip(value)
@@ -87,21 +195,16 @@ impl From<IpAddr> for BindAddress {
 
 impl From<&str> for BindAddress {
     fn from(value: &str) -> Self {
-        if let Ok(addr) = value.parse::<IpAddr>() {
-            addr.into()
-        } else {
-            BindAddress::Host(value.to_string())
-        }
+        Self::parse_trimmed(value)
+            .expect("invalid bind address in BindAddress::from(&str); use BindAddress::from_str for fallible parsing")
     }
 }
 
 impl From<String> for BindAddress {
     fn from(value: String) -> Self {
-        if let Ok(addr) = value.parse::<IpAddr>() {
-            addr.into()
-        } else {
-            BindAddress::Host(value)
-        }
+        Self::parse_owned(value).expect(
+            "invalid bind address in BindAddress::from(String); use BindAddress::from_str for fallible parsing",
+        )
     }
 }
 
@@ -198,64 +301,36 @@ impl ServerBuilder {
         self
     }
 
-    /// Starts the server and returns a handle for shutdown.
+    /// Runs the server in the background and returns a handle for shutdown.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn start(self) -> Result<ServerHandle> {
+    pub async fn background(self) -> Result<ServerHandle> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         start_with_addrs(bind_addrs, self.max_connections).await
     }
 
-    /// Runs the server to completion without returning a handle.
+    /// Runs the server in the foreground to completion without returning a handle.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn run(self) -> Result<()> {
+    pub async fn foreground(self) -> Result<()> {
         let bind_addrs = self.bind.resolve(self.port).await?;
         server_with_addrs(bind_addrs, self.max_connections).await
+    }
+
+    #[deprecated(note = "use background() instead")]
+    pub async fn start(self) -> Result<ServerHandle> {
+        self.background().await
+    }
+
+    #[deprecated(note = "use foreground() instead")]
+    pub async fn run(self) -> Result<()> {
+        self.foreground().await
     }
 }
 
 /// Creates a new `ServerBuilder` with default settings.
-pub fn builder() -> ServerBuilder {
+pub fn server() -> ServerBuilder {
     ServerBuilder::new()
-}
-
-/// Runs the proxy server on `DEFAULT_BIND` with the given port and connection limit.
-///
-/// This starts the accept loop and will run until the task is stopped.
-/// Use `server_with_bind` to specify the bind address explicitly.
-pub async fn server(port: u16, max_connections: MaxConnections) -> Result<()> {
-    server_with_bind(DEFAULT_BIND, port, max_connections).await
-}
-
-/// Runs the proxy server bound to the given IP address and port.
-///
-/// This only stops accepting new connections when the server task ends;
-/// in-flight connections are not forcibly terminated.
-pub async fn server_with_bind(
-    bind: IpAddr,
-    port: u16,
-    max_connections: MaxConnections,
-) -> Result<()> {
-    server_with_addrs(vec![SocketAddr::new(bind, port)], max_connections).await
-}
-
-/// Starts the proxy server on `DEFAULT_BIND` and returns a handle for shutdown.
-///
-/// The returned `ServerHandle` can be used to stop accepting new connections.
-pub async fn start(port: u16, max_connections: MaxConnections) -> Result<ServerHandle> {
-    start_with_bind(DEFAULT_BIND, port, max_connections).await
-}
-
-/// Starts the proxy server bound to the given IP address and port.
-///
-/// The returned `ServerHandle` can be used to stop accepting new connections.
-pub async fn start_with_bind(
-    bind: IpAddr,
-    port: u16,
-    max_connections: MaxConnections,
-) -> Result<ServerHandle> {
-    start_with_addrs(vec![SocketAddr::new(bind, port)], max_connections).await
 }
 
 async fn server_with_addrs(
@@ -601,15 +676,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bind_address_from_str_trait_parses_ip_or_host() {
+        let ip: BindAddress = "127.0.0.1".parse().expect("valid parse");
+        assert!(matches!(ip, BindAddress::Ip(addr) if addr.is_loopback()));
+
+        let ipv6: BindAddress = "::1".parse().expect("valid parse");
+        assert!(matches!(ipv6, BindAddress::Ip(addr) if addr.is_loopback()));
+
+        let host: BindAddress = "localhost".parse().expect("valid parse");
+        assert!(matches!(host, BindAddress::Host(value) if value == "localhost"));
+    }
+
+    #[test]
+    fn bind_address_from_str_trait_rejects_empty_or_port() {
+        let empty = "".parse::<BindAddress>().expect_err("empty should fail");
+        assert!(matches!(empty, BindAddressParseError::Empty));
+
+        let whitespace = "   "
+            .parse::<BindAddress>()
+            .expect_err("whitespace should fail");
+        assert!(matches!(whitespace, BindAddressParseError::Empty));
+
+        let with_port = "127.0.0.1:9999"
+            .parse::<BindAddress>()
+            .expect_err("ip with port should fail");
+        assert!(matches!(with_port, BindAddressParseError::ContainsPort));
+
+        let bracketed_v6_with_port = "[::1]:9999"
+            .parse::<BindAddress>()
+            .expect_err("ipv6 with port should fail");
+        assert!(matches!(
+            bracketed_v6_with_port,
+            BindAddressParseError::ContainsPort
+        ));
+
+        let host_with_port = "localhost:9999"
+            .parse::<BindAddress>()
+            .expect_err("hostname with port should fail");
+        assert!(matches!(
+            host_with_port,
+            BindAddressParseError::ContainsPort
+        ));
+
+        let host_with_out_of_range_port = "example.com:65536"
+            .parse::<BindAddress>()
+            .expect_err("hostname with out-of-range port should fail");
+        assert!(matches!(
+            host_with_out_of_range_port,
+            BindAddressParseError::ContainsPort
+        ));
+
+        let too_long = format!("{}.example.com", "a".repeat(242));
+        let too_long_err = too_long
+            .parse::<BindAddress>()
+            .expect_err("hostname > 253 chars should fail");
+        assert!(matches!(too_long_err, BindAddressParseError::HostTooLong));
+
+        let invalid_chars = "local_host"
+            .parse::<BindAddress>()
+            .expect_err("hostname with invalid chars should fail");
+        assert!(matches!(
+            invalid_chars,
+            BindAddressParseError::InvalidHostChars
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid bind address in BindAddress::from(&str)")]
+    fn bind_address_from_str_panics_on_invalid_whitespace_input() {
+        let _ = BindAddress::from("   ");
+    }
+
     #[actix_rt::test]
-    async fn builder_start_shutdown_smoke() {
-        let handle = builder()
+    async fn server_background_shutdown_smoke() {
+        let handle = server()
             .bind("127.0.0.1")
             .port(0)
             .max_connections(1)
-            .start()
+            .background()
             .await
-            .expect("start");
+            .expect("background");
 
         let listen_addr = handle.listen_addr();
         assert!(listen_addr.ip().is_loopback(), "expected loopback bind");
@@ -634,27 +781,27 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn builder_run_smoke() {
+    async fn server_foreground_smoke() {
         let server_task = actix::spawn(async move {
-            builder()
+            server()
                 .bind("127.0.0.1")
                 .port(0)
                 .max_connections(1)
-                .run()
+                .foreground()
                 .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !server_task.is_finished(),
-            "expected run() task to keep running"
+            "expected foreground() task to keep running"
         );
 
         server_task.abort();
         let join_result = server_task.await;
         assert!(
             join_result.is_err() && join_result.unwrap_err().is_cancelled(),
-            "expected run() task to be cancelled"
+            "expected foreground() task to be cancelled"
         );
     }
 

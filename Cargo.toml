@@ -1,6 +1,6 @@
 [package]
 name = "fyntr"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
@@ -26,4 +26,4 @@ rlimit = "0.11.0"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["test-util"] }
-quickcheck = "1"
+quickcheck = "1.1"
