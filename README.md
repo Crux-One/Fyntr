@@ -89,11 +89,11 @@ async fn main() -> anyhow::Result<()> {
     // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
     env_logger::init();
 
-    let handle = run::builder()
+    let handle = run::server()
         .bind("127.0.0.1")
         .port(0) // 0 lets the OS pick an available port
         .max_connections(512)
-        .start()
+        .background()
         .await?;
 
     println!("Fyntr listening on {}", handle.listen_addr());

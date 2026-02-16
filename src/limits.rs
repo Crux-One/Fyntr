@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 pub type MaxConnections = Option<NonZeroUsize>;
 
 #[inline]
-pub fn max_connections_from_raw(raw: usize) -> MaxConnections {
+pub(crate) fn max_connections_from_raw(raw: usize) -> MaxConnections {
     NonZeroUsize::new(raw)
 }
 
