@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
 
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
-| `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
+| `--bind <ADDR>` | `FYNTR_BIND` | `127.0.0.1` | Address/hostname to bind on (e.g. `127.0.0.1`, `::1`, `localhost`, `0.0.0.0`). Supports both IPv4 and IPv6. Binding to non-loopback interfaces without auth can expose the proxy on the network. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
