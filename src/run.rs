@@ -25,6 +25,7 @@ use crate::{
     flow::FlowId,
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
+    security::connect_policy::{ConnectCidr, ConnectPolicy, ConnectPolicyConfig},
 };
 
 pub const DEFAULT_PORT: u16 = 9999;
@@ -263,6 +264,7 @@ pub struct ServerBuilder {
     bind: BindAddress,
     port: u16,
     max_connections: MaxConnections,
+    connect_policy: ConnectPolicyConfig,
 }
 
 impl Default for ServerBuilder {
@@ -277,6 +279,7 @@ impl ServerBuilder {
             bind: BindAddress::from(DEFAULT_BIND),
             port: DEFAULT_PORT,
             max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
+            connect_policy: ConnectPolicyConfig::default(),
         }
     }
 
@@ -301,12 +304,56 @@ impl ServerBuilder {
         self
     }
 
+    /// Adds a destination port to the CONNECT allow list.
+    pub fn allow_port(mut self, port: u16) -> Self {
+        self.connect_policy.allowed_ports.push(port);
+        self
+    }
+
+    /// Disables implicit default port allowance (443) for CONNECT destinations.
+    pub fn no_default_allow_port(mut self) -> Self {
+        self.connect_policy.include_default_allow_port = false;
+        self
+    }
+
+    /// Adds a CIDR range to the CONNECT deny list.
+    pub fn deny_cidr<S>(mut self, cidr: S) -> Result<Self>
+    where
+        S: AsRef<str>,
+    {
+        let parsed = cidr.as_ref().parse::<ConnectCidr>()?;
+        self.connect_policy.deny_cidrs.push(parsed);
+        Ok(self)
+    }
+
+    /// Adds a CIDR range to the CONNECT allow list.
+    pub fn allow_cidr<S>(mut self, cidr: S) -> Result<Self>
+    where
+        S: AsRef<str>,
+    {
+        let parsed = cidr.as_ref().parse::<ConnectCidr>()?;
+        self.connect_policy.allow_cidrs.push(parsed);
+        Ok(self)
+    }
+
+    /// Adds a domain or suffix to the CONNECT allow list.
+    pub fn allow_domain<S>(mut self, domain: S) -> Self
+    where
+        S: AsRef<str>,
+    {
+        self.connect_policy
+            .allow_domains
+            .push(domain.as_ref().to_string());
+        self
+    }
+
     /// Runs the server in the background and returns a handle for shutdown.
     ///
     /// Returns an error if address resolution or binding fails.
     pub async fn background(self) -> Result<ServerHandle> {
         let bind_addrs = self.bind.resolve(self.port).await?;
-        start_with_addrs(bind_addrs, self.max_connections).await
+        let connect_policy = Arc::new(ConnectPolicy::from_config(self.connect_policy));
+        start_with_addrs(bind_addrs, self.max_connections, connect_policy).await
     }
 
     /// Runs the server in the foreground to completion without returning a handle.
@@ -314,7 +361,8 @@ impl ServerBuilder {
     /// Returns an error if address resolution or binding fails.
     pub async fn foreground(self) -> Result<()> {
         let bind_addrs = self.bind.resolve(self.port).await?;
-        server_with_addrs(bind_addrs, self.max_connections).await
+        let connect_policy = Arc::new(ConnectPolicy::from_config(self.connect_policy));
+        server_with_addrs(bind_addrs, self.max_connections, connect_policy).await
     }
 
     #[deprecated(note = "use background() instead")]
@@ -336,21 +384,28 @@ pub fn server() -> ServerBuilder {
 async fn server_with_addrs(
     bind_addrs: Vec<SocketAddr>,
     max_connections: MaxConnections,
+    connect_policy: Arc<ConnectPolicy>,
 ) -> Result<()> {
     let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
-    run_server(listener, max_connections, None).await
+    run_server(listener, max_connections, connect_policy, None).await
 }
 
 async fn start_with_addrs(
     bind_addrs: Vec<SocketAddr>,
     max_connections: MaxConnections,
+    connect_policy: Arc<ConnectPolicy>,
 ) -> Result<ServerHandle> {
     let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
     let listen_addr = listener
         .local_addr()
         .context("failed to resolve listen address")?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let join_handle = actix::spawn(run_server(listener, max_connections, Some(shutdown_rx)));
+    let join_handle = actix::spawn(run_server(
+        listener,
+        max_connections,
+        connect_policy,
+        Some(shutdown_rx),
+    ));
 
     Ok(ServerHandle {
         listen_addr,
@@ -395,6 +450,7 @@ async fn prepare_listener(
 async fn run_server(
     listener: TcpListener,
     max_connections: MaxConnections,
+    connect_policy: Arc<ConnectPolicy>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
     // Start the scheduler
@@ -428,11 +484,19 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        let connect_policy = connect_policy.clone();
         let connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            let result = handle_connect_proxy(client_stream, client_addr, flow_id, scheduler).await;
+            let result = handle_connect_proxy(
+                client_stream,
+                client_addr,
+                flow_id,
+                scheduler,
+                connect_policy,
+            )
+            .await;
             // Keep the guard alive across the await so pending_connection_tasks
             // is decremented only after the connection task truly finishes.
             drop(connection_task_guard);
