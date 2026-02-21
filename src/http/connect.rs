@@ -23,6 +23,7 @@ use crate::{
         connection::{BackendToClientActor, ClientToBackendActor},
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
+    security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
 };
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
@@ -71,6 +72,7 @@ impl StatusLine {
     );
     const BAD_GATEWAY: StatusLine =
         Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
+    const FORBIDDEN: StatusLine = Self::new(b"HTTP/1.1 403 Forbidden\r\n\r\n", "403", "Forbidden");
     const REQUEST_TIMEOUT: StatusLine = Self::new(
         b"HTTP/1.1 408 Request Timeout\r\n\r\n",
         "408",
@@ -148,6 +150,7 @@ struct ConnectSession {
     flow_id: FlowId,
     client_addr: SocketAddr,
     scheduler: Addr<Scheduler>,
+    connect_policy: Arc<ConnectPolicy>,
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
 }
@@ -168,8 +171,7 @@ enum ConnectState {
     Validating(ConnectSession),
     Dialing {
         session: ConnectSession,
-        target_host: String,
-        target_port: u16,
+        target: ResolvedConnectTarget,
     },
     Registering {
         session: ConnectSession,
@@ -261,17 +263,48 @@ impl ConnectState {
         )
         .await?;
 
-        Ok(ConnectState::Dialing {
-            session,
-            target_host,
-            target_port,
-        })
+        let target = match session
+            .connect_policy
+            .resolve_and_authorize(&target_host, target_port)
+            .await
+        {
+            Ok(target) => target,
+            Err(ConnectPolicyError::Denied(reason)) => {
+                let detail = format!(
+                    "CONNECT {}:{} denied for {}: {}",
+                    target_host, target_port, session.client_addr, reason
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::FORBIDDEN,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+            Err(ConnectPolicyError::ResolveFailed(reason)) => {
+                let detail = format!(
+                    "failed to resolve {}:{} for {}: {}",
+                    target_host, target_port, session.client_addr, reason
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::BAD_GATEWAY,
+                    StatusLogLevel::Error,
+                    detail,
+                )
+                .await;
+            }
+        };
+
+        Ok(ConnectState::Dialing { session, target })
     }
 
     async fn advance_dialing(
         mut session: ConnectSession,
-        target_host: String,
-        target_port: u16,
+        target: ResolvedConnectTarget,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
@@ -304,27 +337,33 @@ impl ConnectState {
             }
         }
 
-        let backend_addr = format!("{}:{}", target_host, target_port);
-        let backend_stream = match connect_with_backoff(session.flow_id, &backend_addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                let detail = format!("failed to connect to {} after retries: {}", backend_addr, e);
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::BAD_GATEWAY,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await;
-            }
-        };
+        let (backend_stream, connected_addr) =
+            match connect_to_any_with_backoff(session.flow_id, &target.addrs).await {
+                Ok(result) => result,
+                Err(e) => {
+                    let detail = format!(
+                        "failed to connect to {}:{} after retries: {}",
+                        target.host, target.port, e
+                    );
+                    return respond_with_status(
+                        session.flow_id,
+                        &mut session.client_write,
+                        StatusLine::BAD_GATEWAY,
+                        StatusLogLevel::Error,
+                        detail,
+                    )
+                    .await;
+                }
+            };
 
         backend_stream
             .set_nodelay(true)
             .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
 
-        info!("flow{}: connected to {}", session.flow_id.0, backend_addr);
+        info!(
+            "flow{}: connected to {}:{} via {}",
+            session.flow_id.0, target.host, target.port, connected_addr
+        );
 
         let (backend_read, backend_write) = backend_stream.into_split();
         let queue_tx = QueueActor::new().start();
@@ -417,11 +456,9 @@ impl ConnectState {
     async fn advance(self, cleanup: &mut FlowCleanup) -> ConnectResult<ConnectState> {
         match self {
             ConnectState::Validating(session) => Self::advance_validating(session).await,
-            ConnectState::Dialing {
-                session,
-                target_host,
-                target_port,
-            } => Self::advance_dialing(session, target_host, target_port, cleanup).await,
+            ConnectState::Dialing { session, target } => {
+                Self::advance_dialing(session, target, cleanup).await
+            }
             ConnectState::Registering {
                 session,
                 queue_tx,
@@ -447,12 +484,14 @@ impl ConnectSession {
         flow_id: FlowId,
         client_addr: SocketAddr,
         scheduler: Addr<Scheduler>,
+        connect_policy: Arc<ConnectPolicy>,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
             flow_id,
             client_addr,
             scheduler,
+            connect_policy,
             client_reader: BufReader::new(client_read),
             client_write,
         }
@@ -544,8 +583,15 @@ pub(crate) async fn handle_connect_proxy(
     client_addr: SocketAddr,
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
+    connect_policy: Arc<ConnectPolicy>,
 ) -> Result<(), anyhow::Error> {
-    let session = ConnectSession::new(client_stream, flow_id, client_addr, scheduler);
+    let session = ConnectSession::new(
+        client_stream,
+        flow_id,
+        client_addr,
+        scheduler,
+        connect_policy,
+    );
 
     match run_connect_flow(session).await {
         Ok(()) => Ok(()),
@@ -562,7 +608,10 @@ const CONNECT_MAX_ATTEMPTS: usize = 3;
 const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
 
-async fn connect_with_backoff(flow_id: FlowId, backend_addr: &str) -> std::io::Result<TcpStream> {
+async fn connect_with_backoff(
+    flow_id: FlowId,
+    backend_addr: SocketAddr,
+) -> std::io::Result<TcpStream> {
     let mut delay = CONNECT_BACKOFF_BASE;
     let mut attempt = 1;
 
@@ -583,11 +632,34 @@ async fn connect_with_backoff(flow_id: FlowId, backend_addr: &str) -> std::io::R
     }
 }
 
+async fn connect_to_any_with_backoff(
+    flow_id: FlowId,
+    backend_addrs: &[SocketAddr],
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let mut last_err = None;
+    for &addr in backend_addrs {
+        match connect_with_backoff(flow_id, addr).await {
+            Ok(stream) => return Ok((stream, addr)),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no backend addresses to connect",
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::limits::max_connections_from_raw;
     use crate::test_utils::make_backend_write;
+    use crate::{
+        limits::max_connections_from_raw,
+        security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
+    };
     use std::{future::Future, time::Duration};
 
     use tokio::{
@@ -605,11 +677,12 @@ mod tests {
     async fn drive_proxy(
         listener: TcpListener,
         scheduler: Addr<Scheduler>,
+        connect_policy: Arc<ConnectPolicy>,
         client_task: impl Future<Output = Vec<u8>>,
     ) -> Vec<u8> {
         let server = async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connect_proxy(stream, peer, FlowId(1), scheduler)
+            handle_connect_proxy(stream, peer, FlowId(1), scheduler, connect_policy)
                 .await
                 .unwrap();
         };
@@ -618,13 +691,29 @@ mod tests {
         response
     }
 
+    fn default_policy() -> Arc<ConnectPolicy> {
+        Arc::new(ConnectPolicy::from_config(ConnectPolicyConfig::default()))
+    }
+
+    fn policy_with_loopback_and_port_allowed(port: u16) -> Arc<ConnectPolicy> {
+        let mut config = ConnectPolicyConfig::default();
+        config.allowed_ports.push(port);
+        config
+            .allow_cidrs
+            .push("127.0.0.0/8".parse::<ConnectCidr>().unwrap());
+        config
+            .allow_cidrs
+            .push("::1/128".parse::<ConnectCidr>().unwrap());
+        Arc::new(ConnectPolicy::from_config(config))
+    }
+
     #[actix_rt::test]
     async fn returns_405_for_non_connect_method() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response = drive_proxy(listener, scheduler, async move {
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
             client
                 .write_all(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n")
@@ -643,7 +732,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response = drive_proxy(listener, scheduler, async move {
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
             client
                 .write_all(b"CONNECT example.com:443 HTTP/2\r\nHost: example\r\n\r\n")
@@ -670,18 +759,42 @@ mod tests {
             port
         };
 
-        let response = drive_proxy(listener, scheduler, async move {
+        let response = drive_proxy(
+            listener,
+            scheduler,
+            policy_with_loopback_and_port_allowed(unreachable_port),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: example\r\n\r\n",
+                    unreachable_port
+                );
+                client.write_all(request.as_bytes()).await.unwrap();
+                read_response(client).await
+            },
+        )
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_403_when_target_is_denied_by_policy() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
-            let request = format!(
-                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: example\r\n\r\n",
-                unreachable_port
-            );
-            client.write_all(request.as_bytes()).await.unwrap();
+            client
+                .write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
             read_response(client).await
         })
         .await;
 
-        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
     }
 
     #[actix_rt::test]
@@ -710,12 +823,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response = drive_proxy(listener, scheduler, async move {
-            let mut client = TcpStream::connect(addr).await.unwrap();
-            let request = format!("CONNECT {} HTTP/1.1\r\nHost: example\r\n\r\n", backend_addr);
-            client.write_all(request.as_bytes()).await.unwrap();
-            read_response(client).await
-        })
+        let response = drive_proxy(
+            listener,
+            scheduler,
+            policy_with_loopback_and_port_allowed(backend_addr.port()),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                let request = format!("CONNECT {} HTTP/1.1\r\nHost: example\r\n\r\n", backend_addr);
+                client.write_all(request.as_bytes()).await.unwrap();
+                read_response(client).await
+            },
+        )
         .await;
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
@@ -729,10 +847,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
-            let client = TcpStream::connect(addr).await.unwrap();
-            read_response(client).await
-        }));
+        let response_task = tokio::spawn(drive_proxy(
+            listener,
+            scheduler,
+            default_policy(),
+            async move {
+                let client = TcpStream::connect(addr).await.unwrap();
+                read_response(client).await
+            },
+        ));
 
         task::yield_now().await;
         time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
@@ -749,14 +872,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
-            let mut client = TcpStream::connect(addr).await.unwrap();
-            client
-                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
-                .await
-                .unwrap();
-            read_response(client).await
-        }));
+        let response_task = tokio::spawn(drive_proxy(
+            listener,
+            scheduler,
+            default_policy(),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                client
+                    .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
+                    .await
+                    .unwrap();
+                read_response(client).await
+            },
+        ));
 
         task::yield_now().await;
         time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
@@ -770,13 +898,11 @@ mod tests {
     async fn connect_with_backoff_succeeds_on_first_attempt() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = listener.local_addr().unwrap();
-        let backend_addr_str = backend_addr.to_string();
-
         let accept = async move {
             let _ = listener.accept().await.unwrap();
         };
 
-        let ((), stream) = tokio::join!(accept, connect_with_backoff(FlowId(1), &backend_addr_str));
+        let ((), stream) = tokio::join!(accept, connect_with_backoff(FlowId(1), backend_addr));
 
         assert!(stream.is_ok());
     }
@@ -789,15 +915,13 @@ mod tests {
             drop(listener);
             port
         };
-        let backend_addr = format!("127.0.0.1:{}", unreachable_port);
+        let backend_addr = SocketAddr::from(([127, 0, 0, 1], unreachable_port));
         let first_delay = CONNECT_BACKOFF_BASE;
         let second_delay = CONNECT_BACKOFF_BASE.saturating_mul(2);
         let start = time::Instant::now();
 
-        let connect_task = task::spawn({
-            let backend_addr = backend_addr.clone();
-            async move { connect_with_backoff(FlowId(1), &backend_addr).await }
-        });
+        let connect_task =
+            task::spawn(async move { connect_with_backoff(FlowId(1), backend_addr).await });
 
         task::yield_now().await;
         time::advance(first_delay).await;
