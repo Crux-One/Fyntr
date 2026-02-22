@@ -145,16 +145,14 @@ pub(crate) enum ConnectPolicyError {
 
 impl ConnectPolicy {
     pub(crate) fn from_config(config: ConnectPolicyConfig) -> Self {
-        let allowed_ports = if config.allowed_ports.is_empty() && config.include_default_allow_port
-        {
-            HashSet::from([443])
-        } else {
-            config
-                .allowed_ports
-                .into_iter()
-                .filter(|port| *port != 0)
-                .collect()
-        };
+        let mut allowed_ports: HashSet<u16> = config
+            .allowed_ports
+            .into_iter()
+            .filter(|port| *port != 0)
+            .collect();
+        if config.include_default_allow_port {
+            allowed_ports.insert(443);
+        }
 
         let allow_domains = config
             .allow_domains
@@ -326,7 +324,10 @@ mod tests {
 
     #[tokio::test]
     async fn allows_private_ipv4_when_allow_cidr_matches() {
-        let mut config = ConnectPolicyConfig::default();
+        let mut config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            ..ConnectPolicyConfig::default()
+        };
         config.allow_cidrs.push("127.0.0.0/8".parse().unwrap());
         let policy = ConnectPolicy::from_config(config);
         let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
@@ -358,6 +359,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn include_default_allow_port_enables_443_implicit_allow() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+        let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn port_zero_in_allow_list_is_ignored() {
         let config = ConnectPolicyConfig {
             include_default_allow_port: false,
@@ -374,9 +387,26 @@ mod tests {
         assert!(matches!(denied, Err(ConnectPolicyError::Denied(_))));
     }
 
+    #[test]
+    fn include_default_allow_port_keeps_443_with_explicit_allow_ports() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allowed_ports: vec![0, 8443],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        assert!(policy.allowed_ports.contains(&443));
+        assert!(policy.allowed_ports.contains(&8443));
+        assert_eq!(policy.allowed_ports.len(), 2);
+    }
+
     #[tokio::test]
     async fn allow_domain_overrides_deny_cidr() {
-        let mut config = ConnectPolicyConfig::default();
+        let mut config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            ..ConnectPolicyConfig::default()
+        };
         config.allow_domains.push("localhost".to_string());
         let policy = ConnectPolicy::from_config(config);
         let result = policy.resolve_and_authorize("localhost", 443).await;
