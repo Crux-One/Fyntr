@@ -2,6 +2,15 @@ use std::num::NonZeroUsize;
 
 pub type MaxConnections = Option<NonZeroUsize>;
 
+pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+pub const MAX_HEADER_BYTES: usize = 32 * 1024;
+pub const MAX_HEADER_LINES: usize = 100;
+
+pub const MAX_QUEUE_PACKET_BYTES: usize = 64 * 1024;
+pub const MAX_QUEUE_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_DEQUEUE_BYTES: usize = MAX_QUEUE_PACKET_BYTES;
+
 #[inline]
 pub(crate) fn max_connections_from_raw(raw: usize) -> MaxConnections {
     NonZeroUsize::new(raw)

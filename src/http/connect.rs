@@ -1,4 +1,4 @@
-use std::{fmt::Display, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -22,7 +22,7 @@ use crate::{
         FlowId,
         connection::{BackendToClientActor, ClientToBackendActor},
     },
-    http::request::{read_request_line, send_connect_response, skip_headers},
+    http::request::{RequestReadError, read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
 };
 
@@ -78,6 +78,13 @@ impl StatusLine {
         "408",
         "Request Timeout",
     );
+    const BAD_REQUEST: StatusLine =
+        Self::new(b"HTTP/1.1 400 Bad Request\r\n\r\n", "400", "Bad Request");
+    const HEADER_FIELDS_TOO_LARGE: StatusLine = Self::new(
+        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
+        "431",
+        "Request Header Fields Too Large",
+    );
     const SERVICE_UNAVAILABLE: StatusLine = Self::new(
         b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "503",
@@ -116,33 +123,17 @@ async fn respond_with_status<T>(
     Err(ConnectFlowError::ResponseSent)
 }
 
-async fn await_with_timeout_response<T, F>(
-    flow_id: FlowId,
-    client_addr: SocketAddr,
-    writer: &mut OwnedWriteHalf,
-    phase: &str,
-    fut: F,
-) -> ConnectResult<T>
-where
-    F: Future<Output = anyhow::Result<T>>,
-{
-    match timeout(CONNECT_HANDSHAKE_TIMEOUT, fut).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => {
-            let detail = format!(
-                "timed out waiting for {} from {} after {:?}",
-                phase, client_addr, CONNECT_HANDSHAKE_TIMEOUT
-            );
-            respond_with_status(
-                flow_id,
-                writer,
-                StatusLine::REQUEST_TIMEOUT,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await
+fn classify_input_error(err: &anyhow::Error) -> StatusLine {
+    if let Some(read_err) = err.downcast_ref::<RequestReadError>() {
+        match read_err {
+            RequestReadError::RequestLineTooLong { .. }
+            | RequestReadError::HeaderLineTooLong { .. }
+            | RequestReadError::HeadersTooLarge { .. }
+            | RequestReadError::TooManyHeaders { .. } => StatusLine::HEADER_FIELDS_TOO_LARGE,
+            RequestReadError::InvalidEncoding => StatusLine::BAD_REQUEST,
         }
+    } else {
+        StatusLine::BAD_REQUEST
     }
 }
 
@@ -240,14 +231,40 @@ impl ConnectState {
     }
 
     async fn advance_validating(mut session: ConnectSession) -> ConnectResult<ConnectState> {
-        let request_line = await_with_timeout_response(
-            session.flow_id,
-            session.client_addr,
-            &mut session.client_write,
-            "request line",
+        let request_line = match timeout(
+            CONNECT_HANDSHAKE_TIMEOUT,
             read_request_line(&mut session.client_reader),
         )
-        .await?;
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => {
+                let status = classify_input_error(&err);
+                let detail = format!("invalid request line from {}: {}", session.client_addr, err);
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    status,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+            Err(_) => {
+                let detail = format!(
+                    "timed out waiting for request line from {} after {:?}",
+                    session.client_addr, CONNECT_HANDSHAKE_TIMEOUT
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::REQUEST_TIMEOUT,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+        };
 
         if !request_line.is_http_1x() {
             let detail = format!(
@@ -285,14 +302,43 @@ impl ConnectState {
             session.flow_id.0, target_host, target_port
         );
 
-        await_with_timeout_response(
-            session.flow_id,
-            session.client_addr,
-            &mut session.client_write,
-            "CONNECT headers",
+        match timeout(
+            CONNECT_HANDSHAKE_TIMEOUT,
             skip_headers(&mut session.client_reader),
         )
-        .await?;
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let status = classify_input_error(&err);
+                let detail = format!(
+                    "invalid CONNECT headers from {}: {}",
+                    session.client_addr, err
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    status,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+            Err(_) => {
+                let detail = format!(
+                    "timed out waiting for CONNECT headers from {} after {:?}",
+                    session.client_addr, CONNECT_HANDSHAKE_TIMEOUT
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::REQUEST_TIMEOUT,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+        }
 
         // Best-effort early admission check so capacity rejection remains cheap under load.
         Self::reject_if_scheduler_at_capacity(&mut session, "before policy resolution").await?;
@@ -700,7 +746,7 @@ mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
-        limits::max_connections_from_raw,
+        limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
     };
     use std::{future::Future, time::Duration};
@@ -989,6 +1035,51 @@ mod tests {
         let response = response_task.await.unwrap();
 
         assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_431_for_overlong_request_line() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let long_target = "a".repeat(MAX_REQUEST_LINE_BYTES);
+            let request = format!("CONNECT {}:443 HTTP/1.1\r\n\r\n", long_target);
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn returns_431_for_too_many_headers() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut request = String::from("CONNECT example.com:443 HTTP/1.1\r\n");
+            for i in 0..=MAX_HEADER_LINES {
+                request.push_str(&format!("X-Test-{}: value\r\n", i));
+            }
+            request.push_str("\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"
+        );
     }
 
     #[actix_rt::test]
