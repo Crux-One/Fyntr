@@ -239,7 +239,11 @@ impl ConnectPolicy {
 }
 
 fn normalize_domain(value: &str) -> String {
-    value.trim().trim_end_matches('.').to_ascii_lowercase()
+    value
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn canonicalize_ip(ip: IpAddr) -> IpAddr {
@@ -425,6 +429,18 @@ mod tests {
             ..ConnectPolicyConfig::default()
         };
         config.allow_domains.push("localhost".to_string());
+        let policy = ConnectPolicy::from_config(config);
+        let result = policy.resolve_and_authorize("localhost", 443).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn allow_domain_with_leading_dot_matches_suffix() {
+        let mut config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            ..ConnectPolicyConfig::default()
+        };
+        config.allow_domains.push(".localhost".to_string());
         let policy = ConnectPolicy::from_config(config);
         let result = policy.resolve_and_authorize("localhost", 443).await;
         assert!(result.is_ok());
