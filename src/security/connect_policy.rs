@@ -193,7 +193,7 @@ impl ConnectPolicy {
 
         let domain_allowed = self.is_domain_allowed(host);
         for addr in &addrs {
-            let ip = addr.ip();
+            let ip = canonicalize_ip(addr.ip());
             if self.is_ip_allowed(ip) || domain_allowed {
                 continue;
             }
@@ -240,6 +240,13 @@ impl ConnectPolicy {
 
 fn normalize_domain(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
 }
 
 fn default_denied_cidrs() -> Vec<ConnectCidr> {
@@ -317,6 +324,16 @@ mod tests {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
             .resolve_and_authorize("127.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_mapped_ipv6_loopback_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("::ffff:127.0.0.1", 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
