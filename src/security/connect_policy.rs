@@ -186,7 +186,7 @@ impl ConnectPolicy {
             .map_err(|err| ConnectPolicyError::ResolveFailed(err.to_string()))?;
         if addrs.is_empty() {
             return Err(ConnectPolicyError::ResolveFailed(format!(
-                "host {} resolved to no addresses",
+                "host {} resolved successfully but returned an empty address list",
                 host
             )));
         }
