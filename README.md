@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
 | `--no-default-allow-port` | `FYNTR_NO_DEFAULT_ALLOW_PORT` | `false` | Disable implicit `443` allowance. Only explicitly configured `--allow-port` values are permitted. |
 | `--deny-cidr <CIDR>` | `FYNTR_DENY_CIDR` | Internal ranges | CIDR ranges denied for `CONNECT` destination IPs (repeat flag or comma-separate). |
 | `--allow-cidr <CIDR>` | `FYNTR_ALLOW_CIDR` | none | CIDR exceptions that are allowed even if they match denied internal ranges. |
-| `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix exceptions allowed for `CONNECT` targets (e.g. `example.com`). |
+| `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix allowlist for `CONNECT` targets. Denied CIDRs remain enforced. Denied addresses are filtered out when a domain matches. |
 
 ## Why Fyntr?
 Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.

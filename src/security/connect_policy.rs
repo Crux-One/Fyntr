@@ -192,28 +192,43 @@ impl ConnectPolicy {
         }
 
         let domain_allowed = self.is_domain_allowed(host);
-        for addr in &addrs {
+        let mut authorized_addrs = Vec::with_capacity(addrs.len());
+        for addr in addrs {
             let ip = canonicalize_ip(addr.ip());
-            if self.is_ip_allowed(ip) || domain_allowed {
+            if self.is_ip_allowed(ip) {
+                authorized_addrs.push(addr);
                 continue;
             }
+
             if let Some(cidr) = self
                 .deny_cidrs
                 .iter()
                 .copied()
                 .find(|cidr| cidr.contains(ip))
             {
+                if domain_allowed {
+                    continue;
+                }
                 return Err(ConnectPolicyError::Denied(format!(
                     "resolved address {} is blocked by {}",
                     ip, cidr
                 )));
             }
+
+            authorized_addrs.push(addr);
+        }
+
+        if authorized_addrs.is_empty() {
+            return Err(ConnectPolicyError::Denied(format!(
+                "all resolved addresses for host {} are blocked by deny CIDRs",
+                host
+            )));
         }
 
         Ok(ResolvedConnectTarget {
             host: host.to_string(),
             port,
-            addrs,
+            addrs: authorized_addrs,
         })
     }
 
@@ -256,7 +271,7 @@ fn canonicalize_ip(ip: IpAddr) -> IpAddr {
 fn default_denied_cidrs() -> Vec<ConnectCidr> {
     // Default blocklist to reduce SSRF blast radius.
     // These ranges cover loopback, RFC1918 private space, link-local, and unspecified addresses.
-    // Use allow_cidrs/allow_domains for explicit exceptions when needed.
+    // Use allow_cidrs/allow_domains for explicit policy exceptions when needed.
     [
         "127.0.0.0/8",
         "10.0.0.0/8",
@@ -423,7 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_domain_overrides_deny_cidr() {
+    async fn allow_domain_does_not_override_deny_cidr_when_all_addresses_are_denied() {
         let mut config = ConnectPolicyConfig {
             include_default_allow_port: true,
             ..ConnectPolicyConfig::default()
@@ -431,18 +446,17 @@ mod tests {
         config.allow_domains.push("localhost".to_string());
         let policy = ConnectPolicy::from_config(config);
         let result = policy.resolve_and_authorize("localhost", 443).await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(ConnectPolicyError::Denied(_))));
     }
 
-    #[tokio::test]
-    async fn allow_domain_with_leading_dot_matches_suffix() {
-        let mut config = ConnectPolicyConfig {
-            include_default_allow_port: true,
+    #[test]
+    fn allow_domain_with_leading_dot_matches_suffix() {
+        let config = ConnectPolicyConfig {
+            allow_domains: vec![".example.com".to_string()],
             ..ConnectPolicyConfig::default()
         };
-        config.allow_domains.push(".localhost".to_string());
         let policy = ConnectPolicy::from_config(config);
-        let result = policy.resolve_and_authorize("localhost", 443).await;
-        assert!(result.is_ok());
+        assert!(policy.is_domain_allowed("api.example.com"));
+        assert!(policy.is_domain_allowed("example.com"));
     }
 }
