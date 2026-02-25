@@ -338,6 +338,13 @@ mod tests {
         assert!(!cidr.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 5))));
     }
 
+    #[test]
+    fn cidr_contains_ipv6() {
+        let cidr: ConnectCidr = "2001:db8::/32".parse().unwrap();
+        assert!(cidr.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        assert!(!cidr.contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
+    }
+
     #[tokio::test]
     async fn blocks_private_ipv4_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
