@@ -820,6 +820,25 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn returns_403_when_target_port_is_not_allowed_by_policy() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"CONNECT 127.0.0.1:22 HTTP/1.1\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    }
+
+    #[actix_rt::test]
     async fn returns_503_when_scheduler_is_at_capacity() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(max_connections_from_raw(1))
