@@ -300,9 +300,13 @@ async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(addrs);
     }
 
+    sort_and_dedup_addrs(&mut addrs);
+    Ok(addrs)
+}
+
+fn sort_and_dedup_addrs(addrs: &mut Vec<SocketAddr>) {
     addrs.sort_unstable();
     addrs.dedup();
-    Ok(addrs)
 }
 
 impl fmt::Display for ConnectPolicyError {
@@ -343,6 +347,20 @@ mod tests {
         let cidr: ConnectCidr = "2001:db8::/32".parse().unwrap();
         assert!(cidr.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
         assert!(!cidr.contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
+    }
+
+    #[test]
+    fn sort_and_dedup_addrs_removes_duplicates_and_sorts() {
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 80);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443);
+        let addr3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 80);
+
+        let mut addrs = vec![addr1, addr2, addr3, addr2];
+        sort_and_dedup_addrs(&mut addrs);
+
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], addr2);
+        assert_eq!(addrs[1], addr1);
     }
 
     #[tokio::test]
