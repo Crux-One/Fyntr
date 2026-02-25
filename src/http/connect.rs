@@ -608,6 +608,7 @@ const CONNECT_MAX_ATTEMPTS: usize = 3;
 const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
 
+#[cfg(test)]
 async fn connect_with_backoff(
     flow_id: FlowId,
     backend_addr: SocketAddr,
@@ -636,20 +637,41 @@ async fn connect_to_any_with_backoff(
     flow_id: FlowId,
     backend_addrs: &[SocketAddr],
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
+    if backend_addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no backend addresses to connect",
+        ));
+    }
+
+    // Use round-robin retries across resolved addresses to avoid spending all retries
+    // on the first address when later addresses may already be reachable.
+    // A full Happy Eyeballs (RFC 8305) strategy can be added later if needed.
+    let mut delay = CONNECT_BACKOFF_BASE;
     let mut last_err = None;
-    for &addr in backend_addrs {
-        match connect_with_backoff(flow_id, addr).await {
-            Ok(stream) => return Ok((stream, addr)),
-            Err(err) => last_err = Some(err),
+    for attempt in 1..=CONNECT_MAX_ATTEMPTS {
+        for &addr in backend_addrs {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return Ok((stream, addr)),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        if attempt < CONNECT_MAX_ATTEMPTS {
+            warn!(
+                "flow{}: connect round {}/{} failed for all {} addresses; backing off {:?}",
+                flow_id.0,
+                attempt,
+                CONNECT_MAX_ATTEMPTS,
+                backend_addrs.len(),
+                delay
+            );
+            sleep(delay).await;
+            delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "no backend addresses to connect",
-        )
-    }))
+    Err(last_err.expect("backend_addrs checked as non-empty"))
 }
 
 #[cfg(test)]
@@ -937,6 +959,35 @@ mod tests {
                 && elapsed <= first_delay + second_delay + CONNECT_BACKOFF_MAX,
             "elapsed {:?} outside expected retry window",
             elapsed
+        );
+    }
+
+    #[actix_rt::test]
+    async fn connect_to_any_with_backoff_uses_next_address_without_full_first_retry_budget() {
+        let unreachable_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let unreachable_addr = SocketAddr::from(([127, 0, 0, 1], unreachable_port));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = listener.local_addr().unwrap();
+
+        let accept = async move {
+            let _ = listener.accept().await.unwrap();
+        };
+        let start = std::time::Instant::now();
+        let addrs = [unreachable_addr, reachable_addr];
+        let ((), connected) = tokio::join!(accept, connect_to_any_with_backoff(FlowId(1), &addrs));
+
+        let (stream, addr) = connected.unwrap();
+        drop(stream);
+        assert_eq!(addr, reachable_addr);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "connect_to_any_with_backoff spent too long before trying a fallback address"
         );
     }
 
