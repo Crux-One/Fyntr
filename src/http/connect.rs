@@ -617,6 +617,7 @@ async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
 const CONNECT_MAX_ATTEMPTS: usize = 3;
 const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
 async fn connect_with_backoff(
@@ -661,9 +662,19 @@ async fn connect_to_any_with_backoff(
     let mut last_err = None;
     for attempt in 1..=CONNECT_MAX_ATTEMPTS {
         for &addr in backend_addrs {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => return Ok((stream, addr)),
-                Err(err) => last_err = Some(err),
+            let connect = TcpStream::connect(addr);
+            match timeout(CONNECT_ATTEMPT_TIMEOUT, connect).await {
+                Ok(Ok(stream)) => return Ok((stream, addr)),
+                Ok(Err(err)) => last_err = Some(err),
+                Err(_) => {
+                    last_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "connect attempt to {} timed out after {:?}",
+                            addr, CONNECT_ATTEMPT_TIMEOUT
+                        ),
+                    ));
+                }
             }
         }
 
