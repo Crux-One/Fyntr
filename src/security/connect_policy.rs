@@ -206,9 +206,10 @@ impl ConnectPolicy {
         let domain_allowed = self.is_domain_allowed(host);
         let mut authorized_addrs = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            let ip = canonicalize_ip(addr.ip());
+            let canonical_addr = canonicalize_socket_addr(addr);
+            let ip = canonical_addr.ip();
             if self.is_ip_allowed(ip) {
-                authorized_addrs.push(addr);
+                authorized_addrs.push(canonical_addr);
                 continue;
             }
 
@@ -227,7 +228,11 @@ impl ConnectPolicy {
                 )));
             }
 
-            authorized_addrs.push(addr);
+            authorized_addrs.push(canonical_addr);
+        }
+
+        if !authorized_addrs.is_empty() {
+            sort_and_dedup_addrs(&mut authorized_addrs);
         }
 
         if authorized_addrs.is_empty() {
@@ -278,6 +283,10 @@ fn canonicalize_ip(ip: IpAddr) -> IpAddr {
         IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
         IpAddr::V4(_) => ip,
     }
+}
+
+fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
 }
 
 fn default_denied_cidrs() -> Vec<ConnectCidr> {
@@ -396,6 +405,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_ipv4_mapped_ipv6_address_in_authorized_results() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        let result = policy
+            .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .await
+            .unwrap();
+
+        assert_eq!(result.addrs.len(), 1);
+        assert_eq!(
+            result.addrs[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
+        );
     }
 
     #[tokio::test]
