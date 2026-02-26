@@ -116,8 +116,8 @@ async fn main() -> anyhow::Result<()> {
 | `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
-| `--allow-port <PORT>` | `FYNTR_ALLOW_PORT` | `443` | Allowed destination port for `CONNECT` in the range `1-65535` (repeat flag or comma-separate to add more). |
 | `--no-default-allow-port` | `FYNTR_NO_DEFAULT_ALLOW_PORT` | `false` | Disable implicit `443` allowance. Only explicitly configured `--allow-port` values are permitted. |
+| `--allow-port <PORT>` | `FYNTR_ALLOW_PORT` | implicit `443` unless `--no-default-allow-port` | Allowed destination port for `CONNECT` in the range `1-65535` (repeat flag or comma-separate to add more). |
 | `--deny-cidr <CIDR>` | `FYNTR_DENY_CIDR` | Internal ranges | CIDR ranges denied for `CONNECT` destination IPs (repeat flag or comma-separate). |
 | `--allow-cidr <CIDR>` | `FYNTR_ALLOW_CIDR` | none | CIDR exceptions that are allowed even if they match denied internal ranges. |
 | `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix allowlist for `CONNECT` targets. When a domain matches, addresses blocked by deny CIDRs are filtered out rather than causing the entire connection to fail. If all resolved addresses are blocked, the connection is denied. |
