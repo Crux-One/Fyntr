@@ -408,6 +408,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skip_headers_rejects_headers_too_large_total_bytes() {
+        let (mut reader, _write_half, mut client_stream) = build_loopback_pair().await;
+        let mut request = String::from("CONNECT example.invalid:443 HTTP/1.1\r\n");
+        let value = "c".repeat(4000);
+        for i in 0..9 {
+            request.push_str(&format!("X-Bulk-{}: {}\r\n", i, value));
+        }
+        request.push_str("\r\n");
+        client_stream.write_all(request.as_bytes()).await.unwrap();
+
+        let _ = read_request_line(&mut reader).await.unwrap();
+        let err = skip_headers(&mut reader).await.unwrap_err();
+        let typed = err.downcast_ref::<RequestReadError>().unwrap();
+        assert_eq!(
+            typed,
+            &RequestReadError::HeadersTooLarge {
+                max_bytes: MAX_HEADER_BYTES
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn test_send_connect_response_writes_expected_bytes() {
         let (_reader, mut write_half, mut client_stream) = build_loopback_pair().await;
 
