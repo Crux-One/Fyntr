@@ -188,6 +188,37 @@ enum ConnectState {
 }
 
 impl ConnectState {
+    async fn reject_if_scheduler_at_capacity(
+        session: &mut ConnectSession,
+        phase: &str,
+    ) -> ConnectResult<()> {
+        match session.scheduler.send(CanAcceptConnection).await {
+            Ok(false) => {
+                let detail = format!("scheduler at capacity {}", phase);
+                respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::SERVICE_UNAVAILABLE,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await
+            }
+            Ok(true) => Ok(()),
+            Err(e) => {
+                let detail = format!("failed to check capacity {}: {}", phase, e);
+                respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::SERVICE_UNAVAILABLE,
+                    StatusLogLevel::Error,
+                    detail,
+                )
+                .await
+            }
+        }
+    }
+
     fn flow_id(&self) -> FlowId {
         match self {
             ConnectState::Validating(session)
@@ -263,6 +294,9 @@ impl ConnectState {
         )
         .await?;
 
+        // Best-effort early admission check so capacity rejection remains cheap under load.
+        Self::reject_if_scheduler_at_capacity(&mut session, "before policy resolution").await?;
+
         let target = match session
             .connect_policy
             .resolve_and_authorize(&target_host, target_port)
@@ -311,31 +345,7 @@ impl ConnectState {
         // This is not atomic with the subsequent `Register` call; between here and registration
         // other flows may be accepted, so this check can return a false positive. The atomic
         // `Register` is the authoritative gatekeeper for enforcing the hard limit.
-        match session.scheduler.send(CanAcceptConnection).await {
-            Ok(false) => {
-                let detail = "scheduler at capacity before dialing";
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
-            }
-            Ok(true) => {}
-            Err(e) => {
-                let detail = format!("failed to check capacity before dialing: {}", e);
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await;
-            }
-        }
+        Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
         let (backend_stream, connected_addr) =
             match connect_to_any_with_backoff(session.flow_id, &target.addrs).await {
@@ -879,6 +889,41 @@ mod tests {
 
         assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
         drop(backend_listener);
+    }
+
+    #[actix_rt::test]
+    async fn returns_503_before_policy_evaluation_when_scheduler_is_at_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(42),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            // default_policy would normally deny this loopback target with 403.
+            client
+                .write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
     }
 
     #[actix_rt::test]
