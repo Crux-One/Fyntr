@@ -824,7 +824,7 @@ mod tests {
         let response = drive_proxy(listener, scheduler, default_policy(), async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
             client
-                .write_all(b"CONNECT example.com:443 HTTP/2\r\nHost: example\r\n\r\n")
+                .write_all(b"CONNECT example.invalid:443 HTTP/2\r\nHost: example\r\n\r\n")
                 .await
                 .unwrap();
             read_response(client).await
@@ -1015,19 +1015,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let response_task = tokio::spawn(drive_proxy(
-            listener,
-            scheduler,
-            default_policy(),
-            async move {
-                let mut client = TcpStream::connect(addr).await.unwrap();
-                client
-                    .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
-                    .await
-                    .unwrap();
-                read_response(client).await
-            },
-        ));
+        let response_task = tokio::spawn(drive_proxy(listener, scheduler, async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"CONNECT example.invalid:443 HTTP/1.1\r\nHost: example\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        }));
 
         task::yield_now().await;
         time::advance(CONNECT_HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
@@ -1066,7 +1061,7 @@ mod tests {
 
         let response = drive_proxy(listener, scheduler, async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
-            let mut request = String::from("CONNECT example.com:443 HTTP/1.1\r\n");
+            let mut request = String::from("CONNECT example.invalid:443 HTTP/1.1\r\n");
             for i in 0..=MAX_HEADER_LINES {
                 request.push_str(&format!("X-Test-{}: value\r\n", i));
             }

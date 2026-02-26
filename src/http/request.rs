@@ -255,21 +255,21 @@ mod tests {
 
     #[test]
     fn test_parse_connect_target_rejects_missing_port() {
-        let req = RequestLine::parse("CONNECT example.com HTTP/1.1").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid CONNECT target"));
     }
 
     #[test]
     fn test_parse_connect_target_rejects_bad_port() {
-        let req = RequestLine::parse("CONNECT example.com:not-a-port HTTP/1.1").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid:not-a-port HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid port"));
     }
 
     #[test]
     fn test_is_connect_method() {
-        let req = RequestLine::parse("CONNECT example.com:443 HTTP/1.1").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid:443 HTTP/1.1").unwrap();
         assert!(req.is_connect_method());
 
         let req = RequestLine::parse("GET /api HTTP/1.1").unwrap();
@@ -278,13 +278,13 @@ mod tests {
 
     #[test]
     fn test_is_http_1x() {
-        let req = RequestLine::parse("CONNECT example.com:443 HTTP/1.1").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid:443 HTTP/1.1").unwrap();
         assert!(req.is_http_1x());
 
-        let req = RequestLine::parse("CONNECT example.com:443 HTTP/1.0").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid:443 HTTP/1.0").unwrap();
         assert!(req.is_http_1x());
 
-        let req = RequestLine::parse("CONNECT example.com:443 HTTP/2.0").unwrap();
+        let req = RequestLine::parse("CONNECT example.invalid:443 HTTP/2.0").unwrap();
         assert!(!req.is_http_1x());
     }
 
@@ -309,13 +309,13 @@ mod tests {
         let (mut reader, _server_write, mut client_stream) = build_loopback_pair().await;
 
         client_stream
-            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n")
+            .write_all(b"CONNECT example.invalid:443 HTTP/1.1\r\n")
             .await
             .unwrap();
 
         let line = read_request_line(&mut reader).await.unwrap();
         assert_eq!(line.method, "CONNECT");
-        assert_eq!(line.target, "example.com:443");
+        assert_eq!(line.target, "example.invalid:443");
         assert_eq!(line.version, "HTTP/1.1");
     }
 
@@ -352,7 +352,7 @@ mod tests {
 
         client_stream
             .write_all(
-                b"CONNECT example.com:443 HTTP/1.1\r\nHeader: value\r\nAnother: header\r\n\r\nBody-Line\r\n",
+                b"CONNECT example.invalid:443 HTTP/1.1\r\nHeader: value\r\nAnother: header\r\n\r\nBody-Line\r\n",
             )
             .await
             .unwrap();
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn test_skip_headers_rejects_too_many_headers() {
         let (mut reader, _write_half, mut client_stream) = build_loopback_pair().await;
-        let mut request = String::from("CONNECT example.com:443 HTTP/1.1\r\n");
+        let mut request = String::from("CONNECT example.invalid:443 HTTP/1.1\r\n");
         for i in 0..=MAX_HEADER_LINES {
             request.push_str(&format!("X-Test-{}: value\r\n", i));
         }
@@ -391,7 +391,7 @@ mod tests {
         let (mut reader, _write_half, mut client_stream) = build_loopback_pair().await;
         let oversized_value = "b".repeat(MAX_HEADER_LINE_BYTES);
         let request = format!(
-            "CONNECT example.com:443 HTTP/1.1\r\nX-Long: {}\r\n\r\n",
+            "CONNECT example.invalid:443 HTTP/1.1\r\nX-Long: {}\r\n\r\n",
             oversized_value
         );
         client_stream.write_all(request.as_bytes()).await.unwrap();

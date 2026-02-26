@@ -784,7 +784,7 @@ mod tests {
             BindAddressParseError::ContainsPort
         ));
 
-        let host_with_out_of_range_port = "example.com:65536"
+        let host_with_out_of_range_port = "example.invalid:65536"
             .parse::<BindAddress>()
             .expect_err("hostname with out-of-range port should fail");
         assert!(matches!(
@@ -792,7 +792,7 @@ mod tests {
             BindAddressParseError::ContainsPort
         ));
 
-        let too_long = format!("{}.example.com", "a".repeat(242));
+        let too_long = format!("{}.example.invalid", "a".repeat(238));
         let too_long_err = too_long
             .parse::<BindAddress>()
             .expect_err("hostname > 253 chars should fail");
