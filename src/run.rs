@@ -305,6 +305,7 @@ impl ServerBuilder {
     }
 
     /// Adds a destination port to the CONNECT allow list.
+    /// Port 0 is invalid and will be ignored when the policy is built.
     pub fn allow_port(mut self, port: u16) -> Self {
         self.connect_policy.allowed_ports.push(port);
         self
