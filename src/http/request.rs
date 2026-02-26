@@ -60,11 +60,10 @@ async fn read_line_with_limit(
             return Ok(line);
         }
 
-        let chunk_len = match buf.iter().position(|&b| b == b'\n') {
-            Some(pos) => pos + 1,
-            None => buf.len(),
+        let (chunk_len, has_newline) = match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (buf.len(), false),
         };
-        let has_newline = buf[..chunk_len].contains(&b'\n');
 
         if line.len().saturating_add(chunk_len) > max_bytes {
             return Err(limit_err.into());
