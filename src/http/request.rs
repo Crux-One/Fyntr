@@ -94,7 +94,7 @@ impl RequestLine {
         let (method, target, version) =
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some(method), Some(target), Some(version), None) => (method, target, version),
-                _ => return Err(anyhow!("Invalid request line: {}", line)),
+                _ => return Err(anyhow!("Invalid request line")),
             };
 
         Ok(RequestLine {
@@ -125,11 +125,11 @@ impl RequestLine {
         let (host, port) = self
             .target
             .split_once(':')
-            .ok_or_else(|| anyhow!("Invalid CONNECT target: {}", self.target))?;
+            .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
         let host = host.to_string();
         let port = port
             .parse::<u16>()
-            .map_err(|_| anyhow!("Invalid port: {}", port))?;
+            .map_err(|_| anyhow!("Invalid port"))?;
 
         Ok((host, port))
     }
@@ -229,12 +229,14 @@ mod tests {
     fn test_parse_request_line_rejects_short_lines() {
         let err = RequestLine::parse("CONNECT only-two").unwrap_err();
         assert!(err.to_string().contains("Invalid request line"));
+        assert!(!err.to_string().contains("only-two"));
     }
 
     #[test]
     fn test_parse_request_line_rejects_too_many_parts() {
         let err = RequestLine::parse("CONNECT host:443 HTTP/1.1 extra").unwrap_err();
         assert!(err.to_string().contains("Invalid request line"));
+        assert!(!err.to_string().contains("extra"));
     }
 
     #[test]
@@ -258,6 +260,7 @@ mod tests {
         let req = RequestLine::parse("CONNECT example.invalid HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid CONNECT target"));
+        assert!(!err.to_string().contains("example.invalid"));
     }
 
     #[test]
@@ -265,6 +268,7 @@ mod tests {
         let req = RequestLine::parse("CONNECT example.invalid:not-a-port HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid port"));
+        assert!(!err.to_string().contains("not-a-port"));
     }
 
     #[test]
