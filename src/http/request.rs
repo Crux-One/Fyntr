@@ -127,9 +127,7 @@ impl RequestLine {
             .split_once(':')
             .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
         let host = host.to_string();
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| anyhow!("Invalid port"))?;
+        let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
 
         Ok((host, port))
     }
