@@ -175,9 +175,21 @@ impl ConnectPolicy {
         port: u16,
     ) -> Result<ResolvedConnectTarget, ConnectPolicyError> {
         if !self.allowed_ports.contains(&port) {
+            let mut allowed_ports: Vec<u16> = self.allowed_ports.iter().copied().collect();
+            allowed_ports.sort_unstable();
+
             return Err(ConnectPolicyError::Denied(format!(
-                "port {} is not in allow list",
-                port
+                "port {} is not in allow list; allowed ports are: {}",
+                port,
+                if allowed_ports.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    allowed_ports
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             )));
         }
 
