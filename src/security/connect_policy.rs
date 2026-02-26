@@ -280,10 +280,13 @@ fn default_denied_cidrs() -> Vec<ConnectCidr> {
         "169.254.0.0/16",
         "100.64.0.0/10",
         "0.0.0.0/8",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
         "::1/128",
         "::/128",
         "fc00::/7",
         "fe80::/10",
+        "ff00::/8",
     ]
     .iter()
     .map(|value| value.parse().expect("default CIDR must parse"))
@@ -378,6 +381,36 @@ mod tests {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
             .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_multicast_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("224.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_reserved_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("240.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv6_multicast_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("ff02::1", 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
