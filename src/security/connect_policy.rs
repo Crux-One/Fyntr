@@ -8,6 +8,8 @@ use std::{
 use anyhow::anyhow;
 use tokio::net::lookup_host;
 
+use crate::limits::MAX_RESOLVED_CONNECT_ADDRS;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectCidr {
     V4 { network: u32, prefix: u8 },
@@ -319,12 +321,36 @@ async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let mut addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
-    if addrs.is_empty() {
-        return Ok(addrs);
+    let resolved = lookup_host((host, port)).await?;
+    collect_resolved_addrs_with_limit(host, resolved, MAX_RESOLVED_CONNECT_ADDRS)
+}
+
+fn collect_resolved_addrs_with_limit(
+    host: &str,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    max_addrs: usize,
+) -> io::Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+
+    for addr in resolved {
+        let canonical = canonicalize_socket_addr(addr);
+        if addrs.contains(&canonical) {
+            continue;
+        }
+
+        addrs.push(canonical);
+        if addrs.len() > max_addrs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "host {} resolved to more than {} unique addresses",
+                    host, max_addrs
+                ),
+            ));
+        }
     }
 
-    sort_and_dedup_addrs(&mut addrs);
+    addrs.sort_unstable();
     Ok(addrs)
 }
 
@@ -385,6 +411,36 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0], addr2);
         assert_eq!(addrs[1], addr1);
+    }
+
+    #[test]
+    fn collect_resolved_addrs_with_limit_rejects_excessive_unique_addresses() {
+        let addrs = (1..=4)
+            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)), 443))
+            .collect::<Vec<_>>();
+        let err = collect_resolved_addrs_with_limit("example.com", addrs, 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("more than 3 unique addresses"));
+    }
+
+    #[test]
+    fn collect_resolved_addrs_with_limit_canonicalizes_and_dedups() {
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V6("::ffff:203.0.113.10".parse().unwrap()), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443),
+        ];
+
+        let collected = collect_resolved_addrs_with_limit("example.com", addrs, 3).unwrap();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(
+            collected[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443)
+        );
+        assert_eq!(
+            collected[1],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443)
+        );
     }
 
     #[tokio::test]
