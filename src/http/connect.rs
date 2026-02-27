@@ -80,6 +80,8 @@ impl StatusLine {
     );
     const BAD_REQUEST: StatusLine =
         Self::new(b"HTTP/1.1 400 Bad Request\r\n\r\n", "400", "Bad Request");
+    const URI_TOO_LONG: StatusLine =
+        Self::new(b"HTTP/1.1 414 URI Too Long\r\n\r\n", "414", "URI Too Long");
     const HEADER_FIELDS_TOO_LARGE: StatusLine = Self::new(
         b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
         "431",
@@ -126,8 +128,8 @@ async fn respond_with_status<T>(
 fn classify_input_error(err: &anyhow::Error) -> StatusLine {
     if let Some(read_err) = err.downcast_ref::<RequestReadError>() {
         match read_err {
-            RequestReadError::RequestLineTooLong { .. }
-            | RequestReadError::HeaderLineTooLong { .. }
+            RequestReadError::RequestLineTooLong { .. } => StatusLine::URI_TOO_LONG,
+            RequestReadError::HeaderLineTooLong { .. }
             | RequestReadError::HeadersTooLarge { .. }
             | RequestReadError::TooManyHeaders { .. } => StatusLine::HEADER_FIELDS_TOO_LARGE,
             RequestReadError::InvalidEncoding => StatusLine::BAD_REQUEST,
@@ -1019,7 +1021,7 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn returns_431_for_overlong_request_line() {
+    async fn returns_414_for_overlong_request_line() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1033,10 +1035,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            response,
-            b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"
-        );
+        assert_eq!(response, b"HTTP/1.1 414 URI Too Long\r\n\r\n");
     }
 
     #[actix_rt::test]
