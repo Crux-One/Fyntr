@@ -221,26 +221,24 @@ impl ConnectState {
         match session.scheduler.send(CanAcceptConnection).await {
             Ok(false) => {
                 let detail = format!("scheduler at capacity {}", phase);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await
             }
             Ok(true) => Ok(()),
             Err(e) => {
                 let detail = format!("failed to check capacity {}: {}", phase, e);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Error,
+                        detail,
+                    )
+                    .await
             }
         }
     }
@@ -281,14 +279,13 @@ impl ConnectState {
                 "unsupported HTTP version {} from {}",
                 request_line.version, session.client_addr
             );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::VERSION_NOT_SUPPORTED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
+            return session
+                .respond(
+                    StatusLine::VERSION_NOT_SUPPORTED,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
         }
 
         if !request_line.is_connect_method() {
@@ -296,14 +293,9 @@ impl ConnectState {
                 "unsupported method {} from {}",
                 request_line.method, session.client_addr
             );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::METHOD_NOT_ALLOWED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
+            return session
+                .respond(StatusLine::METHOD_NOT_ALLOWED, StatusLogLevel::Warn, detail)
+                .await;
         }
 
         let (target_host, target_port) = match request_line.parse_connect_target() {
@@ -313,14 +305,9 @@ impl ConnectState {
                     "malformed CONNECT target '{}' from {}: {}",
                     request_line.target, session.client_addr, err
                 );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::BAD_REQUEST,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
+                return session
+                    .respond(StatusLine::BAD_REQUEST, StatusLogLevel::Warn, detail)
+                    .await;
             }
         };
         info!(
@@ -352,28 +339,18 @@ impl ConnectState {
                     "CONNECT {}:{} denied for {}: {}",
                     target_host, target_port, session.client_addr, reason
                 );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::FORBIDDEN,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
+                return session
+                    .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+                    .await;
             }
             Err(ConnectPolicyError::ResolveFailed(reason)) => {
                 let detail = format!(
                     "failed to resolve {}:{} for {}: {}",
                     target_host, target_port, session.client_addr, reason
                 );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::BAD_GATEWAY,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await;
+                return session
+                    .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                    .await;
             }
         };
 
@@ -399,14 +376,9 @@ impl ConnectState {
                         "failed to connect to {}:{} after retries: {}",
                         target.host, target.port, e
                     );
-                    return respond_with_status(
-                        session.flow_id,
-                        &mut session.client_write,
-                        StatusLine::BAD_GATEWAY,
-                        StatusLogLevel::Error,
-                        detail,
-                    )
-                    .await;
+                    return session
+                        .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                        .await;
                 }
             };
 
@@ -457,14 +429,13 @@ impl ConnectState {
             }
             Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
                 let detail = format!("registration rejected - max connections ({}) reached", max);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await
             }
             Err(e) => {
                 error!(
@@ -549,6 +520,15 @@ impl ConnectSession {
             client_reader: BufReader::new(client_read),
             client_write,
         }
+    }
+
+    async fn respond<T>(
+        &mut self,
+        status: StatusLine,
+        level: StatusLogLevel,
+        detail: impl Display,
+    ) -> ConnectResult<T> {
+        respond_with_status(self.flow_id, &mut self.client_write, status, level, detail).await
     }
 }
 
