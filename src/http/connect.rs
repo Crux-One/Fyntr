@@ -151,6 +151,9 @@ where
     match timeout(CONNECT_HANDSHAKE_TIMEOUT, read_op).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => {
+            if err.downcast_ref::<std::io::Error>().is_some() {
+                return Err(ConnectFlowError::Fatal(err));
+            }
             let status = classify_error(&err);
             let detail = format!("invalid {} from {}: {}", phase, client_addr, err);
             respond_with_status(flow_id, writer, status, StatusLogLevel::Warn, detail).await
