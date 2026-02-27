@@ -175,22 +175,9 @@ impl ConnectPolicy {
         port: u16,
     ) -> Result<ResolvedConnectTarget, ConnectPolicyError> {
         if !self.allowed_ports.contains(&port) {
-            let mut allowed_ports: Vec<u16> = self.allowed_ports.iter().copied().collect();
-            allowed_ports.sort_unstable();
-
-            return Err(ConnectPolicyError::Denied(format!(
-                "port {} is not in allow list; allowed ports are: {}",
-                port,
-                if allowed_ports.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    allowed_ports
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            )));
+            return Err(ConnectPolicyError::Denied(
+                self.disallowed_port_reason(port),
+            ));
         }
 
         let addrs = resolve_host(host, port)
@@ -267,6 +254,27 @@ impl ConnectPolicy {
                     && host.ends_with(allowed)
                     && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
         })
+    }
+
+    fn disallowed_port_reason(&self, port: u16) -> String {
+        if self.allowed_ports.is_empty() {
+            return format!(
+                "port {} is not allowed: no CONNECT ports are enabled. Configure one or more allowed ports with --allow-port (or FYNTR_ALLOW_PORT), or remove --no-default-allow-port to restore implicit 443.",
+                port
+            );
+        }
+
+        let mut allowed_ports: Vec<u16> = self.allowed_ports.iter().copied().collect();
+        allowed_ports.sort_unstable();
+        format!(
+            "port {} is not in allow list; allowed ports are: {}",
+            port,
+            allowed_ports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -492,6 +500,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_allow_port_list_returns_actionable_denial_message() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: false,
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        let err = policy
+            .resolve_and_authorize("example.com", 443)
+            .await
+            .unwrap_err();
+
+        let ConnectPolicyError::Denied(reason) = err else {
+            panic!("expected Denied error");
+        };
+        assert!(reason.contains("no CONNECT ports are enabled"));
+        assert!(reason.contains("--allow-port"));
+        assert!(reason.contains("--no-default-allow-port"));
+        assert!(reason.contains("restore implicit 443"));
     }
 
     #[tokio::test]
