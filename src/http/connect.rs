@@ -304,8 +304,10 @@ impl ConnectState {
         let (target_host, target_port) = match request_line.parse_connect_target() {
             Ok(target) => target,
             Err(err) => {
-                let detail =
-                    format!("malformed CONNECT target from {}: {}", session.client_addr, err);
+                let detail = format!(
+                    "malformed CONNECT target from {}: {}",
+                    session.client_addr, err
+                );
                 return session
                     .respond(StatusLine::BAD_REQUEST, StatusLogLevel::Warn, detail)
                     .await;
