@@ -41,10 +41,8 @@ impl fmt::Display for RequestReadError {
 
 impl Error for RequestReadError {}
 
-fn decode_line(buf: &[u8]) -> Result<String> {
-    std::str::from_utf8(buf)
-        .map(|s| s.to_string())
-        .map_err(|_| RequestReadError::InvalidEncoding.into())
+fn decode_line(buf: &[u8]) -> Result<&str> {
+    std::str::from_utf8(buf).map_err(|_| RequestReadError::InvalidEncoding.into())
 }
 
 async fn read_line_with_limit(
