@@ -306,7 +306,23 @@ impl ConnectState {
             .await;
         }
 
-        let (target_host, target_port) = request_line.parse_connect_target()?;
+        let (target_host, target_port) = match request_line.parse_connect_target() {
+            Ok(target) => target,
+            Err(err) => {
+                let detail = format!(
+                    "malformed CONNECT target '{}' from {}: {}",
+                    request_line.target, session.client_addr, err
+                );
+                return respond_with_status(
+                    session.flow_id,
+                    &mut session.client_write,
+                    StatusLine::BAD_REQUEST,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
+            }
+        };
         info!(
             "flow{}: CONNECT {}:{}",
             session.flow_id.0, target_host, target_port
