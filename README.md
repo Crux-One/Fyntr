@@ -131,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
 
 ## Why Fyntr?
 Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.
-The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
+
+When many flows send data simultaneously, they can create short traffic spikes that overwhelm low-capacity routers, especially consumer NAT devices. This can cause CPU interrupts to be too high and make the network feel unresponsive.
 
 Rather than relying on connection pooling, Fyntr regulates the traffic itself.
 Its scheduler uses DRR to distribute sending opportunities across active flows fairly,
@@ -139,6 +140,9 @@ so packet bursts from many parallel flows get interleaved instead of letting the
 
 This smoothing reduces CPU pressure on routers during connection storms.
 This effect is most critical when scheduling overhead, rather than bandwidth, is the primary bottleneck.
+
+## Limitations
+In certain environments, upload throughput can be reduced due to DRR scheduling, depending on network conditions.
 
 ## Usage with Terraform
 
