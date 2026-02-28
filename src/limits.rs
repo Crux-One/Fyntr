@@ -8,8 +8,8 @@ pub(crate) const MAX_HEADER_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_HEADER_LINES: usize = 100;
 // Caps DNS fan-out to keep CONNECT dial latency bounded.
 // With CONNECT_MAX_ATTEMPTS=3 and CONNECT_ATTEMPT_TIMEOUT=3s, this yields
-// about 72s worst-case active dial time (3 * 8 * 3s), plus backoff sleeps (~0.6s).
-pub(crate) const MAX_RESOLVED_CONNECT_ADDRS: usize = 8;
+// about 288s worst-case active dial time (3 * 32 * 3s), plus backoff sleeps (~0.6s).
+pub(crate) const MAX_RESOLVED_CONNECT_ADDRS: usize = 32;
 
 pub(crate) const MAX_QUEUE_PACKET_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_QUEUE_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
