@@ -11,13 +11,16 @@ use tokio::{
 
 use crate::{
     actors::{
-        queue::{Enqueue, QueueActor},
+        queue::{Enqueue, EnqueueError, QueueActor},
         scheduler::{RecordDownstreamBytes, Scheduler, Unregister},
     },
     util::{format_bytes, format_rate},
 };
 
 const BUFFER_SIZE: usize = 8 * 1024; // 8 KB
+const ENQUEUE_BACKPRESSURE_RETRY_BASE_DELAY: Duration = Duration::from_millis(5);
+const ENQUEUE_BACKPRESSURE_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
+const ENQUEUE_BACKPRESSURE_LOG_EVERY: u32 = 200;
 const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
 const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
@@ -41,6 +44,52 @@ impl ClientToBackendActor {
             client: Some(client),
             queue_tx,
             scheduler,
+        }
+    }
+
+    async fn enqueue_with_backpressure(
+        flow_id: FlowId,
+        queue_tx: &Addr<QueueActor>,
+        chunk: Bytes,
+    ) -> bool {
+        let mut retries = 0u32;
+        let mut delay = ENQUEUE_BACKPRESSURE_RETRY_BASE_DELAY;
+        loop {
+            match queue_tx.send(Enqueue(chunk.clone())).await {
+                Ok(Ok(())) => {
+                    if retries > 0 {
+                        debug!(
+                            "flow{}: queue pressure relieved after {} retries",
+                            flow_id.0, retries
+                        );
+                    }
+                    return true;
+                }
+                Ok(Err(EnqueueError::QueueBufferExceeded {
+                    attempted_total,
+                    max_buffered_bytes,
+                })) => {
+                    retries = retries.saturating_add(1);
+                    if retries == 1 || retries.is_multiple_of(ENQUEUE_BACKPRESSURE_LOG_EVERY) {
+                        warn!(
+                            "flow{}: queue buffered bytes {} exceeds limit {}; pausing upstream reads",
+                            flow_id.0, attempted_total, max_buffered_bytes
+                        );
+                    }
+                    sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(ENQUEUE_BACKPRESSURE_RETRY_MAX_DELAY);
+                }
+                Ok(Err(e)) => {
+                    warn!("flow{}: enqueue rejected: {}", flow_id.0, e);
+                    return false;
+                }
+                Err(e) => {
+                    warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
+                    return false;
+                }
+            }
         }
     }
 }
@@ -86,16 +135,8 @@ impl Actor for ClientToBackendActor {
                         Ok(n) => {
                             total_read += n as u64;
                             let chunk = Bytes::copy_from_slice(&buf[..n]);
-                            match queue_tx.send(Enqueue(chunk)).await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    warn!("flow{}: enqueue rejected: {}", flow_id.0, e);
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
-                                    break;
-                                }
+                            if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
+                                break;
                             }
                         }
                         Err(e) => {
@@ -231,13 +272,14 @@ impl Actor for BackendToClientActor {
 mod tests {
     use super::*;
     use crate::actors::{
-        queue::{Dequeue, QueueActor},
+        queue::{AddQuantum, Dequeue, Enqueue, EnqueueError, QueueActor},
         scheduler::{Register, Scheduler},
     };
+    use crate::limits::{MAX_DEQUEUE_BYTES, MAX_QUEUE_PACKET_BYTES};
     use crate::test_utils::make_backend_write;
     use tokio::{
         net::{TcpListener, TcpStream},
-        time::{Duration, sleep},
+        time::{Duration, sleep, timeout},
     };
 
     async fn build_server_read_half() -> OwnedReadHalf {
@@ -255,6 +297,17 @@ mod tests {
         let server = accept_handle.await.unwrap();
         let (read_half, _write_half) = server.into_split();
         read_half
+    }
+
+    async fn fill_queue_until_buffer_exceeded(queue: &Addr<QueueActor>) {
+        let packet = Bytes::from(vec![0u8; MAX_QUEUE_PACKET_BYTES]);
+        loop {
+            match queue.send(Enqueue(packet.clone())).await.unwrap() {
+                Ok(()) => {}
+                Err(EnqueueError::QueueBufferExceeded { .. }) => break,
+                Err(other) => panic!("unexpected enqueue error while filling queue: {other}"),
+            }
+        }
     }
 
     #[actix_rt::test]
@@ -288,6 +341,48 @@ mod tests {
         assert!(
             stopped,
             "queue should stop after client disconnect unregisters flow"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn enqueue_with_backpressure_retries_until_queue_has_capacity() {
+        let queue = QueueActor::new().start();
+        fill_queue_until_buffer_exceeded(&queue).await;
+
+        let queue_for_drain = queue.clone();
+        let drain_handle = tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            queue_for_drain.do_send(AddQuantum(MAX_QUEUE_PACKET_BYTES));
+            queue_for_drain
+                .send(Dequeue {
+                    max_bytes: MAX_DEQUEUE_BYTES,
+                })
+                .await
+                .expect("dequeue request should succeed")
+        });
+
+        let enqueue_result = timeout(
+            Duration::from_secs(1),
+            ClientToBackendActor::enqueue_with_backpressure(
+                FlowId(999),
+                &queue,
+                Bytes::from(vec![1u8; 1024]),
+            ),
+        )
+        .await
+        .expect("enqueue_with_backpressure should not hang");
+
+        let dequeue_result = drain_handle
+            .await
+            .expect("drain task should complete without panic");
+        assert!(
+            dequeue_result.is_some(),
+            "drain dequeue should return Some once quantum is added"
+        );
+
+        assert!(
+            enqueue_result,
+            "enqueue should eventually succeed once queue capacity is available"
         );
     }
 }
