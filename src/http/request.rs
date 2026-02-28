@@ -124,6 +124,10 @@ impl RequestLine {
             .target
             .split_once(':')
             .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
+        let host = host.trim();
+        if host.is_empty() || host.chars().all(|ch| ch == '[' || ch == ']') {
+            return Err(anyhow!("Invalid CONNECT target"));
+        }
         let host = host.to_string();
         let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
 
@@ -257,6 +261,14 @@ mod tests {
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid CONNECT target"));
         assert!(!err.to_string().contains("example.invalid"));
+    }
+
+    #[test]
+    fn test_parse_connect_target_rejects_empty_host() {
+        let req = RequestLine::parse("CONNECT :443 HTTP/1.1").unwrap();
+        let err = req.parse_connect_target().unwrap_err();
+        assert!(err.to_string().contains("Invalid CONNECT target"));
+        assert!(!err.to_string().contains(":443"));
     }
 
     #[test]
