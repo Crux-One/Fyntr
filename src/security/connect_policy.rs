@@ -485,7 +485,11 @@ mod tests {
             .resolve_and_authorize("example.com", 22)
             .await
             .unwrap_err();
-        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+        let ConnectPolicyError::Denied(reason) = err else {
+            panic!("expected Denied error");
+        };
+        assert!(reason.contains("port 22 is not in allow list; allowed ports are: 443"));
+        assert!(!reason.contains("no CONNECT ports are enabled"));
     }
 
     #[tokio::test]
