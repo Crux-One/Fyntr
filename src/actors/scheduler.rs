@@ -14,7 +14,7 @@ use crate::{
         queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
     },
     flow::FlowId,
-    limits::{MaxConnections, max_connections_display},
+    limits::{MAX_DEQUEUE_BYTES, MaxConnections, max_connections_display},
     util::{format_bytes, format_rate},
 };
 
@@ -493,9 +493,7 @@ impl Scheduler {
     ) {
         queue_addr
             .send(Dequeue {
-                // scheduler always requests full packets today, but we keep the
-                // API field so a future byte cap can hook in without churn.
-                max_bytes: usize::MAX,
+                max_bytes: MAX_DEQUEUE_BYTES,
             })
             .into_actor(self)
             .map(move |res, act, ctx| {

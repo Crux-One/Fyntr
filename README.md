@@ -30,6 +30,7 @@ Fyntr starts with a small memory profile right after startup (~1-2MB peak memory
 - Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
 - Adaptive quantum tuning: Optimizes quantum size via packet size statistics to reduce latency spikes and improve throughput.
 - FD limit guard: Validates file descriptor limits against max connection settings.
+- DoS guardrails: Caps request line/header sizes and per-flow queue buffering to suppress memory growth.
 
 ## Quick Start
 

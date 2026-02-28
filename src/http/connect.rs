@@ -22,7 +22,7 @@ use crate::{
         FlowId,
         connection::{BackendToClientActor, ClientToBackendActor},
     },
-    http::request::{read_request_line, send_connect_response, skip_headers},
+    http::request::{RequestReadError, read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
 };
 
@@ -78,6 +78,15 @@ impl StatusLine {
         "408",
         "Request Timeout",
     );
+    const BAD_REQUEST: StatusLine =
+        Self::new(b"HTTP/1.1 400 Bad Request\r\n\r\n", "400", "Bad Request");
+    const URI_TOO_LONG: StatusLine =
+        Self::new(b"HTTP/1.1 414 URI Too Long\r\n\r\n", "414", "URI Too Long");
+    const HEADER_FIELDS_TOO_LARGE: StatusLine = Self::new(
+        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
+        "431",
+        "Request Header Fields Too Large",
+    );
     const SERVICE_UNAVAILABLE: StatusLine = Self::new(
         b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "503",
@@ -116,19 +125,41 @@ async fn respond_with_status<T>(
     Err(ConnectFlowError::ResponseSent)
 }
 
+fn classify_input_error(err: &anyhow::Error) -> StatusLine {
+    if let Some(read_err) = err.downcast_ref::<RequestReadError>() {
+        match read_err {
+            RequestReadError::RequestLineTooLong { .. } => StatusLine::URI_TOO_LONG,
+            RequestReadError::HeaderLineTooLong { .. }
+            | RequestReadError::HeadersTooLarge { .. }
+            | RequestReadError::TooManyHeaders { .. } => StatusLine::HEADER_FIELDS_TOO_LARGE,
+            RequestReadError::InvalidEncoding => StatusLine::BAD_REQUEST,
+        }
+    } else {
+        StatusLine::BAD_REQUEST
+    }
+}
+
 async fn await_with_timeout_response<T, F>(
     flow_id: FlowId,
     client_addr: SocketAddr,
     writer: &mut OwnedWriteHalf,
     phase: &str,
-    fut: F,
+    read_op: F,
+    classify_error: fn(&anyhow::Error) -> StatusLine,
 ) -> ConnectResult<T>
 where
-    F: Future<Output = anyhow::Result<T>>,
+    F: Future<Output = Result<T, anyhow::Error>>,
 {
-    match timeout(CONNECT_HANDSHAKE_TIMEOUT, fut).await {
+    match timeout(CONNECT_HANDSHAKE_TIMEOUT, read_op).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(err)) => {
+            if err.downcast_ref::<std::io::Error>().is_some() {
+                return Err(ConnectFlowError::Fatal(err));
+            }
+            let status = classify_error(&err);
+            let detail = format!("invalid {} from {}: {}", phase, client_addr, err);
+            respond_with_status(flow_id, writer, status, StatusLogLevel::Warn, detail).await
+        }
         Err(_) => {
             let detail = format!(
                 "timed out waiting for {} from {} after {:?}",
@@ -195,26 +226,24 @@ impl ConnectState {
         match session.scheduler.send(CanAcceptConnection).await {
             Ok(false) => {
                 let detail = format!("scheduler at capacity {}", phase);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await
             }
             Ok(true) => Ok(()),
             Err(e) => {
                 let detail = format!("failed to check capacity {}: {}", phase, e);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Error,
+                        detail,
+                    )
+                    .await
             }
         }
     }
@@ -246,6 +275,7 @@ impl ConnectState {
             &mut session.client_write,
             "request line",
             read_request_line(&mut session.client_reader),
+            classify_input_error,
         )
         .await?;
 
@@ -254,14 +284,13 @@ impl ConnectState {
                 "unsupported HTTP version {} from {}",
                 request_line.version, session.client_addr
             );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::VERSION_NOT_SUPPORTED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
+            return session
+                .respond(
+                    StatusLine::VERSION_NOT_SUPPORTED,
+                    StatusLogLevel::Warn,
+                    detail,
+                )
+                .await;
         }
 
         if !request_line.is_connect_method() {
@@ -269,17 +298,23 @@ impl ConnectState {
                 "unsupported method {} from {}",
                 request_line.method, session.client_addr
             );
-            return respond_with_status(
-                session.flow_id,
-                &mut session.client_write,
-                StatusLine::METHOD_NOT_ALLOWED,
-                StatusLogLevel::Warn,
-                detail,
-            )
-            .await;
+            return session
+                .respond(StatusLine::METHOD_NOT_ALLOWED, StatusLogLevel::Warn, detail)
+                .await;
         }
 
-        let (target_host, target_port) = request_line.parse_connect_target()?;
+        let (target_host, target_port) = match request_line.parse_connect_target() {
+            Ok(target) => target,
+            Err(err) => {
+                let detail = format!(
+                    "malformed CONNECT target from {}: {}",
+                    session.client_addr, err
+                );
+                return session
+                    .respond(StatusLine::BAD_REQUEST, StatusLogLevel::Warn, detail)
+                    .await;
+            }
+        };
         info!(
             "flow{}: CONNECT {}:{}",
             session.flow_id.0, target_host, target_port
@@ -291,6 +326,7 @@ impl ConnectState {
             &mut session.client_write,
             "CONNECT headers",
             skip_headers(&mut session.client_reader),
+            classify_input_error,
         )
         .await?;
 
@@ -308,28 +344,18 @@ impl ConnectState {
                     "CONNECT {}:{} denied for {}: {}",
                     target_host, target_port, session.client_addr, reason
                 );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::FORBIDDEN,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await;
+                return session
+                    .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+                    .await;
             }
             Err(ConnectPolicyError::ResolveFailed(reason)) => {
                 let detail = format!(
                     "failed to resolve {}:{} for {}: {}",
                     target_host, target_port, session.client_addr, reason
                 );
-                return respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::BAD_GATEWAY,
-                    StatusLogLevel::Error,
-                    detail,
-                )
-                .await;
+                return session
+                    .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                    .await;
             }
         };
 
@@ -355,14 +381,9 @@ impl ConnectState {
                         "failed to connect to {}:{} after retries: {}",
                         target.host, target.port, e
                     );
-                    return respond_with_status(
-                        session.flow_id,
-                        &mut session.client_write,
-                        StatusLine::BAD_GATEWAY,
-                        StatusLogLevel::Error,
-                        detail,
-                    )
-                    .await;
+                    return session
+                        .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                        .await;
                 }
             };
 
@@ -413,14 +434,13 @@ impl ConnectState {
             }
             Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
                 let detail = format!("registration rejected - max connections ({}) reached", max);
-                respond_with_status(
-                    session.flow_id,
-                    &mut session.client_write,
-                    StatusLine::SERVICE_UNAVAILABLE,
-                    StatusLogLevel::Warn,
-                    detail,
-                )
-                .await
+                session
+                    .respond(
+                        StatusLine::SERVICE_UNAVAILABLE,
+                        StatusLogLevel::Warn,
+                        detail,
+                    )
+                    .await
             }
             Err(e) => {
                 error!(
@@ -505,6 +525,15 @@ impl ConnectSession {
             client_reader: BufReader::new(client_read),
             client_write,
         }
+    }
+
+    async fn respond<T>(
+        &mut self,
+        status: StatusLine,
+        level: StatusLogLevel,
+        detail: impl Display,
+    ) -> ConnectResult<T> {
+        respond_with_status(self.flow_id, &mut self.client_write, status, level, detail).await
     }
 }
 
@@ -700,7 +729,7 @@ mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
-        limits::max_connections_from_raw,
+        limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
     };
     use std::{future::Future, time::Duration};
@@ -778,7 +807,7 @@ mod tests {
         let response = drive_proxy(listener, scheduler, default_policy(), async move {
             let mut client = TcpStream::connect(addr).await.unwrap();
             client
-                .write_all(b"CONNECT example.com:443 HTTP/2\r\nHost: example\r\n\r\n")
+                .write_all(b"CONNECT example.invalid:443 HTTP/2\r\nHost: example\r\n\r\n")
                 .await
                 .unwrap();
             read_response(client).await
@@ -976,7 +1005,7 @@ mod tests {
             async move {
                 let mut client = TcpStream::connect(addr).await.unwrap();
                 client
-                    .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example\r\n")
+                    .write_all(b"CONNECT example.invalid:443 HTTP/1.1\r\nHost: example\r\n")
                     .await
                     .unwrap();
                 read_response(client).await
@@ -989,6 +1018,48 @@ mod tests {
         let response = response_task.await.unwrap();
 
         assert_eq!(response, b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_414_for_overlong_request_line() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let long_target = "a".repeat(MAX_REQUEST_LINE_BYTES);
+            let request = format!("CONNECT {}:443 HTTP/1.1\r\n\r\n", long_target);
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 414 URI Too Long\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_431_for_too_many_headers() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut request = String::from("CONNECT example.invalid:443 HTTP/1.1\r\n");
+            for i in 0..=MAX_HEADER_LINES {
+                request.push_str(&format!("X-Test-{}: value\r\n", i));
+            }
+            request.push_str("\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"
+        );
     }
 
     #[actix_rt::test]

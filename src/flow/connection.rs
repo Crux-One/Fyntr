@@ -86,9 +86,16 @@ impl Actor for ClientToBackendActor {
                         Ok(n) => {
                             total_read += n as u64;
                             let chunk = Bytes::copy_from_slice(&buf[..n]);
-                            if let Err(e) = queue_tx.send(Enqueue(chunk)).await {
-                                warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
-                                break;
+                            match queue_tx.send(Enqueue(chunk)).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!("flow{}: enqueue rejected: {}", flow_id.0, e);
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("flow{}: failed to enqueue chunk: {}", flow_id.0, e);
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
