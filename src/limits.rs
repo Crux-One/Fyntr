@@ -12,7 +12,7 @@ pub(crate) const MAX_HEADER_LINES: usize = 100;
 pub(crate) const MAX_RESOLVED_CONNECT_ADDRS: usize = 32;
 
 pub(crate) const MAX_QUEUE_PACKET_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_QUEUE_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_QUEUE_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_DEQUEUE_BYTES: usize = MAX_QUEUE_PACKET_BYTES;
 
 #[inline]
