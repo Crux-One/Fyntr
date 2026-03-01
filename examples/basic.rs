@@ -2,8 +2,8 @@ use fyntr::run;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
-    // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
-    env_logger::init();
+    // Optional: enable logs via RUST_LOG (e.g., RUST_LOG=info) by adding:
+    // env_logger::init();
 
     let handle = run::server()
         .bind("127.0.0.1")
