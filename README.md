@@ -30,6 +30,7 @@ Fyntr starts with a small memory profile right after startup (~1-2MB peak memory
 - Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
 - Adaptive quantum tuning: Optimizes quantum size via packet size statistics to reduce latency spikes and improve throughput.
 - FD limit guard: Validates file descriptor limits against max connection settings.
+- DoS guardrails: Caps request line/header sizes and per-flow queue buffering to suppress memory growth.
 
 ## Quick Start
 
@@ -111,15 +112,28 @@ async fn main() -> anyhow::Result<()> {
 
 ## CLI Options
 
+### Server
+
 | Option | Env var | Default | Description |
 | --- | --- | --- | --- |
-| `--bind <IP>` | `FYNTR_BIND` | `127.0.0.1` | Address to bind on. Binding to non-loopback interfaces (e.g. `0.0.0.0`) without auth can expose the proxy on the network. |
+| `--bind <ADDR>` | `FYNTR_BIND` | `127.0.0.1` | Address/hostname to bind on (e.g. `127.0.0.1`, `::1`, `localhost`, `0.0.0.0`). Supports both IPv4 and IPv6. Binding to non-loopback interfaces without auth can expose the proxy on the network. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
+### CONNECT Policy
+
+| Option | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `--no-default-allow-port` | `FYNTR_NO_DEFAULT_ALLOW_PORT` | `false` | Disable implicit `443` allowance. Only explicitly configured `--allow-port` values are permitted. |
+| `--allow-port <PORT>` | `FYNTR_ALLOW_PORT` | implicit `443` unless `--no-default-allow-port` | Allowed destination port for `CONNECT` in the range `1-65535` (repeat flag or comma-separate to add more). |
+| `--deny-cidr <CIDR>` | `FYNTR_DENY_CIDR` | Internal ranges | CIDR ranges denied for `CONNECT` destination IPs (repeat flag or comma-separate). |
+| `--allow-cidr <CIDR>` | `FYNTR_ALLOW_CIDR` | none | CIDR exceptions that are allowed even if they match denied internal ranges. |
+| `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix allowlist for `CONNECT` targets. When a domain matches, addresses blocked by deny CIDRs are filtered out rather than causing the entire connection to fail. If all resolved addresses are blocked, the connection is denied. |
+
 ## Why Fyntr?
 Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.
-The simultaneous transmission of data from these flows often causes micro-bursts that choke routers with limited capacity, particularly on consumer-grade NAT devices, which can lead to unresponsive networks due to overwhelming CPU interrupt loads.
+
+When many flows send data simultaneously, they can create short traffic spikes that overwhelm low-capacity routers, especially consumer NAT devices. This can cause CPU interrupts to be too high and make the network feel unresponsive.
 
 Rather than relying on connection pooling, Fyntr regulates the traffic itself.
 Its scheduler uses DRR to distribute sending opportunities across active flows fairly,
@@ -127,6 +141,9 @@ so packet bursts from many parallel flows get interleaved instead of letting the
 
 This smoothing reduces CPU pressure on routers during connection storms.
 This effect is most critical when scheduling overhead, rather than bandwidth, is the primary bottleneck.
+
+## Limitations
+In certain environments, upload throughput can be reduced due to DRR scheduling, depending on network conditions.
 
 ## Usage with Terraform
 

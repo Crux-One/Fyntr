@@ -1,0 +1,652 @@
+use std::{
+    collections::HashSet,
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
+};
+
+use anyhow::anyhow;
+use tokio::net::lookup_host;
+
+use crate::limits::MAX_RESOLVED_CONNECT_ADDRS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectCidr {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+impl ConnectCidr {
+    fn contains(self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4 { network, prefix }, IpAddr::V4(addr)) => {
+                let mask = ipv4_mask(prefix);
+                (u32::from(addr) & mask) == network
+            }
+            (Self::V6 { network, prefix }, IpAddr::V6(addr)) => {
+                let mask = ipv6_mask(prefix);
+                (u128::from(addr) & mask) == network
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for ConnectCidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V4 { network, prefix } => write!(f, "{}/{}", Ipv4Addr::from(*network), prefix),
+            Self::V6 { network, prefix } => write!(f, "{}/{}", Ipv6Addr::from(*network), prefix),
+        }
+    }
+}
+
+impl FromStr for ConnectCidr {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        let (ip_raw, prefix_raw) = trimmed
+            .split_once('/')
+            .ok_or_else(|| anyhow!("invalid CIDR '{}': expected ip/prefix", value))?;
+        let prefix = prefix_raw
+            .parse::<u8>()
+            .map_err(|_| anyhow!("invalid CIDR '{}': invalid prefix '{}'", value, prefix_raw))?;
+        let ip = ip_raw
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow!("invalid CIDR '{}': invalid IP '{}'", value, ip_raw))?;
+
+        match ip {
+            IpAddr::V4(addr) => {
+                if prefix > 32 {
+                    return Err(anyhow!(
+                        "invalid CIDR '{}': IPv4 prefix must be <= 32",
+                        value
+                    ));
+                }
+                let mask = ipv4_mask(prefix);
+                Ok(Self::V4 {
+                    network: u32::from(addr) & mask,
+                    prefix,
+                })
+            }
+            IpAddr::V6(addr) => {
+                if prefix > 128 {
+                    return Err(anyhow!(
+                        "invalid CIDR '{}': IPv6 prefix must be <= 128",
+                        value
+                    ));
+                }
+                let mask = ipv6_mask(prefix);
+                Ok(Self::V6 {
+                    network: u128::from(addr) & mask,
+                    prefix,
+                })
+            }
+        }
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectPolicyConfig {
+    pub(crate) allowed_ports: Vec<u16>,
+    pub(crate) include_default_allow_port: bool,
+    pub(crate) deny_cidrs: Vec<ConnectCidr>,
+    pub(crate) allow_cidrs: Vec<ConnectCidr>,
+    pub(crate) allow_domains: Vec<String>,
+}
+
+impl Default for ConnectPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_ports: Vec::new(),
+            include_default_allow_port: true,
+            deny_cidrs: default_denied_cidrs(),
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectPolicy {
+    allowed_ports: HashSet<u16>,
+    deny_cidrs: Vec<ConnectCidr>,
+    allow_cidrs: Vec<ConnectCidr>,
+    allow_domains: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedConnectTarget {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) addrs: Vec<SocketAddr>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ConnectPolicyError {
+    Denied(String),
+    ResolveFailed(String),
+}
+
+impl ConnectPolicy {
+    pub(crate) fn from_config(config: ConnectPolicyConfig) -> Self {
+        let mut allowed_ports: HashSet<u16> = config
+            .allowed_ports
+            .into_iter()
+            .filter(|port| *port != 0)
+            .collect();
+        if config.include_default_allow_port {
+            allowed_ports.insert(443);
+        }
+
+        let allow_domains = config
+            .allow_domains
+            .into_iter()
+            .map(|domain| normalize_domain(&domain))
+            .filter(|domain| !domain.is_empty())
+            .collect();
+
+        Self {
+            allowed_ports,
+            deny_cidrs: config.deny_cidrs,
+            allow_cidrs: config.allow_cidrs,
+            allow_domains,
+        }
+    }
+
+    pub(crate) async fn resolve_and_authorize(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<ResolvedConnectTarget, ConnectPolicyError> {
+        if !self.allowed_ports.contains(&port) {
+            return Err(ConnectPolicyError::Denied(
+                self.disallowed_port_reason(port),
+            ));
+        }
+
+        let addrs = resolve_host(host, port)
+            .await
+            .map_err(|err| ConnectPolicyError::ResolveFailed(err.to_string()))?;
+        if addrs.is_empty() {
+            return Err(ConnectPolicyError::ResolveFailed(format!(
+                "host {} resolved successfully but returned an empty address list",
+                host
+            )));
+        }
+
+        let domain_allowed = self.is_domain_allowed(host);
+        let mut authorized_addrs = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let canonical_addr = canonicalize_socket_addr(addr);
+            let ip = canonical_addr.ip();
+            if self.is_ip_allowed(ip) {
+                authorized_addrs.push(canonical_addr);
+                continue;
+            }
+
+            if let Some(cidr) = self
+                .deny_cidrs
+                .iter()
+                .copied()
+                .find(|cidr| cidr.contains(ip))
+            {
+                if domain_allowed {
+                    continue;
+                }
+                return Err(ConnectPolicyError::Denied(format!(
+                    "resolved address {} is blocked by {}",
+                    ip, cidr
+                )));
+            }
+
+            authorized_addrs.push(canonical_addr);
+        }
+
+        if !authorized_addrs.is_empty() {
+            sort_and_dedup_addrs(&mut authorized_addrs);
+        }
+
+        if authorized_addrs.is_empty() {
+            return Err(ConnectPolicyError::Denied(format!(
+                "all resolved addresses for host {} are blocked by deny CIDRs",
+                host
+            )));
+        }
+
+        Ok(ResolvedConnectTarget {
+            host: host.to_string(),
+            port,
+            addrs: authorized_addrs,
+        })
+    }
+
+    fn is_ip_allowed(&self, ip: IpAddr) -> bool {
+        self.allow_cidrs
+            .iter()
+            .copied()
+            .any(|cidr| cidr.contains(ip))
+    }
+
+    fn is_domain_allowed(&self, host: &str) -> bool {
+        let host = normalize_domain(host);
+        if host.is_empty() {
+            return false;
+        }
+        self.allow_domains.iter().any(|allowed| {
+            host == *allowed
+                || (host.len() > allowed.len()
+                    && host.ends_with(allowed)
+                    && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
+        })
+    }
+
+    fn disallowed_port_reason(&self, port: u16) -> String {
+        if self.allowed_ports.is_empty() {
+            return format!(
+                "port {} is not allowed: no CONNECT ports are enabled. Configure one or more allowed ports with --allow-port (or FYNTR_ALLOW_PORT), or remove --no-default-allow-port to restore implicit 443.",
+                port
+            );
+        }
+
+        let mut allowed_ports: Vec<u16> = self.allowed_ports.iter().copied().collect();
+        allowed_ports.sort_unstable();
+        format!(
+            "port {} is not in allow list; allowed ports are: {}",
+            port,
+            allowed_ports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn normalize_domain(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
+}
+
+fn default_denied_cidrs() -> Vec<ConnectCidr> {
+    // Default blocklist to reduce SSRF blast radius.
+    // These ranges cover loopback, RFC1918 private space, link-local, and unspecified addresses.
+    // Use allow_cidrs/allow_domains for explicit policy exceptions when needed.
+    [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "0.0.0.0/8",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::1/128",
+        "::/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    ]
+    .iter()
+    .map(|value| value.parse().expect("default CIDR must parse"))
+    .collect()
+}
+
+async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let resolved = lookup_host((host, port)).await?;
+    collect_resolved_addrs_with_limit(host, resolved, MAX_RESOLVED_CONNECT_ADDRS)
+}
+
+fn collect_resolved_addrs_with_limit(
+    host: &str,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    max_addrs: usize,
+) -> io::Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+
+    for addr in resolved {
+        let canonical = canonicalize_socket_addr(addr);
+        if addrs.contains(&canonical) {
+            continue;
+        }
+
+        addrs.push(canonical);
+        if addrs.len() > max_addrs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "host {} resolved to more than {} unique addresses",
+                    host, max_addrs
+                ),
+            ));
+        }
+    }
+
+    addrs.sort_unstable();
+    Ok(addrs)
+}
+
+fn sort_and_dedup_addrs(addrs: &mut Vec<SocketAddr>) {
+    addrs.sort_unstable();
+    addrs.dedup();
+}
+
+impl fmt::Display for ConnectPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Denied(reason) => write!(f, "connect target denied: {}", reason),
+            Self::ResolveFailed(reason) => write!(f, "connect target resolve failed: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for ConnectPolicyError {}
+
+impl From<ConnectPolicyError> for io::Error {
+    fn from(value: ConnectPolicyError) -> Self {
+        match value {
+            ConnectPolicyError::Denied(reason) => {
+                io::Error::new(io::ErrorKind::PermissionDenied, reason)
+            }
+            ConnectPolicyError::ResolveFailed(reason) => io::Error::other(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cidr_contains_ipv4() {
+        let cidr: ConnectCidr = "192.168.1.0/24".parse().unwrap();
+        assert!(cidr.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+        assert!(!cidr.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 5))));
+    }
+
+    #[test]
+    fn cidr_contains_ipv6() {
+        let cidr: ConnectCidr = "2001:db8::/32".parse().unwrap();
+        assert!(cidr.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        assert!(!cidr.contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
+    }
+
+    #[test]
+    fn sort_and_dedup_addrs_removes_duplicates_and_sorts() {
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 80);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443);
+        let addr3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 80);
+
+        let mut addrs = vec![addr1, addr2, addr3, addr2];
+        sort_and_dedup_addrs(&mut addrs);
+
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], addr2);
+        assert_eq!(addrs[1], addr1);
+    }
+
+    #[test]
+    fn collect_resolved_addrs_with_limit_rejects_excessive_unique_addresses() {
+        let addrs = (1..=4)
+            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)), 443))
+            .collect::<Vec<_>>();
+        let err = collect_resolved_addrs_with_limit("example.com", addrs, 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("more than 3 unique addresses"));
+    }
+
+    #[test]
+    fn collect_resolved_addrs_with_limit_canonicalizes_and_dedups() {
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V6("::ffff:203.0.113.10".parse().unwrap()), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443),
+        ];
+
+        let collected = collect_resolved_addrs_with_limit("example.com", addrs, 3).unwrap();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(
+            collected[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443)
+        );
+        assert_eq!(
+            collected[1],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_private_ipv4_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("127.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_mapped_ipv6_loopback_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_ipv4_mapped_ipv6_address_in_authorized_results() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        let result = policy
+            .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .await
+            .unwrap();
+
+        assert_eq!(result.addrs.len(), 1);
+        assert_eq!(
+            result.addrs[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_multicast_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("224.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv4_reserved_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("240.0.0.1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn blocks_ipv6_multicast_by_default() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("ff02::1", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn allows_private_ipv4_when_allow_cidr_matches() {
+        let mut config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            ..ConnectPolicyConfig::default()
+        };
+        config.allow_cidrs.push("127.0.0.0/8".parse().unwrap());
+        let policy = ConnectPolicy::from_config(config);
+        let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocks_disallowed_port() {
+        let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
+        let err = policy
+            .resolve_and_authorize("example.com", 22)
+            .await
+            .unwrap_err();
+        let ConnectPolicyError::Denied(reason) = err else {
+            panic!("expected Denied error");
+        };
+        assert!(reason.contains("port 22 is not in allow list; allowed ports are: 443"));
+        assert!(!reason.contains("no CONNECT ports are enabled"));
+    }
+
+    #[tokio::test]
+    async fn no_default_allow_port_disables_443_implicit_allow() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: false,
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+        let err = policy
+            .resolve_and_authorize("example.com", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectPolicyError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_allow_port_list_returns_actionable_denial_message() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: false,
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        let err = policy
+            .resolve_and_authorize("example.com", 443)
+            .await
+            .unwrap_err();
+
+        let ConnectPolicyError::Denied(reason) = err else {
+            panic!("expected Denied error");
+        };
+        assert!(reason.contains("no CONNECT ports are enabled"));
+        assert!(reason.contains("--allow-port"));
+        assert!(reason.contains("--no-default-allow-port"));
+        assert!(reason.contains("restore implicit 443"));
+    }
+
+    #[tokio::test]
+    async fn include_default_allow_port_enables_443_implicit_allow() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+        let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn port_zero_in_allow_list_is_ignored() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: false,
+            allowed_ports: vec![0, 443],
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        let allowed = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        assert!(allowed.is_ok());
+
+        let denied = policy.resolve_and_authorize("127.0.0.1", 0).await;
+        assert!(matches!(denied, Err(ConnectPolicyError::Denied(_))));
+    }
+
+    #[test]
+    fn include_default_allow_port_keeps_443_with_explicit_allow_ports() {
+        let config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            allowed_ports: vec![0, 8443],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        assert!(policy.allowed_ports.contains(&443));
+        assert!(policy.allowed_ports.contains(&8443));
+        assert_eq!(policy.allowed_ports.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn allow_domain_does_not_override_deny_cidr_when_all_addresses_are_denied() {
+        let mut config = ConnectPolicyConfig {
+            include_default_allow_port: true,
+            ..ConnectPolicyConfig::default()
+        };
+        config.allow_domains.push("localhost".to_string());
+        let policy = ConnectPolicy::from_config(config);
+        let result = policy.resolve_and_authorize("localhost", 443).await;
+        assert!(matches!(result, Err(ConnectPolicyError::Denied(_))));
+    }
+
+    #[test]
+    fn allow_domain_with_leading_dot_matches_suffix() {
+        let config = ConnectPolicyConfig {
+            allow_domains: vec![".example.com".to_string()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+        assert!(policy.is_domain_allowed("api.example.com"));
+        assert!(policy.is_domain_allowed("example.com"));
+    }
+}

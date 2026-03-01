@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::{error::Error, fmt};
 
 use actix::prelude::*;
 use bytes::Bytes;
@@ -6,11 +7,49 @@ use bytes::Bytes;
 use crate::{
     actors::scheduler::{FlowReady, Scheduler},
     flow::FlowId,
+    limits::{MAX_DEQUEUE_BYTES, MAX_QUEUE_BUFFERED_BYTES, MAX_QUEUE_PACKET_BYTES},
 };
 
 #[derive(Message)]
-#[rtype(result = "()")]
+#[rtype(result = "Result<(), EnqueueError>")]
 pub(crate) struct Enqueue(pub Bytes);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueError {
+    PacketTooLarge {
+        packet_bytes: usize,
+        max_packet_bytes: usize,
+    },
+    QueueBufferExceeded {
+        attempted_total: usize,
+        max_buffered_bytes: usize,
+    },
+}
+
+impl fmt::Display for EnqueueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PacketTooLarge {
+                packet_bytes,
+                max_packet_bytes,
+            } => write!(
+                f,
+                "packet size {} exceeds max packet size {}",
+                packet_bytes, max_packet_bytes
+            ),
+            Self::QueueBufferExceeded {
+                attempted_total,
+                max_buffered_bytes,
+            } => write!(
+                f,
+                "queue buffered bytes {} exceeds limit {}",
+                attempted_total, max_buffered_bytes
+            ),
+        }
+    }
+}
+
+impl Error for EnqueueError {}
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -45,13 +84,32 @@ pub(crate) struct DequeueResult {
 #[derive(Default)]
 pub(crate) struct QueueState {
     buf: VecDeque<Bytes>,
+    buffered_bytes: usize,
     deficit: usize,
     closing: bool,
 }
 
 impl QueueState {
-    pub(crate) fn enqueue(&mut self, data: Bytes) {
+    pub(crate) fn enqueue(&mut self, data: Bytes) -> Result<(), EnqueueError> {
+        let packet_len = data.len();
+        if packet_len > MAX_QUEUE_PACKET_BYTES {
+            return Err(EnqueueError::PacketTooLarge {
+                packet_bytes: packet_len,
+                max_packet_bytes: MAX_QUEUE_PACKET_BYTES,
+            });
+        }
+
+        let attempted_total = self.buffered_bytes.saturating_add(packet_len);
+        if attempted_total > MAX_QUEUE_BUFFERED_BYTES {
+            return Err(EnqueueError::QueueBufferExceeded {
+                attempted_total,
+                max_buffered_bytes: MAX_QUEUE_BUFFERED_BYTES,
+            });
+        }
+
         self.buf.push_back(data);
+        self.buffered_bytes = attempted_total;
+        Ok(())
     }
 
     pub(crate) fn add_quantum(&mut self, quantum: usize) {
@@ -63,6 +121,7 @@ impl QueueState {
             if front.len() <= self.deficit && front.len() <= max_bytes {
                 let pkt = self.buf.pop_front().unwrap();
                 self.deficit -= pkt.len();
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(pkt.len());
                 let ready_for_more = self
                     .buf
                     .front()
@@ -96,6 +155,7 @@ impl QueueState {
 
     pub(crate) fn stop_now(&mut self) {
         self.buf.clear();
+        self.buffered_bytes = 0;
     }
 }
 
@@ -138,9 +198,7 @@ impl QueueActor {
             return;
         };
 
-        // Scheduler currently dequeues with usize::MAX as the byte limit, so
-        // we mirror that constraint here when deciding whether to notify.
-        if self.state.has_ready_packet(usize::MAX) {
+        if self.state.has_ready_packet(MAX_DEQUEUE_BYTES) {
             notifier.scheduler.do_send(FlowReady {
                 flow_id: notifier.flow_id,
             });
@@ -158,11 +216,14 @@ pub(crate) struct BindScheduler {
 
 // Enqueue
 impl Handler<Enqueue> for QueueActor {
-    type Result = ();
+    type Result = MessageResult<Enqueue>;
 
     fn handle(&mut self, msg: Enqueue, _ctx: &mut Self::Context) -> Self::Result {
-        self.state.enqueue(msg.0);
-        self.maybe_notify_ready();
+        let result = self.state.enqueue(msg.0);
+        if result.is_ok() {
+            self.maybe_notify_ready();
+        }
+        MessageResult(result)
     }
 }
 
@@ -372,6 +433,39 @@ mod tests {
             })
             .await;
         assert_actor_stopped_or_empty(res);
+    }
+
+    #[test]
+    fn enqueue_rejects_oversized_packet() {
+        let mut state = QueueState::default();
+        let data = Bytes::from(vec![0u8; MAX_QUEUE_PACKET_BYTES + 1]);
+        let result = state.enqueue(data);
+        assert_eq!(
+            result,
+            Err(EnqueueError::PacketTooLarge {
+                packet_bytes: MAX_QUEUE_PACKET_BYTES + 1,
+                max_packet_bytes: MAX_QUEUE_PACKET_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn enqueue_rejects_when_buffer_limit_exceeded() {
+        let mut state = QueueState::default();
+        let chunk = Bytes::from(vec![0u8; MAX_QUEUE_PACKET_BYTES]);
+        let full_chunks = MAX_QUEUE_BUFFERED_BYTES / MAX_QUEUE_PACKET_BYTES;
+        for _ in 0..full_chunks {
+            assert!(state.enqueue(chunk.clone()).is_ok());
+        }
+
+        let result = state.enqueue(Bytes::from_static(b"x"));
+        assert_eq!(
+            result,
+            Err(EnqueueError::QueueBufferExceeded {
+                attempted_total: MAX_QUEUE_BUFFERED_BYTES + 1,
+                max_buffered_bytes: MAX_QUEUE_BUFFERED_BYTES,
+            })
+        );
     }
 
     // Helper to assert that the actor is stopped or the queue is empty.
