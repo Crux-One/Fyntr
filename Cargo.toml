@@ -6,6 +6,8 @@ description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
 repository = "https://github.com/Crux-One/Fyntr"
 readme = "README.md"
+categories = ["network-programming", "command-line-utilities"]
+keywords = ["forward-proxy", "http-connect", "traffic-shaping", "networking"]
 
 [[bin]]
 name = "fyntr"
@@ -13,12 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 actix = "0.13"
-actix-rt = "2"
-tokio = { version = "1.49", features = ["full"] }
-anyhow = "1"
+actix-rt = "2.11.0"
+tokio = { version = "1.50.0", features = ["full"] }
+anyhow = "1.0.102"
 bytes = "1.11.1"
 clap = { version = "4.5.60", features = ["derive", "env"] }
-env_logger = "0.11"
+env_logger = "0.11.9"
 log = "0.4.29"
 
 [target.'cfg(unix)'.dependencies]
