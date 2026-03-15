@@ -21,16 +21,15 @@
 </div>
 
 ## About
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy that smooths bursts of outbound TLS traffic, stabilizing connections on constrained networks.
-No server-side changes required, no auth, no inspection.
-
-Fyntr starts with a small memory profile right after startup (~1-2MB peak memory footprint on macOS via `/usr/bin/time -l`, and ~1MB private memory on Windows) and uses an actor-driven scheduler to relay traffic transparently, making bursty workloads more stable and reliable without terminating TLS.
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy for constrained networks that keeps them responsive under bursty outbound TLS traffic.
+No server-side configuration, no inspection, and low baseline memory use.
 
 ## Internals
-- Traffic shaping: Prevents burst congestion by interleaving packets via Deficit Round-Robin (DRR) scheduling.
-- Adaptive quantum tuning: Optimizes quantum size via packet size statistics to reduce latency spikes and improve throughput.
-- FD limit guard: Validates file descriptor limits against max connection settings.
-- DoS guardrails: Caps request line/header sizes and per-flow queue buffering to suppress memory growth.
+- Transparent CONNECT relay: Forwards TLS traffic E2E without termination or inspection.
+- Traffic shaping: Interleaves packets across active flows using Deficit Round-Robin (DRR).
+- Adaptive quantum tuning: Adjusts DRR quantum from observed packet-size statistics.
+- FD limit guard: Checks file descriptor limits against max connection settings at startup.
+- DoS guardrails: Caps request line/header sizes and per-flow queue buffering.
 
 ## Quick Start
 
@@ -49,26 +48,15 @@ Fyntr starts with a small memory profile right after startup (~1-2MB peak memory
     cargo run --release
     ```
 
-    Override defaults via CLI flags or env vars:
-
-    ```bash
-    cargo run --release -- --port 8080 --max-connections 512
-
-    # Or use environment variables
-    FYNTR_PORT=8080 FYNTR_MAX_CONNECTIONS=512 cargo run --release
-    ```
-
-    By default, Fyntr caps concurrent connections at 1000 (set `0` for unlimited).
-
 2. Configure Your Environment:
 
     Export the following environment variables in a separate terminal.
 
     ```bash
-    export HTTPS_PROXY=http://127.0.0.1:9999 
+    export HTTPS_PROXY=http://127.0.0.1:9999
     ```
 
-    This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more. 
+    This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more.
 
 3. Verify It Works:
 
@@ -77,6 +65,8 @@ Fyntr starts with a small memory profile right after startup (~1-2MB peak memory
     ```bash
     curl https://ifconfig.me
     ```
+
+    If logging is enabled, you should also see a log entry for the `CONNECT` target of the `curl` request.
 
 ## Library Usage
 
@@ -87,8 +77,9 @@ use fyntr::run;
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
-    // Optional: enables logs via RUST_LOG (e.g., RUST_LOG=info).
-    env_logger::init();
+    // Optional: to enable logging, set RUST_LOG (for example, RUST_LOG=info)
+    // and uncomment the line below to initialize env_logger:
+    // env_logger::init();
 
     let handle = run::server()
         .bind("127.0.0.1")
@@ -109,6 +100,34 @@ async fn main() -> anyhow::Result<()> {
 [10]:https://docs.rs/crate/actix-rt/latest
 [11]:https://docs.rs/crate/anyhow/latest
 [12]:https://docs.rs/crate/env_logger/latest
+
+## Configuration Examples
+
+These examples assume you installed the `fyntr` binary.
+If you are running from source, replace `fyntr ...` with `cargo run --release -- ...`.
+
+Set a higher connection limit:
+
+```bash
+# CLI flags
+fyntr --max-connections 2048
+
+# Equivalent via environment variables
+FYNTR_MAX_CONNECTIONS=2048 \
+fyntr
+```
+
+Allow only explicit `CONNECT` ports:
+
+```bash
+# CLI flags
+fyntr --no-default-allow-port --allow-port 8443
+
+# Equivalent via environment variables
+FYNTR_NO_DEFAULT_ALLOW_PORT=true \
+FYNTR_ALLOW_PORT=8443 \
+fyntr
+```
 
 ## CLI Options
 
@@ -131,24 +150,27 @@ async fn main() -> anyhow::Result<()> {
 | `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix allowlist for `CONNECT` targets. When a domain matches, addresses blocked by deny CIDRs are filtered out rather than causing the entire connection to fail. If all resolved addresses are blocked, the connection is denied. |
 
 ## Why Fyntr?
-Cloud automation tools such as Terraform spawn bursts of TCP connections that rapidly open and close.
+Cloud automation tools such as Terraform can spawn bursts of TCP connections that rapidly open and close, especially when managing many resources in parallel.
 
-When many flows send data simultaneously, they can create short traffic spikes that overwhelm low-capacity routers, especially consumer NAT devices. This can cause CPU interrupts to be too high and make the network feel unresponsive.
+When many flows send data simultaneously, they can create short traffic spikes that overwhelm low-capacity routers, particularly consumer NAT devices. This can push CPU interrupt load too high and make the network feel unresponsive.
 
 Rather than relying on connection pooling, Fyntr regulates the traffic itself.
+
 Its scheduler uses DRR to distribute sending opportunities across active flows fairly,
-so packet bursts from many parallel flows get interleaved instead of letting them fire all at once.
+so bursts from many parallel flows get interleaved as queued chunks instead of firing all at once.
 
 This smoothing reduces CPU pressure on routers during connection storms.
-This effect is most critical when scheduling overhead, rather than bandwidth, is the primary bottleneck.
+This matters most when scheduling overhead, rather than bandwidth, is the primary bottleneck.
 
 ## Limitations
-In certain environments, upload throughput can be reduced due to DRR scheduling, depending on network conditions.
+1. In certain environments, DRR scheduling can reduce upload throughput, especially on low-spec hardware, as a trade-off for more stable responsiveness.
+2. Currently, Fyntr supports only HTTP CONNECT tunneling (commonly used for HTTPS) and does not support plain HTTP proxying.
+3. Fyntr has no built-in authentication. Exposing a public bind address can allow unauthorized proxy use.
 
 ## Usage with Terraform
 
 ### Example: AWS Provider
-    
+
 ```bash
 # Set environment variables
 export HTTPS_PROXY=http://127.0.0.1:9999
