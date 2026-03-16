@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, net::Ipv6Addr};
 
 use anyhow::{Result, anyhow};
 use tokio::{
@@ -113,26 +113,42 @@ impl RequestLine {
     }
 
     /// Extracts the host and port from the CONNECT target.
-    /// Example: "api.aws.amazon.com:443" -> ("api.aws.amazon.com", 443)
-    /// Note: IPv6 bracket form (e.g., "[2001:db8::1]:443") is not supported.
+    /// Examples:
+    /// "api.aws.amazon.com:443" -> ("api.aws.amazon.com", 443)
+    /// "[2001:db8::1]:443" -> ("2001:db8::1", 443)
     pub(crate) fn parse_connect_target(&self) -> Result<(String, u16)> {
         if !self.is_connect_method() {
             return Err(anyhow!("Not a CONNECT request"));
         }
 
-        let (host, port) = self
-            .target
-            .split_once(':')
+        parse_connect_authority(&self.target)
+    }
+}
+
+fn parse_connect_authority(target: &str) -> Result<(String, u16)> {
+    if let Some(target) = target.strip_prefix('[') {
+        let (host, remainder) = target
+            .split_once(']')
             .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
-        let host = host.trim();
-        if host.is_empty() || host.chars().all(|ch| ch == '[' || ch == ']') {
+        if host.is_empty() || host.parse::<Ipv6Addr>().is_err() {
             return Err(anyhow!("Invalid CONNECT target"));
         }
-        let host = host.to_string();
+        let port = remainder
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
         let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
-
-        Ok((host, port))
+        return Ok((host.to_string(), port));
     }
+
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
+    if host.is_empty() || host.contains(':') {
+        return Err(anyhow!("Invalid CONNECT target"));
+    }
+    let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
+
+    Ok((host.to_string(), port))
 }
 
 /// Reads the first line (request line) of an HTTP request from the given BufReader.
@@ -249,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_connect_target_bracketed_ipv6() {
+        let line = "CONNECT [2001:db8::1]:443 HTTP/1.1";
+        let req = RequestLine::parse(line).unwrap();
+        let (host, port) = req.parse_connect_target().unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
     fn test_parse_connect_target_non_connect() {
         let req = RequestLine::parse("GET / HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
@@ -277,6 +302,27 @@ mod tests {
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid port"));
         assert!(!err.to_string().contains("not-a-port"));
+    }
+
+    #[test]
+    fn test_parse_connect_target_rejects_unbracketed_ipv6() {
+        let req = RequestLine::parse("CONNECT 2001:db8::1:443 HTTP/1.1").unwrap();
+        let err = req.parse_connect_target().unwrap_err();
+        assert!(err.to_string().contains("Invalid CONNECT target"));
+    }
+
+    #[test]
+    fn test_parse_connect_target_rejects_missing_bracket_separator() {
+        let req = RequestLine::parse("CONNECT [2001:db8::1]443 HTTP/1.1").unwrap();
+        let err = req.parse_connect_target().unwrap_err();
+        assert!(err.to_string().contains("Invalid CONNECT target"));
+    }
+
+    #[test]
+    fn test_parse_connect_target_rejects_bracketed_hostname() {
+        let req = RequestLine::parse("CONNECT [example.invalid]:443 HTTP/1.1").unwrap();
+        let err = req.parse_connect_target().unwrap_err();
+        assert!(err.to_string().contains("Invalid CONNECT target"));
     }
 
     #[test]

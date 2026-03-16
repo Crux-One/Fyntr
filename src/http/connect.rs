@@ -177,6 +177,14 @@ where
     }
 }
 
+fn format_connect_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
 struct ConnectSession {
     flow_id: FlowId,
     client_addr: SocketAddr,
@@ -315,10 +323,8 @@ impl ConnectState {
                     .await;
             }
         };
-        info!(
-            "flow{}: CONNECT {}:{}",
-            session.flow_id.0, target_host, target_port
-        );
+        let target_authority = format_connect_authority(&target_host, target_port);
+        info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
 
         await_with_timeout_response(
             session.flow_id,
@@ -341,8 +347,8 @@ impl ConnectState {
             Ok(target) => target,
             Err(ConnectPolicyError::Denied(reason)) => {
                 let detail = format!(
-                    "CONNECT {}:{} denied for {}: {}",
-                    target_host, target_port, session.client_addr, reason
+                    "CONNECT {} denied for {}: {}",
+                    target_authority, session.client_addr, reason
                 );
                 return session
                     .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
@@ -350,8 +356,8 @@ impl ConnectState {
             }
             Err(ConnectPolicyError::ResolveFailed(reason)) => {
                 let detail = format!(
-                    "failed to resolve {}:{} for {}: {}",
-                    target_host, target_port, session.client_addr, reason
+                    "failed to resolve {} for {}: {}",
+                    target_authority, session.client_addr, reason
                 );
                 return session
                     .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
@@ -373,13 +379,14 @@ impl ConnectState {
         // `Register` is the authoritative gatekeeper for enforcing the hard limit.
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
+        let target_authority = format_connect_authority(&target.host, target.port);
         let (backend_stream, connected_addr) =
             match connect_to_any_with_backoff(session.flow_id, &target.addrs).await {
                 Ok(result) => result,
                 Err(e) => {
                     let detail = format!(
-                        "failed to connect to {}:{} after retries: {}",
-                        target.host, target.port, e
+                        "failed to connect to {} after retries: {}",
+                        target_authority, e
                     );
                     return session
                         .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
@@ -392,8 +399,8 @@ impl ConnectState {
             .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
 
         info!(
-            "flow{}: connected to {}:{} via {}",
-            session.flow_id.0, target.host, target.port, connected_addr
+            "flow{}: connected to {} via {}",
+            session.flow_id.0, target_authority, connected_addr
         );
 
         let (backend_read, backend_write) = backend_stream.into_split();
