@@ -58,15 +58,15 @@ No server-side configuration, no inspection, and low baseline memory use.
 
     This configuration affects not only `aws-cli` but also various tools that use `libcurl`, including `git`, `brew`, `wget`, and more.
 
-3. Verify It Works:
+3. Verify the proxy:
 
-    You can test the connection with a simple `curl` command.
+    Send an `HTTPS` request through the proxy and confirm that it succeeds:
 
     ```bash
-    curl https://ifconfig.me
+    curl https://example.com
     ```
 
-    If logging is enabled, you should also see a log entry for the `CONNECT` target of the `curl` request.
+    If logging is enabled, you should also see a log entry showing the `CONNECT` target for that request.
 
 ## Library Usage
 
@@ -100,6 +100,21 @@ async fn main() -> anyhow::Result<()> {
 [10]:https://docs.rs/crate/actix-rt/latest
 [11]:https://docs.rs/crate/anyhow/latest
 [12]:https://docs.rs/crate/env_logger/latest
+
+## Usage with Terraform
+
+### Example: AWS Provider
+
+```bash
+# Set environment variables
+export HTTPS_PROXY=http://127.0.0.1:9999
+
+# Standard usage
+terraform apply
+
+# Or use aws-vault wrapper
+aws-vault exec my-profile -- terraform apply
+```
 
 ## Configuration Examples
 
@@ -166,18 +181,3 @@ This matters most when scheduling overhead, rather than bandwidth, is the primar
 1. In certain environments, DRR scheduling can reduce upload throughput, especially on low-spec hardware, as a trade-off for more stable responsiveness.
 2. Currently, Fyntr supports only HTTP CONNECT tunneling (commonly used for HTTPS) and does not support plain HTTP proxying.
 3. Fyntr has no built-in authentication. Exposing a public bind address can allow unauthorized proxy use.
-
-## Usage with Terraform
-
-### Example: AWS Provider
-
-```bash
-# Set environment variables
-export HTTPS_PROXY=http://127.0.0.1:9999
-
-# Standard usage
-terraform apply
-
-# Or use aws-vault wrapper
-aws-vault exec my-profile -- terraform apply
-```
