@@ -1,0 +1,23 @@
+name: Betterleaks Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, develop]
+
+jobs:
+  scan:
+    runs-on: ubuntu-slim
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Betterleaks
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ghcr.io/betterleaks/betterleaks:latest \
+            git .
