@@ -7,6 +7,7 @@ on:
 
 jobs:
   scan:
+    name: Run Betterleaks scan
     runs-on: ubuntu-latest
 
     steps:
@@ -17,6 +18,9 @@ jobs:
       - name: Betterleaks
         run: |
           docker run --rm \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/work \
             -v "$PWD:/work" \
             -w /work \
             ghcr.io/betterleaks/betterleaks:latest \
