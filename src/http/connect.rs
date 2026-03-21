@@ -1,4 +1,4 @@
-use std::{fmt::Display, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -107,7 +107,7 @@ async fn respond_with_status<T>(
     writer: &mut OwnedWriteHalf,
     status: StatusLine,
     level: StatusLogLevel,
-    detail: impl Display,
+    detail: impl fmt::Display,
 ) -> ConnectResult<T> {
     match level {
         StatusLogLevel::Warn => warn!(
@@ -177,12 +177,23 @@ where
     }
 }
 
-fn format_connect_authority(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{}]:{}", host, port)
-    } else {
-        format!("{}:{}", host, port)
+struct ConnectAuthority<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+impl fmt::Display for ConnectAuthority<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
+}
+
+fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
+    ConnectAuthority { host, port }
 }
 
 struct ConnectSession {
@@ -538,7 +549,7 @@ impl ConnectSession {
         &mut self,
         status: StatusLine,
         level: StatusLogLevel,
-        detail: impl Display,
+        detail: impl fmt::Display,
     ) -> ConnectResult<T> {
         respond_with_status(self.flow_id, &mut self.client_write, status, level, detail).await
     }
