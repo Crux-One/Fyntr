@@ -23,5 +23,5 @@ jobs:
             -e GIT_CONFIG_VALUE_0=/work \
             -v "$PWD:/work" \
             -w /work \
-            ghcr.io/betterleaks/betterleaks:latest \
+            ghcr.io/betterleaks/betterleaks:v1.1.1 \
             git .
