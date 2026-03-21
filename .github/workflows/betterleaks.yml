@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, develop]
 
+permissions:
+  contents: read
+
 jobs:
   scan:
     name: Run Betterleaks scan
