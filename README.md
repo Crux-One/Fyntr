@@ -13,6 +13,7 @@
   <p>
     A minimal forward proxy to tame bursty outbound traffic.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/Crux-One/Fyntr/ci.yml?logo=githubactions&style=for-the-badge)](https://github.com/Crux-One/Fyntr/actions/workflows/ci.yml)
 [![GitHub License](https://img.shields.io/github/license/Crux-One/Fyntr?logo=github&style=for-the-badge)](https://github.com/Crux-One/Fyntr)
 [![Release Version](https://img.shields.io/github/v/release/Crux-One/Fyntr?include_prereleases&logo=github&style=for-the-badge)](https://github.com/Crux-One/Fyntr/releases/latest)
 [![Crates.io Version](https://img.shields.io/crates/v/fyntr?style=for-the-badge&logo=rust&color=yellow)](https://crates.io/crates/fyntr)
