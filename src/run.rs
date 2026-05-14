@@ -887,13 +887,23 @@ mod tests {
         let listen_addr = handle.listen_addr();
         let _held_pending_connection = TcpStream::connect(listen_addr).await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let mut rejected = TcpStream::connect(listen_addr).await.unwrap();
-        let mut response = Vec::new();
-        rejected.read_to_end(&mut response).await.unwrap();
-
-        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let mut rejected = TcpStream::connect(listen_addr).await.unwrap();
+            let mut response = Vec::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                rejected.read_to_end(&mut response),
+            )
+            .await
+            {
+                Ok(Ok(_)) if response == b"HTTP/1.1 503 Service Unavailable\r\n\r\n" => break,
+                Ok(Ok(_)) => panic!("unexpected rejection response: {:?}", response),
+                Ok(Err(err)) => panic!("failed to read rejection response: {}", err),
+                Err(_) if tokio::time::Instant::now() < deadline => continue,
+                Err(_) => panic!("timed out waiting for pending connection rejection"),
+            }
+        }
 
         handle.shutdown().await.expect("shutdown");
     }
