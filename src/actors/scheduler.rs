@@ -370,24 +370,21 @@ impl Scheduler {
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
         let pending = self.pending_connection_tasks;
-        let open_fds = open_fd_count_display();
         match self.max_connections() {
             Some(limit) => info!(
-                "flow{}: {} (connections: {}/{}, pending_connect_tasks: {}, open_fds: {})",
+                "flow{}: {} (connections: {}/{}, pending_connect_tasks: {})",
                 flow_id.0,
                 action,
                 self.current_connection_count(),
                 limit,
-                pending,
-                open_fds
+                pending
             ),
             None => info!(
-                "flow{}: {} (connections: {}, pending_connect_tasks: {}, open_fds: {})",
+                "flow{}: {} (connections: {}, pending_connect_tasks: {})",
                 flow_id.0,
                 action,
                 self.current_connection_count(),
-                pending,
-                open_fds
+                pending
             ),
         };
     }
