@@ -11,8 +11,9 @@ use std::{
 
 use actix::prelude::*;
 use anyhow::{Context, Result, anyhow};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, lookup_host},
     sync::oneshot,
     task::JoinHandle,
@@ -20,7 +21,7 @@ use tokio::{
 
 use crate::{
     actors::scheduler::{
-        ConnectionTaskFinished, ConnectionTaskStarted, Scheduler, Shutdown as SchedulerShutdown,
+        ConnectionTaskFinished, Scheduler, Shutdown as SchedulerShutdown, TryStartConnectionTask,
     },
     flow::FlowId,
     http::connect::handle_connect_proxy,
@@ -41,8 +42,7 @@ struct ConnectionTaskGuard {
 }
 
 impl ConnectionTaskGuard {
-    fn new(scheduler: Addr<Scheduler>) -> Self {
-        scheduler.do_send(ConnectionTaskStarted);
+    fn from_reserved(scheduler: Addr<Scheduler>) -> Self {
         Self { scheduler }
     }
 }
@@ -485,8 +485,27 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
+        let connection_task_guard = match scheduler.send(TryStartConnectionTask).await {
+            Ok(Ok(())) => ConnectionTaskGuard::from_reserved(scheduler.clone()),
+            Ok(Err(err)) => {
+                warn!(
+                    "flow{}: rejecting connection from {} before CONNECT parsing: {}",
+                    flow_id.0, client_addr, err
+                );
+                reject_over_capacity(client_stream).await;
+                continue;
+            }
+            Err(err) => {
+                error!(
+                    "flow{}: scheduler unavailable while reserving connection task: {}",
+                    flow_id.0, err
+                );
+                reject_over_capacity(client_stream).await;
+                continue;
+            }
+        };
+
         let connect_policy = connect_policy.clone();
-        let connection_task_guard = ConnectionTaskGuard::new(scheduler.clone());
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
@@ -508,6 +527,15 @@ async fn run_server(
     }
 
     Ok(())
+}
+
+async fn reject_over_capacity(mut client_stream: tokio::net::TcpStream) {
+    if let Err(err) = client_stream
+        .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+        .await
+    {
+        debug!("failed to write over-capacity response: {}", err);
+    }
 }
 
 fn maybe_warn_non_loopback(addr: SocketAddr) {
@@ -625,6 +653,7 @@ fn nofile_warnings(max_connections: MaxConnections, limits: Option<(u64, u64)>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
 
     #[test]
@@ -843,6 +872,30 @@ mod tests {
             connect_result.is_err(),
             "expected connection to fail after shutdown"
         );
+    }
+
+    #[actix_rt::test]
+    async fn server_rejects_when_pending_connections_reach_limit() {
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .max_connections(1)
+            .background()
+            .await
+            .expect("background");
+
+        let listen_addr = handle.listen_addr();
+        let _held_pending_connection = TcpStream::connect(listen_addr).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut rejected = TcpStream::connect(listen_addr).await.unwrap();
+        let mut response = Vec::new();
+        rejected.read_to_end(&mut response).await.unwrap();
+
+        assert_eq!(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+
+        handle.shutdown().await.expect("shutdown");
     }
 
     #[actix_rt::test]

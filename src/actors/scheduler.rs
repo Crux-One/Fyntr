@@ -34,6 +34,10 @@ pub(crate) struct Register {
 pub(crate) struct CanAcceptConnection;
 
 #[derive(Message)]
+#[rtype(result = "Result<(), RegisterError>")]
+pub(crate) struct TryStartConnectionTask;
+
+#[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
     pub flow_id: FlowId,
@@ -266,6 +270,30 @@ impl Handler<ConnectionTaskStarted> for Scheduler {
 
     fn handle(&mut self, _msg: ConnectionTaskStarted, _ctx: &mut Self::Context) -> Self::Result {
         self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
+        self.log_pending_connection_task_diagnostics("started");
+    }
+}
+
+impl Handler<TryStartConnectionTask> for Scheduler {
+    type Result = Result<(), RegisterError>;
+
+    fn handle(&mut self, _msg: TryStartConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(limit) = self.max_connections() {
+            let in_flight = self
+                .current_connection_count()
+                .saturating_add(self.pending_connection_tasks);
+            if in_flight >= limit.get() {
+                warn!(
+                    "connection rejected - max in-flight connections ({}) reached",
+                    limit
+                );
+                return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
+            }
+        }
+
+        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
+        self.log_pending_connection_task_diagnostics("started");
+        Ok(())
     }
 }
 
@@ -277,6 +305,7 @@ impl Handler<ConnectionTaskFinished> for Scheduler {
             warn!("connection task finished but pending counter is already zero");
         }
         self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
+        self.log_pending_connection_task_diagnostics("finished");
 
         if self.should_stop() {
             ctx.stop();
@@ -340,21 +369,51 @@ impl Scheduler {
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
+        let pending = self.pending_connection_tasks;
+        let open_fds = open_fd_count_display();
         match self.max_connections() {
             Some(limit) => info!(
-                "flow{}: {} (connections: {}/{})",
+                "flow{}: {} (connections: {}/{}, pending_connect_tasks: {}, open_fds: {})",
                 flow_id.0,
                 action,
                 self.current_connection_count(),
-                limit
+                limit,
+                pending,
+                open_fds
             ),
             None => info!(
-                "flow{}: {} (connections: {})",
+                "flow{}: {} (connections: {}, pending_connect_tasks: {}, open_fds: {})",
                 flow_id.0,
                 action,
-                self.current_connection_count()
+                self.current_connection_count(),
+                pending,
+                open_fds
             ),
         };
+    }
+
+    fn log_pending_connection_task_diagnostics(&self, action: &str) {
+        if !should_log_pending_connection_task_diagnostics(self.pending_connection_tasks) {
+            return;
+        }
+
+        match self.max_connections() {
+            Some(limit) => info!(
+                "connection task {} (pending_connect_tasks: {}, connections: {}/{}, open_fds: {})",
+                action,
+                self.pending_connection_tasks,
+                self.current_connection_count(),
+                limit,
+                open_fd_count_display()
+            ),
+            None => info!(
+                "connection task {} (pending_connect_tasks: {}, connections: {}, open_fds: {})",
+                action,
+                self.pending_connection_tasks,
+                self.current_connection_count(),
+                open_fd_count_display()
+            ),
+        }
     }
 
     fn register(
@@ -648,6 +707,29 @@ impl Scheduler {
     }
 }
 
+fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
+    pending <= 16 || pending.is_power_of_two() || pending.is_multiple_of(100)
+}
+
+fn open_fd_count_display() -> String {
+    match open_fd_count() {
+        Some(count) => count.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn open_fd_count() -> Option<usize> {
+    ["/dev/fd", "/proc/self/fd"]
+        .into_iter()
+        .find_map(|path| std::fs::read_dir(path).ok().map(|entries| entries.count()))
+}
+
+#[cfg(not(unix))]
+fn open_fd_count() -> Option<usize> {
+    None
+}
+
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
@@ -889,6 +971,57 @@ mod tests {
 
         let can_accept = scheduler.send(CanAcceptConnection).await.unwrap();
         assert!(can_accept, "unlimited scheduler should always allow");
+    }
+
+    #[actix_rt::test]
+    async fn try_start_connection_task_respects_active_and_pending_limit() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(42),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler.send(TryStartConnectionTask).await.unwrap();
+        assert!(
+            matches!(result, Err(RegisterError::MaxConnectionsReached { .. })),
+            "active + pending connections should consume the configured limit"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn try_start_connection_task_allows_new_task_after_pending_finishes() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask)
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.send(ConnectionTaskFinished).await.unwrap();
+
+        scheduler
+            .send(TryStartConnectionTask)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[actix_rt::test]
