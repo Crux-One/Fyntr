@@ -170,10 +170,11 @@ Cloud automation tools such as Terraform can spawn bursts of TCP connections tha
 
 When many flows send data simultaneously, they can create short traffic spikes that overwhelm low-capacity routers, particularly consumer NAT devices. This can push CPU interrupt load too high and make the network feel unresponsive.
 
-Rather than relying on connection pooling, Fyntr regulates the traffic itself.
+Rather than relying on connection pooling, Fyntr regulates traffic at the application layer.
 
-Its scheduler uses DRR to distribute sending opportunities across active flows fairly,
-so bursts from many parallel flows get interleaved as queued chunks instead of firing all at once.
+Its scheduler uses DRR to distribute sending opportunities fairly across active flows,
+so bursts from many parallel connections get interleaved as queued chunks instead of firing all at once.
+As a result, Fyntr reduces bufferbloat-like queue buildup and thundering-herd-like traffic patterns.
 
 This smoothing reduces CPU pressure on routers during connection storms.
 This matters most when scheduling overhead, rather than bandwidth, is the primary bottleneck.
