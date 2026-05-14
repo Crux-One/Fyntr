@@ -390,25 +390,42 @@ impl Scheduler {
     }
 
     fn log_pending_connection_task_diagnostics(&self, action: &str) {
-        if !should_log_pending_connection_task_diagnostics(self.pending_connection_tasks) {
+        let pending = self.pending_connection_tasks;
+        if !should_log_pending_connection_task_diagnostics(pending) {
             return;
         }
 
-        match self.max_connections() {
-            Some(limit) => info!(
+        let max_connections = self.max_connections();
+        let open_fds =
+            should_log_open_fd_count(pending, max_connections).then(open_fd_count_display);
+        match (max_connections, open_fds) {
+            (Some(limit), Some(open_fds)) => info!(
                 "connection task {} (pending_connect_tasks: {}, connections: {}/{}, open_fds: {})",
                 action,
-                self.pending_connection_tasks,
+                pending,
                 self.current_connection_count(),
                 limit,
-                open_fd_count_display()
+                open_fds
             ),
-            None => info!(
+            (Some(limit), None) => info!(
+                "connection task {} (pending_connect_tasks: {}, connections: {}/{})",
+                action,
+                pending,
+                self.current_connection_count(),
+                limit
+            ),
+            (None, Some(open_fds)) => info!(
                 "connection task {} (pending_connect_tasks: {}, connections: {}, open_fds: {})",
                 action,
-                self.pending_connection_tasks,
+                pending,
                 self.current_connection_count(),
-                open_fd_count_display()
+                open_fds
+            ),
+            (None, None) => info!(
+                "connection task {} (pending_connect_tasks: {}, connections: {})",
+                action,
+                pending,
+                self.current_connection_count()
             ),
         }
     }
@@ -706,6 +723,17 @@ impl Scheduler {
 
 fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
     pending <= 16 || pending.is_power_of_two() || pending.is_multiple_of(100)
+}
+
+fn should_log_open_fd_count(pending: usize, max_connections: MaxConnections) -> bool {
+    let threshold = max_connections
+        .map(|limit| {
+            let eighty_percent = limit.get().saturating_mul(4).saturating_add(4) / 5;
+            eighty_percent.max(17)
+        })
+        .unwrap_or(100);
+
+    pending >= threshold && (pending.is_power_of_two() || pending.is_multiple_of(100))
 }
 
 fn open_fd_count_display() -> String {
@@ -1019,6 +1047,34 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn open_fd_count_logging_uses_connection_limit_high_watermark() {
+        assert!(
+            !should_log_open_fd_count(16, max_connections_from_raw(1000)),
+            "low pending counts should not collect FDs on the actor hot path"
+        );
+        assert!(
+            !should_log_open_fd_count(512, max_connections_from_raw(1000)),
+            "power-of-two diagnostics below the high watermark should omit FD collection"
+        );
+        assert!(
+            should_log_open_fd_count(800, max_connections_from_raw(1000)),
+            "FD collection should start around 80% of max_connections"
+        );
+    }
+
+    #[test]
+    fn open_fd_count_logging_uses_floor_for_small_connection_limits() {
+        assert!(
+            !should_log_open_fd_count(1, max_connections_from_raw(1)),
+            "tiny connection limits should not collect FDs for ordinary one-connection events"
+        );
+        assert!(
+            !should_log_open_fd_count(16, max_connections_from_raw(10)),
+            "the low-count diagnostic range should not collect FDs"
+        );
     }
 
     #[actix_rt::test]
