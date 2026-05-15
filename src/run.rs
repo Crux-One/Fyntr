@@ -39,17 +39,20 @@ const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
 struct ConnectionTaskGuard {
     scheduler: Addr<Scheduler>,
+    flow_id: FlowId,
 }
 
 impl ConnectionTaskGuard {
-    fn from_reserved(scheduler: Addr<Scheduler>) -> Self {
-        Self { scheduler }
+    fn from_reserved(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
+        Self { scheduler, flow_id }
     }
 }
 
 impl Drop for ConnectionTaskGuard {
     fn drop(&mut self) {
-        self.scheduler.do_send(ConnectionTaskFinished);
+        self.scheduler.do_send(ConnectionTaskFinished {
+            flow_id: self.flow_id,
+        });
     }
 }
 
@@ -485,8 +488,8 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
-        let connection_task_guard = match scheduler.send(TryStartConnectionTask).await {
-            Ok(Ok(())) => ConnectionTaskGuard::from_reserved(scheduler.clone()),
+        let connection_task_guard = match scheduler.send(TryStartConnectionTask { flow_id }).await {
+            Ok(Ok(())) => ConnectionTaskGuard::from_reserved(scheduler.clone(), flow_id),
             Ok(Err(err)) => {
                 warn!(
                     "flow{}: rejecting connection from {} before CONNECT parsing: {}",
