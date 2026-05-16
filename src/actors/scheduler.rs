@@ -283,10 +283,18 @@ impl Handler<TryStartConnectionTask> for Scheduler {
             }
         }
 
-        if self.pending_connection_task_ids.insert(msg.flow_id) {
-            self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
-            self.log_pending_connection_task_diagnostics("started");
+        if !self.pending_connection_task_ids.insert(msg.flow_id) {
+            warn!(
+                "flow{}: duplicate pending connection task reservation",
+                msg.flow_id.0
+            );
+            return Err(RegisterError::DuplicateConnectionTask {
+                flow_id: msg.flow_id,
+            });
         }
+
+        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
+        self.log_pending_connection_task_diagnostics("started");
         Ok(())
     }
 }
@@ -1063,6 +1071,37 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[actix_rt::test]
+    async fn try_start_connection_task_rejects_duplicate_flow_id() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(RegisterError::DuplicateConnectionTask { flow_id: FlowId(1) })
+            ),
+            "duplicate pending flow IDs should not share one reservation"
+        );
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.pending_connection_tasks, 1,
+            "duplicate reservations should not increment the pending counter"
+        );
     }
 
     #[actix_rt::test]

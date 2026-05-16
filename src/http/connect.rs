@@ -460,6 +460,15 @@ impl ConnectState {
                     )
                     .await
             }
+            Ok(Err(err)) => {
+                error!(
+                    "flow{}: scheduler rejected registration: {}",
+                    session.flow_id.0, err
+                );
+                Err(ConnectFlowError::Fatal(anyhow!(
+                    "Scheduler registration rejected"
+                )))
+            }
             Err(e) => {
                 error!(
                     "flow{}: failed to register with scheduler: {}",
