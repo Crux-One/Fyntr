@@ -466,7 +466,8 @@ impl ConnectState {
                     session.flow_id.0, err
                 );
                 Err(ConnectFlowError::Fatal(anyhow!(
-                    "Scheduler registration rejected"
+                    "Scheduler registration rejected: {}",
+                    err
                 )))
             }
             Err(e) => {
