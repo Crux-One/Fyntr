@@ -303,12 +303,7 @@ impl Handler<ConnectionTaskFinished> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
-        if !self.finish_pending_connection_task(msg.flow_id) {
-            debug!(
-                "flow{}: connection task finished after pending reservation was consumed",
-                msg.flow_id.0
-            );
-        }
+        self.finish_pending_connection_task(msg.flow_id);
 
         if self.should_stop() {
             ctx.stop();
