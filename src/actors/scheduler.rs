@@ -409,14 +409,14 @@ impl Scheduler {
 
         let max_connections = self.max_connections();
         match max_connections {
-            Some(limit) => info!(
+            Some(limit) => debug!(
                 "connection task {} (pending_connect_tasks: {}, connections: {}/{})",
                 action,
                 pending,
                 self.current_connection_count(),
                 limit
             ),
-            None => info!(
+            None => debug!(
                 "connection task {} (pending_connect_tasks: {}, connections: {})",
                 action,
                 pending,
@@ -718,7 +718,7 @@ impl Scheduler {
 }
 
 fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
-    pending <= 16 || pending.is_power_of_two() || pending.is_multiple_of(100)
+    pending > 16 && (pending.is_power_of_two() || pending.is_multiple_of(100))
 }
 
 #[cfg(test)]
