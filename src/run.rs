@@ -21,7 +21,8 @@ use tokio::{
 
 use crate::{
     actors::scheduler::{
-        ConnectionTaskFinished, Scheduler, Shutdown as SchedulerShutdown, TryStartConnectionTask,
+        PendingConnectionReservation, Scheduler, Shutdown as SchedulerShutdown,
+        TryStartConnectionTask,
     },
     flow::FlowId,
     http::connect::handle_connect_proxy,
@@ -36,25 +37,6 @@ const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
-
-struct ConnectionTaskGuard {
-    scheduler: Addr<Scheduler>,
-    flow_id: FlowId,
-}
-
-impl ConnectionTaskGuard {
-    fn from_reserved(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
-        Self { scheduler, flow_id }
-    }
-}
-
-impl Drop for ConnectionTaskGuard {
-    fn drop(&mut self) {
-        self.scheduler.do_send(ConnectionTaskFinished {
-            flow_id: self.flow_id,
-        });
-    }
-}
 
 /// Address to bind the server to (IP or hostname).
 ///
@@ -488,8 +470,8 @@ async fn run_server(
         info!("flow{}: new connection from {}", flow_id.0, client_addr);
 
         let scheduler = scheduler.clone();
-        let connection_task_guard = match scheduler.send(TryStartConnectionTask { flow_id }).await {
-            Ok(Ok(())) => ConnectionTaskGuard::from_reserved(scheduler.clone(), flow_id),
+        let pending_reservation = match scheduler.send(TryStartConnectionTask { flow_id }).await {
+            Ok(Ok(())) => PendingConnectionReservation::new(scheduler.clone(), flow_id),
             Ok(Err(err)) => {
                 warn!(
                     "flow{}: rejecting connection from {} before CONNECT parsing: {}",
@@ -518,11 +500,9 @@ async fn run_server(
                 flow_id,
                 scheduler,
                 connect_policy,
+                pending_reservation,
             )
             .await;
-            // Keep the guard alive across the await so pending_connection_tasks
-            // is decremented only after the connection task truly finishes.
-            drop(connection_task_guard);
             if let Err(e) = result {
                 error!("flow{}: error: {}", flow_id.0, e);
             }

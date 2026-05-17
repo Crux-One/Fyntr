@@ -242,6 +242,45 @@ pub(crate) struct ConnectionTaskFinished {
     pub flow_id: FlowId,
 }
 
+pub(crate) struct PendingConnectionReservation {
+    scheduler: Addr<Scheduler>,
+    flow_id: FlowId,
+    armed: bool,
+}
+
+impl PendingConnectionReservation {
+    pub(crate) fn new(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
+        Self {
+            scheduler,
+            flow_id,
+            armed: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn already_consumed(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
+        Self {
+            scheduler,
+            flow_id,
+            armed: false,
+        }
+    }
+
+    pub(crate) fn consumed_by_register(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingConnectionReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.scheduler.do_send(ConnectionTaskFinished {
+                flow_id: self.flow_id,
+            });
+        }
+    }
+}
+
 impl Handler<QuantumTick> for Scheduler {
     type Result = ();
 
