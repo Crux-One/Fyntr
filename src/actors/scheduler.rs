@@ -314,10 +314,6 @@ impl Handler<TryStartConnectionTask> for Scheduler {
                 .current_connection_count()
                 .saturating_add(self.pending_connection_tasks);
             if in_flight >= limit.get() {
-                warn!(
-                    "connection rejected - max in-flight connections ({}) reached",
-                    limit
-                );
                 return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
             }
         }
