@@ -2,11 +2,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use log::warn;
 
+use crate::flow::FlowId;
 use crate::limits::MaxConnections;
 
 #[derive(Debug)]
 pub(crate) enum RegisterError {
     MaxConnectionsReached { max: usize },
+    DuplicateConnectionTask { flow_id: FlowId },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -14,6 +16,13 @@ impl std::fmt::Display for RegisterError {
         match self {
             Self::MaxConnectionsReached { max } => {
                 write!(f, "maximum connection limit ({}) reached", max)
+            }
+            Self::DuplicateConnectionTask { flow_id } => {
+                write!(
+                    f,
+                    "duplicate pending connection task reservation for flow{}",
+                    flow_id.0
+                )
             }
         }
     }

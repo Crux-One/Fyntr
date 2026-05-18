@@ -34,6 +34,12 @@ pub(crate) struct Register {
 pub(crate) struct CanAcceptConnection;
 
 #[derive(Message)]
+#[rtype(result = "Result<(), RegisterError>")]
+pub(crate) struct TryStartConnectionTask {
+    pub flow_id: FlowId,
+}
+
+#[derive(Message)]
 #[rtype(result = "()")]
 pub(crate) struct Unregister {
     pub flow_id: FlowId,
@@ -208,6 +214,7 @@ pub(crate) struct Scheduler {
     connection_limiter: ConnectionLimiter,
     shutdown_requested: bool,
     pending_connection_tasks: usize,
+    pending_connection_task_ids: HashSet<FlowId>,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -231,11 +238,48 @@ pub(crate) struct Shutdown;
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub(crate) struct ConnectionTaskStarted;
+pub(crate) struct ConnectionTaskFinished {
+    pub flow_id: FlowId,
+}
 
-#[derive(Message)]
-#[rtype(result = "()")]
-pub(crate) struct ConnectionTaskFinished;
+pub(crate) struct PendingConnectionReservation {
+    scheduler: Addr<Scheduler>,
+    flow_id: FlowId,
+    armed: bool,
+}
+
+impl PendingConnectionReservation {
+    pub(crate) fn new(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
+        Self {
+            scheduler,
+            flow_id,
+            armed: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn already_consumed(scheduler: Addr<Scheduler>, flow_id: FlowId) -> Self {
+        Self {
+            scheduler,
+            flow_id,
+            armed: false,
+        }
+    }
+
+    pub(crate) fn consumed_by_register(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingConnectionReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.scheduler.do_send(ConnectionTaskFinished {
+                flow_id: self.flow_id,
+            });
+        }
+    }
+}
 
 impl Handler<QuantumTick> for Scheduler {
     type Result = ();
@@ -261,22 +305,40 @@ impl Handler<Shutdown> for Scheduler {
     }
 }
 
-impl Handler<ConnectionTaskStarted> for Scheduler {
-    type Result = ();
+impl Handler<TryStartConnectionTask> for Scheduler {
+    type Result = Result<(), RegisterError>;
 
-    fn handle(&mut self, _msg: ConnectionTaskStarted, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: TryStartConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(limit) = self.max_connections() {
+            let in_flight = self
+                .current_connection_count()
+                .saturating_add(self.pending_connection_tasks);
+            if in_flight >= limit.get() {
+                return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
+            }
+        }
+
+        if !self.pending_connection_task_ids.insert(msg.flow_id) {
+            warn!(
+                "flow{}: duplicate pending connection task reservation",
+                msg.flow_id.0
+            );
+            return Err(RegisterError::DuplicateConnectionTask {
+                flow_id: msg.flow_id,
+            });
+        }
+
         self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
+        self.log_pending_connection_task_diagnostics("started");
+        Ok(())
     }
 }
 
 impl Handler<ConnectionTaskFinished> for Scheduler {
     type Result = ();
 
-    fn handle(&mut self, _msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
-        if self.pending_connection_tasks == 0 {
-            warn!("connection task finished but pending counter is already zero");
-        }
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
+    fn handle(&mut self, msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
+        self.finish_pending_connection_task(msg.flow_id);
 
         if self.should_stop() {
             ctx.stop();
@@ -308,6 +370,7 @@ impl Scheduler {
             connection_limiter: ConnectionLimiter::new(),
             shutdown_requested: false,
             pending_connection_tasks: 0,
+            pending_connection_task_ids: HashSet::new(),
         }
     }
 
@@ -331,6 +394,19 @@ impl Scheduler {
         self.connection_limiter.current()
     }
 
+    fn finish_pending_connection_task(&mut self, flow_id: FlowId) -> bool {
+        if !self.pending_connection_task_ids.remove(&flow_id) {
+            return false;
+        }
+
+        if self.pending_connection_tasks == 0 {
+            warn!("connection task finished but pending counter is already zero");
+        }
+        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
+        self.log_pending_connection_task_diagnostics("finished");
+        true
+    }
+
     fn max_connections(&self) -> MaxConnections {
         self.connection_limiter.max_connections()
     }
@@ -340,21 +416,48 @@ impl Scheduler {
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
+        let pending = self.pending_connection_tasks;
         match self.max_connections() {
             Some(limit) => info!(
-                "flow{}: {} (connections: {}/{})",
+                "flow{}: {} (connections: {}/{}, pending_connect_tasks: {})",
                 flow_id.0,
                 action,
                 self.current_connection_count(),
-                limit
+                limit,
+                pending
             ),
             None => info!(
-                "flow{}: {} (connections: {})",
+                "flow{}: {} (connections: {}, pending_connect_tasks: {})",
                 flow_id.0,
                 action,
-                self.current_connection_count()
+                self.current_connection_count(),
+                pending
             ),
         };
+    }
+
+    fn log_pending_connection_task_diagnostics(&self, action: &str) {
+        let pending = self.pending_connection_tasks;
+        if !should_log_pending_connection_task_diagnostics(pending) {
+            return;
+        }
+
+        let max_connections = self.max_connections();
+        match max_connections {
+            Some(limit) => debug!(
+                "connection task {} (pending_connect_tasks: {}, connections: {}/{})",
+                action,
+                pending,
+                self.current_connection_count(),
+                limit
+            ),
+            None => debug!(
+                "connection task {} (pending_connect_tasks: {}, connections: {})",
+                action,
+                pending,
+                self.current_connection_count()
+            ),
+        }
     }
 
     fn register(
@@ -363,6 +466,7 @@ impl Scheduler {
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
     ) {
+        self.finish_pending_connection_task(id);
         self.flows
             .insert(id, FlowEntry::new(queue_addr, backend_write));
     }
@@ -648,6 +752,10 @@ impl Scheduler {
     }
 }
 
+fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
+    pending > 16 && (pending.is_power_of_two() || pending.is_multiple_of(100))
+}
+
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
@@ -892,6 +1000,132 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn try_start_connection_task_respects_active_and_pending_limit() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(42),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(RegisterError::MaxConnectionsReached { .. })),
+            "active + pending connections should consume the configured limit"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn try_start_connection_task_allows_new_task_after_pending_finishes() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler
+            .send(ConnectionTaskFinished { flow_id: FlowId(1) })
+            .await
+            .unwrap();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[actix_rt::test]
+    async fn try_start_connection_task_rejects_duplicate_flow_id() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(RegisterError::DuplicateConnectionTask { flow_id: FlowId(1) })
+            ),
+            "duplicate pending flow IDs should not share one reservation"
+        );
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.pending_connection_tasks, 1,
+            "duplicate reservations should not increment the pending counter"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn register_consumes_pending_connection_task_reservation() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(1),
+                queue_addr: queue,
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(reply.connections, 1, "registered flow should be active");
+        assert_eq!(
+            reply.pending_connection_tasks, 0,
+            "registration should consume the pending reservation"
+        );
+
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[actix_rt::test]
     async fn unregister_updates_connection_count_and_ready_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(max_connections_from_raw(5))
@@ -980,7 +1214,11 @@ mod tests {
     async fn shutdown_waits_for_pending_connection_tasks() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
 
-        scheduler.send(ConnectionTaskStarted).await.unwrap();
+        scheduler
+            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .await
+            .unwrap()
+            .unwrap();
         scheduler.send(Shutdown).await.unwrap();
 
         let reply = scheduler.send(super::InspectState).await.unwrap();
@@ -989,7 +1227,10 @@ mod tests {
             "pending tasks should remain tracked during shutdown"
         );
 
-        scheduler.send(ConnectionTaskFinished).await.unwrap();
+        scheduler
+            .send(ConnectionTaskFinished { flow_id: FlowId(1) })
+            .await
+            .unwrap();
 
         let mut stopped = false;
         for _ in 0..20 {

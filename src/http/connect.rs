@@ -16,7 +16,10 @@ use tokio::{
 use crate::{
     actors::{
         queue::{Close, QueueActor},
-        scheduler::{CanAcceptConnection, Register, RegisterError, Scheduler, Unregister},
+        scheduler::{
+            CanAcceptConnection, PendingConnectionReservation, Register, RegisterError, Scheduler,
+            Unregister,
+        },
     },
     flow::{
         FlowId,
@@ -203,6 +206,7 @@ struct ConnectSession {
     connect_policy: Arc<ConnectPolicy>,
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
+    pending_reservation: Option<PendingConnectionReservation>,
 }
 
 /// RAII guard that tears down queue and scheduler registrations if the flow exits early.
@@ -443,6 +447,9 @@ impl ConnectState {
             .await
         {
             Ok(Ok(())) => {
+                if let Some(reservation) = session.pending_reservation.take() {
+                    reservation.consumed_by_register();
+                }
                 cleanup.mark_registered();
                 Ok(ConnectState::Established {
                     session,
@@ -459,6 +466,16 @@ impl ConnectState {
                         detail,
                     )
                     .await
+            }
+            Ok(Err(err)) => {
+                error!(
+                    "flow{}: scheduler rejected registration: {}",
+                    session.flow_id.0, err
+                );
+                Err(ConnectFlowError::Fatal(anyhow!(
+                    "Scheduler registration rejected: {}",
+                    err
+                )))
             }
             Err(e) => {
                 error!(
@@ -533,6 +550,7 @@ impl ConnectSession {
         client_addr: SocketAddr,
         scheduler: Addr<Scheduler>,
         connect_policy: Arc<ConnectPolicy>,
+        pending_reservation: PendingConnectionReservation,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
@@ -542,6 +560,7 @@ impl ConnectSession {
             connect_policy,
             client_reader: BufReader::new(client_read),
             client_write,
+            pending_reservation: Some(pending_reservation),
         }
     }
 
@@ -641,6 +660,7 @@ pub(crate) async fn handle_connect_proxy(
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
+    pending_reservation: PendingConnectionReservation,
 ) -> Result<(), anyhow::Error> {
     let session = ConnectSession::new(
         client_stream,
@@ -648,6 +668,7 @@ pub(crate) async fn handle_connect_proxy(
         client_addr,
         scheduler,
         connect_policy,
+        pending_reservation,
     );
 
     match run_connect_flow(session).await {
@@ -747,6 +768,7 @@ mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
+        actors::scheduler::TryStartConnectionTask,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
     };
@@ -772,9 +794,25 @@ mod tests {
     ) -> Vec<u8> {
         let server = async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connect_proxy(stream, peer, FlowId(1), scheduler, connect_policy)
+            let flow_id = FlowId(1);
+            let pending_reservation = scheduler
+                .send(TryStartConnectionTask { flow_id })
                 .await
-                .unwrap();
+                .unwrap()
+                .map_or_else(
+                    |_| PendingConnectionReservation::already_consumed(scheduler.clone(), flow_id),
+                    |_| PendingConnectionReservation::new(scheduler.clone(), flow_id),
+                );
+            handle_connect_proxy(
+                stream,
+                peer,
+                flow_id,
+                scheduler,
+                connect_policy,
+                pending_reservation,
+            )
+            .await
+            .unwrap();
         };
 
         let ((), response) = tokio::join!(server, client_task);
