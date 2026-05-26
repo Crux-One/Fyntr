@@ -37,6 +37,8 @@ use self::status_response::{
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
+const CONNECT_LOG_TARGET: &str = module_path!();
+
 #[derive(Debug)]
 enum ConnectFlowError {
     ResponseSent,

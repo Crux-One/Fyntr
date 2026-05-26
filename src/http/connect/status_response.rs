@@ -5,9 +5,7 @@ use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf};
 
 use crate::{flow::FlowId, http::request::RequestReadError};
 
-use super::{ConnectFlowError, ConnectResult};
-
-const CONNECT_LOG_TARGET: &str = "fyntr::http::connect";
+use super::{CONNECT_LOG_TARGET, ConnectFlowError, ConnectResult};
 
 /// Prebuilt HTTP status line used when responding to failed CONNECT requests.
 /// Holds the raw bytes sent to the client plus the parsed pieces for logging.
