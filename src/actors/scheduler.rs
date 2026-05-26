@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+mod connection_admission;
 mod flow_stats;
 mod quantum_strategy;
 
@@ -12,15 +13,13 @@ use log::{debug, info, trace, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::{
-        connection_limit::ConnectionLimiter,
-        queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
-    },
+    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
     flow::FlowId,
     limits::{MAX_DEQUEUE_BYTES, MaxConnections, max_connections_display},
     util::{format_bytes, format_rate},
 };
 
+use self::connection_admission::ConnectionAdmission;
 use self::flow_stats::FlowStats;
 
 pub(crate) use crate::actors::connection_limit::RegisterError;
@@ -110,10 +109,8 @@ pub(crate) struct Scheduler {
     total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
-    connection_limiter: ConnectionLimiter,
+    admission: ConnectionAdmission,
     shutdown_requested: bool,
-    pending_connection_tasks: usize,
-    pending_connection_task_ids: HashSet<FlowId>,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -208,28 +205,7 @@ impl Handler<TryStartConnectionTask> for Scheduler {
     type Result = Result<(), RegisterError>;
 
     fn handle(&mut self, msg: TryStartConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
-        if let Some(limit) = self.max_connections() {
-            let in_flight = self
-                .current_connection_count()
-                .saturating_add(self.pending_connection_tasks);
-            if in_flight >= limit.get() {
-                return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
-            }
-        }
-
-        if !self.pending_connection_task_ids.insert(msg.flow_id) {
-            warn!(
-                "flow{}: duplicate pending connection task reservation",
-                msg.flow_id.0
-            );
-            return Err(RegisterError::DuplicateConnectionTask {
-                flow_id: msg.flow_id,
-            });
-        }
-
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
-        self.log_pending_connection_task_diagnostics("started");
-        Ok(())
+        self.admission.try_start_connection_task(msg.flow_id)
     }
 }
 
@@ -266,10 +242,8 @@ impl Scheduler {
             total_backend_to_client_bytes: 0,
             global_start_time: None,
             total_ticks: 0,
-            connection_limiter: ConnectionLimiter::new(),
+            admission: ConnectionAdmission::new(),
             shutdown_requested: false,
-            pending_connection_tasks: 0,
-            pending_connection_task_ids: HashSet::new(),
         }
     }
 
@@ -277,45 +251,38 @@ impl Scheduler {
     ///
     /// Use `None` to allow unlimited connections.
     pub(crate) fn with_max_connections(mut self, max_connections: MaxConnections) -> Self {
-        self.connection_limiter.set_max_connections(max_connections);
+        self.admission.set_max_connections(max_connections);
         self
     }
 
     fn try_increment_connection_count(&self) -> Result<(), RegisterError> {
-        self.connection_limiter.try_acquire()
+        self.admission.try_acquire_registered()
     }
 
     fn decrement_connection_count(&self) {
-        self.connection_limiter.release();
+        self.admission.release_registered();
     }
 
     fn current_connection_count(&self) -> usize {
-        self.connection_limiter.current()
+        self.admission.current_connection_count()
     }
 
     fn finish_pending_connection_task(&mut self, flow_id: FlowId) -> bool {
-        if !self.pending_connection_task_ids.remove(&flow_id) {
-            return false;
-        }
-
-        if self.pending_connection_tasks == 0 {
-            warn!("connection task finished but pending counter is already zero");
-        }
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
-        self.log_pending_connection_task_diagnostics("finished");
-        true
+        self.admission.finish_pending_connection_task(flow_id)
     }
 
     fn max_connections(&self) -> MaxConnections {
-        self.connection_limiter.max_connections()
+        self.admission.max_connections()
     }
 
     fn should_stop(&self) -> bool {
-        self.shutdown_requested && self.flows.is_empty() && self.pending_connection_tasks == 0
+        self.shutdown_requested
+            && self.flows.is_empty()
+            && self.admission.pending_connection_tasks() == 0
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
-        let pending = self.pending_connection_tasks;
+        let pending = self.admission.pending_connection_tasks();
         match self.max_connections() {
             Some(limit) => info!(
                 "flow{}: {} (connections: {}/{}, pending_connect_tasks: {})",
@@ -333,30 +300,6 @@ impl Scheduler {
                 pending
             ),
         };
-    }
-
-    fn log_pending_connection_task_diagnostics(&self, action: &str) {
-        let pending = self.pending_connection_tasks;
-        if !should_log_pending_connection_task_diagnostics(pending) {
-            return;
-        }
-
-        let max_connections = self.max_connections();
-        match max_connections {
-            Some(limit) => debug!(
-                "connection task {} (pending_connect_tasks: {}, connections: {}/{})",
-                action,
-                pending,
-                self.current_connection_count(),
-                limit
-            ),
-            None => debug!(
-                "connection task {} (pending_connect_tasks: {}, connections: {})",
-                action,
-                pending,
-                self.current_connection_count()
-            ),
-        }
     }
 
     fn register(
@@ -422,10 +365,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
     type Result = bool;
 
     fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
-        match self.max_connections() {
-            Some(limit) => self.current_connection_count() < limit.get(),
-            None => true,
-        }
+        self.admission.can_accept_connection()
     }
 }
 
@@ -651,10 +591,6 @@ impl Scheduler {
     }
 }
 
-fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
-    pending > 16 && (pending.is_power_of_two() || pending.is_multiple_of(100))
-}
-
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
@@ -688,7 +624,7 @@ impl Handler<InspectState> for Scheduler {
             flow_ids: self.flows.keys().copied().collect(),
             total_client_to_backend_bytes: self.total_client_to_backend_bytes,
             total_backend_to_client_bytes: self.total_backend_to_client_bytes,
-            pending_connection_tasks: self.pending_connection_tasks,
+            pending_connection_tasks: self.admission.pending_connection_tasks(),
         })
     }
 }
