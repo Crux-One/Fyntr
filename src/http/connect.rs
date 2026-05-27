@@ -1,10 +1,12 @@
 use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
+mod status_response;
+
 use actix::prelude::*;
 use anyhow::anyhow;
 use log::{debug, error, info, warn};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::BufReader,
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -25,11 +27,17 @@ use crate::{
         FlowId,
         connection::{BackendToClientActor, ClientToBackendActor},
     },
-    http::request::{RequestReadError, read_request_line, send_connect_response, skip_headers},
+    http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
 };
 
+use self::status_response::{
+    StatusLine, StatusLogLevel, classify_input_error, respond_with_status,
+};
+
 type ConnectResult<T> = Result<T, ConnectFlowError>;
+
+const CONNECT_LOG_TARGET: &str = module_path!();
 
 #[derive(Debug)]
 enum ConnectFlowError {
@@ -49,98 +57,7 @@ impl From<std::io::Error> for ConnectFlowError {
     }
 }
 
-/// Prebuilt HTTP status line used when responding to failed CONNECT requests.
-/// Holds the raw bytes sent to the client plus the parsed pieces for logging.
-#[derive(Clone, Copy)]
-struct StatusLine {
-    raw: &'static [u8],
-    code: &'static str,
-    reason: &'static str,
-}
-
-impl StatusLine {
-    const fn new(raw: &'static [u8], code: &'static str, reason: &'static str) -> Self {
-        Self { raw, code, reason }
-    }
-
-    const METHOD_NOT_ALLOWED: StatusLine = Self::new(
-        b"HTTP/1.1 405 Method Not Allowed\r\n\r\n",
-        "405",
-        "Method Not Allowed",
-    );
-    const VERSION_NOT_SUPPORTED: StatusLine = Self::new(
-        b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n",
-        "505",
-        "HTTP Version Not Supported",
-    );
-    const BAD_GATEWAY: StatusLine =
-        Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
-    const FORBIDDEN: StatusLine = Self::new(b"HTTP/1.1 403 Forbidden\r\n\r\n", "403", "Forbidden");
-    const REQUEST_TIMEOUT: StatusLine = Self::new(
-        b"HTTP/1.1 408 Request Timeout\r\n\r\n",
-        "408",
-        "Request Timeout",
-    );
-    const BAD_REQUEST: StatusLine =
-        Self::new(b"HTTP/1.1 400 Bad Request\r\n\r\n", "400", "Bad Request");
-    const URI_TOO_LONG: StatusLine =
-        Self::new(b"HTTP/1.1 414 URI Too Long\r\n\r\n", "414", "URI Too Long");
-    const HEADER_FIELDS_TOO_LARGE: StatusLine = Self::new(
-        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
-        "431",
-        "Request Header Fields Too Large",
-    );
-    const SERVICE_UNAVAILABLE: StatusLine = Self::new(
-        b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
-        "503",
-        "Service Unavailable",
-    );
-}
-
 const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy)]
-enum StatusLogLevel {
-    Warn,
-    Error,
-}
-
-async fn respond_with_status<T>(
-    flow_id: FlowId,
-    writer: &mut OwnedWriteHalf,
-    status: StatusLine,
-    level: StatusLogLevel,
-    detail: impl fmt::Display,
-) -> ConnectResult<T> {
-    match level {
-        StatusLogLevel::Warn => warn!(
-            "flow{}: {} ({} {})",
-            flow_id.0, detail, status.code, status.reason
-        ),
-        StatusLogLevel::Error => error!(
-            "flow{}: {} ({} {})",
-            flow_id.0, detail, status.code, status.reason
-        ),
-    }
-
-    writer.write_all(status.raw).await?;
-    writer.flush().await?;
-    Err(ConnectFlowError::ResponseSent)
-}
-
-fn classify_input_error(err: &anyhow::Error) -> StatusLine {
-    if let Some(read_err) = err.downcast_ref::<RequestReadError>() {
-        match read_err {
-            RequestReadError::RequestLineTooLong { .. } => StatusLine::URI_TOO_LONG,
-            RequestReadError::HeaderLineTooLong { .. }
-            | RequestReadError::HeadersTooLarge { .. }
-            | RequestReadError::TooManyHeaders { .. } => StatusLine::HEADER_FIELDS_TOO_LARGE,
-            RequestReadError::InvalidEncoding => StatusLine::BAD_REQUEST,
-        }
-    } else {
-        StatusLine::BAD_REQUEST
-    }
-}
 
 async fn await_with_timeout_response<T, F>(
     flow_id: FlowId,
