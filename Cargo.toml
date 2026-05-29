@@ -1,6 +1,6 @@
 [package]
 name = "fyntr"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 description = "A minimal forward proxy to tame bursty outbound traffic"
 license = "MIT"
@@ -21,7 +21,7 @@ anyhow = "1.0.102"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 env_logger = "0.11.10"
-log = "0.4.29"
+log = "0.4.30"
 
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.11.0"
