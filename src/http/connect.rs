@@ -1,16 +1,19 @@
 use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
+mod backoff;
+mod status_response;
+
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::BufReader,
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::Mutex,
-    time::{sleep, timeout},
+    time::timeout,
 };
 
 use crate::{
@@ -25,11 +28,18 @@ use crate::{
         FlowId,
         connection::{BackendToClientActor, ClientToBackendActor},
     },
-    http::request::{RequestReadError, read_request_line, send_connect_response, skip_headers},
+    http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
 };
 
+use self::backoff::connect_to_any_with_backoff;
+use self::status_response::{
+    StatusLine, StatusLogLevel, classify_input_error, respond_with_status,
+};
+
 type ConnectResult<T> = Result<T, ConnectFlowError>;
+
+const CONNECT_LOG_TARGET: &str = module_path!();
 
 #[derive(Debug)]
 enum ConnectFlowError {
@@ -49,98 +59,7 @@ impl From<std::io::Error> for ConnectFlowError {
     }
 }
 
-/// Prebuilt HTTP status line used when responding to failed CONNECT requests.
-/// Holds the raw bytes sent to the client plus the parsed pieces for logging.
-#[derive(Clone, Copy)]
-struct StatusLine {
-    raw: &'static [u8],
-    code: &'static str,
-    reason: &'static str,
-}
-
-impl StatusLine {
-    const fn new(raw: &'static [u8], code: &'static str, reason: &'static str) -> Self {
-        Self { raw, code, reason }
-    }
-
-    const METHOD_NOT_ALLOWED: StatusLine = Self::new(
-        b"HTTP/1.1 405 Method Not Allowed\r\n\r\n",
-        "405",
-        "Method Not Allowed",
-    );
-    const VERSION_NOT_SUPPORTED: StatusLine = Self::new(
-        b"HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n",
-        "505",
-        "HTTP Version Not Supported",
-    );
-    const BAD_GATEWAY: StatusLine =
-        Self::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", "502", "Bad Gateway");
-    const FORBIDDEN: StatusLine = Self::new(b"HTTP/1.1 403 Forbidden\r\n\r\n", "403", "Forbidden");
-    const REQUEST_TIMEOUT: StatusLine = Self::new(
-        b"HTTP/1.1 408 Request Timeout\r\n\r\n",
-        "408",
-        "Request Timeout",
-    );
-    const BAD_REQUEST: StatusLine =
-        Self::new(b"HTTP/1.1 400 Bad Request\r\n\r\n", "400", "Bad Request");
-    const URI_TOO_LONG: StatusLine =
-        Self::new(b"HTTP/1.1 414 URI Too Long\r\n\r\n", "414", "URI Too Long");
-    const HEADER_FIELDS_TOO_LARGE: StatusLine = Self::new(
-        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
-        "431",
-        "Request Header Fields Too Large",
-    );
-    const SERVICE_UNAVAILABLE: StatusLine = Self::new(
-        b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
-        "503",
-        "Service Unavailable",
-    );
-}
-
 const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy)]
-enum StatusLogLevel {
-    Warn,
-    Error,
-}
-
-async fn respond_with_status<T>(
-    flow_id: FlowId,
-    writer: &mut OwnedWriteHalf,
-    status: StatusLine,
-    level: StatusLogLevel,
-    detail: impl fmt::Display,
-) -> ConnectResult<T> {
-    match level {
-        StatusLogLevel::Warn => warn!(
-            "flow{}: {} ({} {})",
-            flow_id.0, detail, status.code, status.reason
-        ),
-        StatusLogLevel::Error => error!(
-            "flow{}: {} ({} {})",
-            flow_id.0, detail, status.code, status.reason
-        ),
-    }
-
-    writer.write_all(status.raw).await?;
-    writer.flush().await?;
-    Err(ConnectFlowError::ResponseSent)
-}
-
-fn classify_input_error(err: &anyhow::Error) -> StatusLine {
-    if let Some(read_err) = err.downcast_ref::<RequestReadError>() {
-        match read_err {
-            RequestReadError::RequestLineTooLong { .. } => StatusLine::URI_TOO_LONG,
-            RequestReadError::HeaderLineTooLong { .. }
-            | RequestReadError::HeadersTooLarge { .. }
-            | RequestReadError::TooManyHeaders { .. } => StatusLine::HEADER_FIELDS_TOO_LARGE,
-            RequestReadError::InvalidEncoding => StatusLine::BAD_REQUEST,
-        }
-    } else {
-        StatusLine::BAD_REQUEST
-    }
-}
 
 async fn await_with_timeout_response<T, F>(
     flow_id: FlowId,
@@ -682,89 +601,12 @@ async fn run_connect_flow(session: ConnectSession) -> ConnectResult<()> {
     ConnectStateMachine::new(session).run().await
 }
 
-const CONNECT_MAX_ATTEMPTS: usize = 3;
-const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
-const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
-const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[cfg(test)]
-async fn connect_with_backoff(
-    flow_id: FlowId,
-    backend_addr: SocketAddr,
-) -> std::io::Result<TcpStream> {
-    let mut delay = CONNECT_BACKOFF_BASE;
-    let mut attempt = 1;
-
-    loop {
-        match TcpStream::connect(backend_addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) if attempt == CONNECT_MAX_ATTEMPTS => return Err(err),
-            Err(err) => {
-                warn!(
-                    "flow{}: connect attempt {}/{} to {} failed: {}; backing off {:?}",
-                    flow_id.0, attempt, CONNECT_MAX_ATTEMPTS, backend_addr, err, delay
-                );
-                sleep(delay).await;
-                delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
-                attempt += 1;
-            }
-        }
-    }
-}
-
-async fn connect_to_any_with_backoff(
-    flow_id: FlowId,
-    backend_addrs: &[SocketAddr],
-) -> std::io::Result<(TcpStream, SocketAddr)> {
-    if backend_addrs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "no backend addresses to connect",
-        ));
-    }
-
-    // Use round-robin retries across resolved addresses to avoid spending all retries
-    // on the first address when later addresses may already be reachable.
-    // A full Happy Eyeballs (RFC 8305) strategy can be added later if needed.
-    let mut delay = CONNECT_BACKOFF_BASE;
-    let mut last_err = None;
-    for attempt in 1..=CONNECT_MAX_ATTEMPTS {
-        for &addr in backend_addrs {
-            let connect = TcpStream::connect(addr);
-            match timeout(CONNECT_ATTEMPT_TIMEOUT, connect).await {
-                Ok(Ok(stream)) => return Ok((stream, addr)),
-                Ok(Err(err)) => last_err = Some(err),
-                Err(_) => {
-                    last_err = Some(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "connect attempt to {} timed out after {:?}",
-                            addr, CONNECT_ATTEMPT_TIMEOUT
-                        ),
-                    ));
-                }
-            }
-        }
-
-        if attempt < CONNECT_MAX_ATTEMPTS {
-            warn!(
-                "flow{}: connect round {}/{} failed for all {} addresses; backing off {:?}",
-                flow_id.0,
-                attempt,
-                CONNECT_MAX_ATTEMPTS,
-                backend_addrs.len(),
-                delay
-            );
-            sleep(delay).await;
-            delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
-        }
-    }
-
-    Err(last_err.expect("backend_addrs checked as non-empty"))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::backoff::{
+        CONNECT_BACKOFF_BASE, CONNECT_BACKOFF_MAX, connect_to_any_with_backoff,
+        connect_with_backoff,
+    };
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
@@ -1191,27 +1033,5 @@ mod tests {
             start.elapsed() < Duration::from_millis(500),
             "connect_to_any_with_backoff spent too long before trying a fallback address"
         );
-    }
-
-    fn backoff_sequence(steps: usize) -> Vec<Duration> {
-        let mut delay = CONNECT_BACKOFF_BASE;
-        let mut seq = Vec::with_capacity(steps);
-        for _ in 0..steps {
-            seq.push(delay);
-            delay = (delay.saturating_mul(2)).min(CONNECT_BACKOFF_MAX);
-        }
-        seq
-    }
-
-    #[test]
-    fn backoff_delays_cap_at_max() {
-        let delays = backoff_sequence(6);
-
-        assert_eq!(delays[0], CONNECT_BACKOFF_BASE);
-        assert_eq!(delays[1], CONNECT_BACKOFF_BASE.saturating_mul(2));
-        assert_eq!(delays[2], CONNECT_BACKOFF_BASE.saturating_mul(4));
-        assert_eq!(delays[3], CONNECT_BACKOFF_BASE.saturating_mul(8));
-        assert_eq!(delays[4], CONNECT_BACKOFF_MAX);
-        assert_eq!(delays[5], CONNECT_BACKOFF_MAX);
     }
 }

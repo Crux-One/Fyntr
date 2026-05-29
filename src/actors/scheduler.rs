@@ -4,19 +4,23 @@ use std::{
     time::Duration,
 };
 
+mod connection_admission;
+mod flow_stats;
+mod quantum_strategy;
+
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
-    actors::{
-        connection_limit::ConnectionLimiter,
-        queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
-    },
+    actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
     flow::FlowId,
     limits::{MAX_DEQUEUE_BYTES, MaxConnections, max_connections_display},
     util::{format_bytes, format_rate},
 };
+
+use self::connection_admission::ConnectionAdmission;
+use self::flow_stats::FlowStats;
 
 pub(crate) use crate::actors::connection_limit::RegisterError;
 
@@ -57,54 +61,6 @@ pub(crate) struct RecordDownstreamBytes {
     pub bytes: usize,
 }
 
-/// Tracks statistics for a flow, including bytes sent, packets sent, and average packet size using a low-pass filter.
-///
-/// The average packet size is maintained using an exponential moving average (EMA) with a smoothing factor.
-/// This helps smooth out short-term fluctuations while responding to longer-term trends in packet sizes.
-#[derive(Debug)]
-struct FlowStats {
-    bytes_sent: u64,
-    packets_sent: u64,
-    start_time: Option<Instant>,
-    avg_packet_size_lpf: Option<f64>,
-}
-
-impl FlowStats {
-    fn new() -> Self {
-        Self {
-            bytes_sent: 0,
-            packets_sent: 0,
-            start_time: None,
-            avg_packet_size_lpf: None,
-        }
-    }
-
-    /// Updates the flow statistics with a new packet size sample.
-    ///
-    /// Uses an exponential moving average to compute the average packet size, reducing noise from individual packet variations.
-    /// The smoothing factor ALPHA = 0.2 provides a balance: 20% weight to the current sample and 80% to the previous average,
-    /// allowing the average to adapt to changes while filtering out transient spikes.
-    fn update(&mut self, bytes: usize) {
-        const ALPHA: f64 = 0.2;
-
-        self.bytes_sent += bytes as u64;
-        self.packets_sent += 1;
-        if self.start_time.is_none() {
-            self.start_time = Some(Instant::now());
-        }
-
-        let sample = bytes as f64;
-        self.avg_packet_size_lpf = Some(match self.avg_packet_size_lpf {
-            Some(prev) => prev + ALPHA * (sample - prev),
-            None => sample,
-        });
-    }
-
-    fn avg_packet_size(&self) -> Option<usize> {
-        self.avg_packet_size_lpf.map(|avg| avg.round() as usize)
-    }
-}
-
 struct FlowEntry {
     queue_addr: Addr<QueueActor>,
     backend_write: Arc<Mutex<OwnedWriteHalf>>,
@@ -138,66 +94,8 @@ impl FlowEntry {
     /// The call remains a thin wrapper that forwards to the reusable `DrrQuantumStrategy`, keeping
     /// the decision logic centralized while allowing each flow to supply its own packet history.
     fn recommended_quantum(&self, default_quantum: usize) -> usize {
-        DEFAULT_DRR_QUANTUM_STRATEGY
+        quantum_strategy::DEFAULT_DRR_QUANTUM_STRATEGY
             .recommended_quantum(self.stats.avg_packet_size(), default_quantum)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct QuantumConfig {
-    min_quantum: usize,
-    max_quantum: usize,
-    target_burst_packets: usize,
-    small_packet_threshold: usize,
-}
-
-/// Tuning defaults chosen to balance small-packet latency against large-packet throughput.
-///
-/// * `min_quantum (1500 bytes)`: Standard Ethernet MTU, ensuring even latency-sensitive flows get
-///   at least one full-sized packet per scheduling turn.
-/// * `max_quantum (16 KiB)`: Prevents any single flow from monopolizing airtime while still
-///   amortizing scheduler overhead for bulk traffic.
-/// * `target_burst_packets (10)`: Empirically smooths throughput without making interactive
-///   traffic wait excessively between turns.
-/// * `small_packet_threshold (200 bytes)`: Heuristic cutoff for “chatty” or control-plane flows
-///   (e.g., TCP ACKs, SSH, VoIP) that benefit from shorter quanta to reduce jitter.
-const DEFAULT_QUANTUM_CONFIG: QuantumConfig = QuantumConfig {
-    min_quantum: 1_500,
-    max_quantum: 16 * 1024,
-    target_burst_packets: 10,
-    small_packet_threshold: 200,
-};
-
-#[derive(Clone, Copy, Debug)]
-struct DrrQuantumStrategy {
-    config: QuantumConfig,
-}
-
-/// Immutable default strategy reused by every flow to avoid repeatedly constructing the same tuning profile.
-const DEFAULT_DRR_QUANTUM_STRATEGY: DrrQuantumStrategy = DrrQuantumStrategy {
-    config: DEFAULT_QUANTUM_CONFIG,
-};
-
-impl DrrQuantumStrategy {
-    /// Calculates the optimal Deficit Round Robin (DRR) quantum based on historical packet
-    /// statistics.
-    ///
-    /// Strategy overview:
-    /// - If we have no packet history, fall back to the caller-provided default to avoid guessing.
-    /// - Small packets (below `small_packet_threshold`) get the minimum quantum to keep the
-    ///   scheduler cycling quickly and minimize jitter for interactive traffic.
-    /// - Otherwise we scale linearly to target `target_burst_packets` per turn and clamp the result
-    ///   between `min_quantum` and `max_quantum` so bulk flows gain efficiency without starving
-    ///   others.
-    fn recommended_quantum(&self, avg_packet_size: Option<usize>, default_quantum: usize) -> usize {
-        match avg_packet_size {
-            Some(avg) if avg < self.config.small_packet_threshold => self.config.min_quantum,
-            Some(avg) => {
-                let target = avg.saturating_mul(self.config.target_burst_packets);
-                target.clamp(self.config.min_quantum, self.config.max_quantum)
-            }
-            None => default_quantum,
-        }
     }
 }
 
@@ -211,10 +109,8 @@ pub(crate) struct Scheduler {
     total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
-    connection_limiter: ConnectionLimiter,
+    admission: ConnectionAdmission,
     shutdown_requested: bool,
-    pending_connection_tasks: usize,
-    pending_connection_task_ids: HashSet<FlowId>,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -309,28 +205,7 @@ impl Handler<TryStartConnectionTask> for Scheduler {
     type Result = Result<(), RegisterError>;
 
     fn handle(&mut self, msg: TryStartConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
-        if let Some(limit) = self.max_connections() {
-            let in_flight = self
-                .current_connection_count()
-                .saturating_add(self.pending_connection_tasks);
-            if in_flight >= limit.get() {
-                return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
-            }
-        }
-
-        if !self.pending_connection_task_ids.insert(msg.flow_id) {
-            warn!(
-                "flow{}: duplicate pending connection task reservation",
-                msg.flow_id.0
-            );
-            return Err(RegisterError::DuplicateConnectionTask {
-                flow_id: msg.flow_id,
-            });
-        }
-
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
-        self.log_pending_connection_task_diagnostics("started");
-        Ok(())
+        self.admission.try_start_connection_task(msg.flow_id)
     }
 }
 
@@ -367,10 +242,8 @@ impl Scheduler {
             total_backend_to_client_bytes: 0,
             global_start_time: None,
             total_ticks: 0,
-            connection_limiter: ConnectionLimiter::new(),
+            admission: ConnectionAdmission::new(),
             shutdown_requested: false,
-            pending_connection_tasks: 0,
-            pending_connection_task_ids: HashSet::new(),
         }
     }
 
@@ -378,45 +251,38 @@ impl Scheduler {
     ///
     /// Use `None` to allow unlimited connections.
     pub(crate) fn with_max_connections(mut self, max_connections: MaxConnections) -> Self {
-        self.connection_limiter.set_max_connections(max_connections);
+        self.admission.set_max_connections(max_connections);
         self
     }
 
     fn try_increment_connection_count(&self) -> Result<(), RegisterError> {
-        self.connection_limiter.try_acquire()
+        self.admission.try_acquire_registered()
     }
 
     fn decrement_connection_count(&self) {
-        self.connection_limiter.release();
+        self.admission.release_registered();
     }
 
     fn current_connection_count(&self) -> usize {
-        self.connection_limiter.current()
+        self.admission.current_connection_count()
     }
 
     fn finish_pending_connection_task(&mut self, flow_id: FlowId) -> bool {
-        if !self.pending_connection_task_ids.remove(&flow_id) {
-            return false;
-        }
-
-        if self.pending_connection_tasks == 0 {
-            warn!("connection task finished but pending counter is already zero");
-        }
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
-        self.log_pending_connection_task_diagnostics("finished");
-        true
+        self.admission.finish_pending_connection_task(flow_id)
     }
 
     fn max_connections(&self) -> MaxConnections {
-        self.connection_limiter.max_connections()
+        self.admission.max_connections()
     }
 
     fn should_stop(&self) -> bool {
-        self.shutdown_requested && self.flows.is_empty() && self.pending_connection_tasks == 0
+        self.shutdown_requested
+            && self.flows.is_empty()
+            && self.admission.pending_connection_tasks() == 0
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
-        let pending = self.pending_connection_tasks;
+        let pending = self.admission.pending_connection_tasks();
         match self.max_connections() {
             Some(limit) => info!(
                 "flow{}: {} (connections: {}/{}, pending_connect_tasks: {})",
@@ -434,30 +300,6 @@ impl Scheduler {
                 pending
             ),
         };
-    }
-
-    fn log_pending_connection_task_diagnostics(&self, action: &str) {
-        let pending = self.pending_connection_tasks;
-        if !should_log_pending_connection_task_diagnostics(pending) {
-            return;
-        }
-
-        let max_connections = self.max_connections();
-        match max_connections {
-            Some(limit) => debug!(
-                "connection task {} (pending_connect_tasks: {}, connections: {}/{})",
-                action,
-                pending,
-                self.current_connection_count(),
-                limit
-            ),
-            None => debug!(
-                "connection task {} (pending_connect_tasks: {}, connections: {})",
-                action,
-                pending,
-                self.current_connection_count()
-            ),
-        }
     }
 
     fn register(
@@ -523,10 +365,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
     type Result = bool;
 
     fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
-        match self.max_connections() {
-            Some(limit) => self.current_connection_count() < limit.get(),
-            None => true,
-        }
+        self.admission.can_accept_connection()
     }
 }
 
@@ -752,10 +591,6 @@ impl Scheduler {
     }
 }
 
-fn should_log_pending_connection_task_diagnostics(pending: usize) -> bool {
-    pending > 16 && (pending.is_power_of_two() || pending.is_multiple_of(100))
-}
-
 #[cfg(test)]
 pub(super) struct InspectReply {
     pub connections: usize,
@@ -789,7 +624,7 @@ impl Handler<InspectState> for Scheduler {
             flow_ids: self.flows.keys().copied().collect(),
             total_client_to_backend_bytes: self.total_client_to_backend_bytes,
             total_backend_to_client_bytes: self.total_backend_to_client_bytes,
-            pending_connection_tasks: self.pending_connection_tasks,
+            pending_connection_tasks: self.admission.pending_connection_tasks(),
         })
     }
 }
@@ -1330,44 +1165,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_drr_quantum_strategy_cases() {
-        let strategy = DEFAULT_DRR_QUANTUM_STRATEGY;
-        let config = strategy.config;
-        let default_quantum = 4096;
-
-        // Validate DRR quantum selection across key regimes: no stats, small packets,
-        // burst-scaled packets, and clamped large packets.
-        let cases = vec![
-            (None, default_quantum, "no stats uses default"),
-            (
-                Some(config.small_packet_threshold - 1),
-                config.min_quantum,
-                "small packets get minimum quantum",
-            ),
-            (
-                Some(config.small_packet_threshold + 50),
-                (config.small_packet_threshold + 50)
-                    .saturating_mul(config.target_burst_packets)
-                    .clamp(config.min_quantum, config.max_quantum),
-                "moderate packets scale by burst target",
-            ),
-            (
-                Some(config.max_quantum + 1),
-                config.max_quantum,
-                "large packets clamp at maximum",
-            ),
-        ];
-
-        for (avg, expected, label) in cases {
-            assert_eq!(
-                strategy.recommended_quantum(avg, default_quantum),
-                expected,
-                "{}",
-                label
-            );
-        }
-    }
     #[actix_rt::test]
     async fn test_quantum_adapts_with_filtered_average() {
         let queue = QueueActor::new().start();
@@ -1394,42 +1191,6 @@ mod tests {
             flow.recommended_quantum(default_quantum),
             16384,
             "EMA should adapt and drive the quantum to MAX_QUANTUM after sustained large packets"
-        );
-    }
-
-    #[test]
-    fn test_flow_stats_ema() {
-        let mut stats = FlowStats::new();
-
-        // Initial state
-        assert!(stats.avg_packet_size().is_none());
-
-        // First packet: initializes average
-        stats.update(1000);
-        assert_eq!(stats.avg_packet_size(), Some(1000));
-
-        // Second packet: 2000 bytes
-        // ALPHA = 0.2
-        // avg = 1000 + 0.2 * (2000 - 1000) = 1000 + 200 = 1200
-        stats.update(2000);
-        assert_eq!(stats.avg_packet_size(), Some(1200));
-
-        // Third packet: 500 bytes
-        // avg = 1200 + 0.2 * (500 - 1200) = 1200 + 0.2 * (-700) = 1200 - 140 = 1060
-        stats.update(500);
-        assert_eq!(stats.avg_packet_size(), Some(1060));
-
-        // Convergence test: constant stream of 2000 bytes
-        // It should approach 2000.
-        for _ in 0..50 {
-            stats.update(2000);
-        }
-        // After many updates, it should be very close to 2000.
-        let avg = stats.avg_packet_size().unwrap();
-        assert!(
-            (1900..=2000).contains(&avg),
-            "Average should converge to 2000, got {}",
-            avg
         );
     }
 }
