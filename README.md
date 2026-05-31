@@ -155,9 +155,8 @@ fyntr \
   --threat-action block
 ```
 
-Supported feed formats are plain domain/IP lines and AdGuard-style domain rules such as `||example.com^` or `||1.2.3.4^`.
-Unsupported filter rules are skipped and counted in startup logs.
-If the file cannot be read, cannot be loaded, or contains no supported entries, Fyntr fails to start.
+Feeds can contain plain domain/IP lines or AdGuard-style rules such as `||example.com^` and `||1.2.3.4^`.
+Unsupported rules are skipped and reported in startup logs. Fyntr fails to start if no supported entries can be loaded.
 
 ## CLI Options
 
