@@ -1,6 +1,14 @@
-use clap::Parser;
+use std::path::PathBuf;
+
+use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use fyntr::run::{self, BindAddress, DEFAULT_BIND, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ThreatActionCli {
+    Warn,
+    Block,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,6 +49,14 @@ struct Cli {
     /// Domains (or suffixes) to explicitly allow for CONNECT destinations.
     #[clap(long, env = "FYNTR_ALLOW_DOMAIN", value_delimiter = ',')]
     allow_domain: Vec<String>,
+
+    /// Local threat feed files with domain/IP entries to warn on or block.
+    #[clap(long, env = "FYNTR_THREAT_FEED_FILE", value_delimiter = ',')]
+    threat_feed_file: Vec<PathBuf>,
+
+    /// Action to take when a CONNECT target matches a configured threat feed.
+    #[clap(long, env = "FYNTR_THREAT_ACTION", value_enum, default_value = "warn")]
+    threat_action: ThreatActionCli,
 }
 
 #[actix_rt::main]
@@ -67,6 +83,12 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     for domain in cli.allow_domain {
         server = server.allow_domain(domain);
+    }
+    for path in cli.threat_feed_file {
+        server = server.threat_feed_file(path);
+    }
+    if matches!(cli.threat_action, ThreatActionCli::Block) {
+        server = server.block_threats();
     }
 
     server.foreground().await

@@ -5,7 +5,7 @@ mod status_response;
 
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::{
     io::BufReader,
     net::{
@@ -30,6 +30,7 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
+    threat::{ThreatAction, ThreatMatch},
 };
 
 use self::backoff::connect_to_any_with_backoff;
@@ -116,6 +117,27 @@ impl fmt::Display for ConnectAuthority<'_> {
 
 fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
     ConnectAuthority { host, port }
+}
+
+fn log_threat_match(
+    flow_id: FlowId,
+    action: ThreatAction,
+    target_authority: &ConnectAuthority<'_>,
+    client_addr: SocketAddr,
+    threat_match: &ThreatMatch,
+) {
+    let matched = threat_match.matched();
+    let host = threat_match.host().unwrap_or("");
+    warn!(
+        "flow{}: threat_match=true action={} match_type={} host={} matched={} connect_target={} client_addr={}",
+        flow_id.0,
+        action.as_str(),
+        threat_match.match_type(),
+        host,
+        matched,
+        target_authority,
+        client_addr
+    );
 }
 
 struct ConnectSession {
@@ -259,6 +281,22 @@ impl ConnectState {
         };
         let target_authority = format_connect_authority(&target_host, target_port);
         info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
+        if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target_host) {
+            let threat_action = session.connect_policy.threat_action();
+            log_threat_match(
+                session.flow_id,
+                threat_action,
+                &target_authority,
+                session.client_addr,
+                &threat_match,
+            );
+            if matches!(threat_action, ThreatAction::Block) {
+                let detail = format!("CONNECT {} blocked by threat feed", target_authority);
+                return session
+                    .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+                    .await;
+            }
+        }
 
         await_with_timeout_response(
             session.flow_id,
@@ -613,6 +651,7 @@ mod tests {
         actors::scheduler::TryStartConnectionTask,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
+        threat::{ThreatAction, ThreatIndex},
     };
     use std::{future::Future, time::Duration};
 
@@ -663,6 +702,15 @@ mod tests {
 
     fn default_policy() -> Arc<ConnectPolicy> {
         Arc::new(ConnectPolicy::from_config(ConnectPolicyConfig::default()))
+    }
+
+    fn policy_with_blocking_threat_feed(feed: &str) -> Arc<ConnectPolicy> {
+        let config = ConnectPolicyConfig {
+            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
+            threat_action: ThreatAction::Block,
+            ..ConnectPolicyConfig::default()
+        };
+        Arc::new(ConnectPolicy::from_config(config))
     }
 
     fn policy_with_loopback_and_port_allowed(port: u16) -> Arc<ConnectPolicy> {
@@ -781,6 +829,30 @@ mod tests {
                 .unwrap();
             read_response(client).await
         })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_403_when_threat_action_blocks_target() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(
+            listener,
+            scheduler,
+            policy_with_blocking_threat_feed("||example.invalid^\n"),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                client
+                    .write_all(b"CONNECT api.example.invalid:443 HTTP/1.1\r\nHost: example\r\n\r\n")
+                    .await
+                    .unwrap();
+                read_response(client).await
+            },
+        )
         .await;
 
         assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
