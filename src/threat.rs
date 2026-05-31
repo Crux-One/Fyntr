@@ -113,10 +113,6 @@ impl ThreatIndex {
             }
         }
 
-        if domains.is_empty() && ips.is_empty() {
-            return Err(anyhow!("threat feed contains no supported entries"));
-        }
-
         let stats = ThreatFeedStats {
             domains: domains.len(),
             ips: ips.len(),
@@ -333,9 +329,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_feed_with_no_supported_entries() {
-        let err = ThreatIndex::from_feed_content("! comments only\n# none\n").unwrap_err();
-        assert!(err.to_string().contains("no supported entries"));
+    fn parses_feed_content_with_no_supported_entries() {
+        let (index, stats) = ThreatIndex::from_feed_content("! comments only\n# none\n").unwrap();
+
+        assert_eq!(stats.domains, 0);
+        assert_eq!(stats.ips, 0);
+        assert_eq!(stats.skipped, 0);
+        assert!(index.lookup_host("example.com").is_none());
     }
 
     #[test]
@@ -371,6 +371,44 @@ mod tests {
 
         assert!(index.lookup_host("api.evil.com").is_some());
         assert!(index.lookup_host("1.2.3.4").is_some());
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn merges_multiple_feed_files_when_one_file_has_no_supported_entries() {
+        let dir = std::env::temp_dir();
+        let empty = dir.join(format!("fyntr-threat-feed-empty-{}", std::process::id()));
+        let valid = dir.join(format!("fyntr-threat-feed-valid-{}", std::process::id()));
+        fs::write(&empty, "! comments only\n# none\n").unwrap();
+        fs::write(&valid, "||evil.com^\n").unwrap();
+
+        let index = ThreatIndex::from_feed_files(&[&empty, &valid]).unwrap();
+
+        assert!(index.lookup_host("api.evil.com").is_some());
+
+        let _ = fs::remove_file(empty);
+        let _ = fs::remove_file(valid);
+    }
+
+    #[test]
+    fn rejects_feed_files_when_merged_index_has_no_supported_entries() {
+        let dir = std::env::temp_dir();
+        let first = dir.join(format!(
+            "fyntr-threat-feed-unsupported-first-{}",
+            std::process::id()
+        ));
+        let second = dir.join(format!(
+            "fyntr-threat-feed-unsupported-second-{}",
+            std::process::id()
+        ));
+        fs::write(&first, "! comments only\n").unwrap();
+        fs::write(&second, "||evil.com^$important\n").unwrap();
+
+        let err = ThreatIndex::from_feed_files(&[&first, &second]).unwrap_err();
+
+        assert!(err.to_string().contains("no supported entries"));
 
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
