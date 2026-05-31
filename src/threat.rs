@@ -361,9 +361,9 @@ mod tests {
 
     #[test]
     fn merges_multiple_feed_files() {
-        let dir = std::env::temp_dir();
-        let first = dir.join(format!("fyntr-threat-feed-first-{}", std::process::id()));
-        let second = dir.join(format!("fyntr-threat-feed-second-{}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
         fs::write(&first, "||evil.com^\n").unwrap();
         fs::write(&second, "||1.2.3.4^\n").unwrap();
 
@@ -371,46 +371,31 @@ mod tests {
 
         assert!(index.lookup_host("api.evil.com").is_some());
         assert!(index.lookup_host("1.2.3.4").is_some());
-
-        let _ = fs::remove_file(first);
-        let _ = fs::remove_file(second);
     }
 
     #[test]
     fn merges_multiple_feed_files_when_one_file_has_no_supported_entries() {
-        let dir = std::env::temp_dir();
-        let empty = dir.join(format!("fyntr-threat-feed-empty-{}", std::process::id()));
-        let valid = dir.join(format!("fyntr-threat-feed-valid-{}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.txt");
+        let valid = dir.path().join("valid.txt");
         fs::write(&empty, "! comments only\n# none\n").unwrap();
         fs::write(&valid, "||evil.com^\n").unwrap();
 
         let index = ThreatIndex::from_feed_files(&[&empty, &valid]).unwrap();
 
         assert!(index.lookup_host("api.evil.com").is_some());
-
-        let _ = fs::remove_file(empty);
-        let _ = fs::remove_file(valid);
     }
 
     #[test]
     fn rejects_feed_files_when_merged_index_has_no_supported_entries() {
-        let dir = std::env::temp_dir();
-        let first = dir.join(format!(
-            "fyntr-threat-feed-unsupported-first-{}",
-            std::process::id()
-        ));
-        let second = dir.join(format!(
-            "fyntr-threat-feed-unsupported-second-{}",
-            std::process::id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("unsupported-first.txt");
+        let second = dir.path().join("unsupported-second.txt");
         fs::write(&first, "! comments only\n").unwrap();
         fs::write(&second, "||evil.com^$important\n").unwrap();
 
         let err = ThreatIndex::from_feed_files(&[&first, &second]).unwrap_err();
 
         assert!(err.to_string().contains("no supported entries"));
-
-        let _ = fs::remove_file(first);
-        let _ = fs::remove_file(second);
     }
 }
