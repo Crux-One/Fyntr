@@ -27,6 +27,7 @@ No server-side configuration, no inspection, and low baseline memory use.
 
 ## Internals
 - Transparent CONNECT relay: Forwards TLS traffic E2E without termination or inspection.
+- Threat detection: Loads local domain/IP feeds at startup and matches CONNECT hosts against an immutable in-memory index.
 - Traffic shaping: Interleaves packets across active flows using Deficit Round-Robin (DRR).
 - Adaptive quantum tuning: Adjusts DRR quantum from observed packet-size statistics.
 - FD limit guard: Checks file descriptor limits against max connection settings at startup.
@@ -122,7 +123,7 @@ aws-vault exec my-profile -- terraform apply
 These examples assume you installed the `fyntr` binary.
 If you are running from source, replace `fyntr ...` with `cargo run --release -- ...`.
 
-Set a higher connection limit:
+### Set a higher connection limit:
 
 ```bash
 # CLI flags
@@ -133,7 +134,7 @@ FYNTR_MAX_CONNECTIONS=2048 \
 fyntr
 ```
 
-Allow only explicit `CONNECT` ports:
+### Allow only explicit `CONNECT` ports:
 
 ```bash
 # CLI flags
@@ -145,32 +146,18 @@ FYNTR_ALLOW_PORT=8443 \
 fyntr
 ```
 
-Warn when a `CONNECT` target matches a local threat feed:
-
-```bash
-# CLI flag
-fyntr --threat-feed-file ./urlhaus-filter-agh.txt
-
-# Equivalent via environment variable
-FYNTR_THREAT_FEED_FILE=./urlhaus-filter-agh.txt \
-fyntr
-```
-
-Multiple feeds can be provided by repeating the flag or comma-separating the environment value.
-Threat matches warn by default; use `--threat-action block` to reject matching `CONNECT` targets with `403 Forbidden`.
+### Detect `CONNECT` targets with a threat feed:
 
 ```bash
 fyntr \
-  --threat-feed-file ./urlhaus-filter-agh.txt \
-  --threat-feed-file ./phishing-domains.txt \
+  --threat-feed-file ./phishing-domains-1.txt \
+  --threat-feed-file ./phishing-domains-2.txt \
   --threat-action block
 ```
 
-The threat feed is loaded once at startup into an immutable in-memory index.
-Supported MVP formats are plain domain/IP lines and AdGuard-style domain rules such as `||example.com^` or `||1.2.3.4^`.
+Supported feed formats are plain domain/IP lines and AdGuard-style domain rules such as `||example.com^` or `||1.2.3.4^`.
 Unsupported filter rules are skipped and counted in startup logs.
 If the file cannot be read, cannot be loaded, or contains no supported entries, Fyntr fails to start.
-Threat matches emit structured warning logs with fields such as `threat_match=true`, `action`, `match_type`, `host`, and `matched`.
 
 ## CLI Options
 
@@ -191,8 +178,11 @@ Threat matches emit structured warning logs with fields such as `threat_match=tr
 | `--deny-cidr <CIDR>` | `FYNTR_DENY_CIDR` | Internal ranges | CIDR ranges denied for `CONNECT` destination IPs (repeat flag or comma-separate). |
 | `--allow-cidr <CIDR>` | `FYNTR_ALLOW_CIDR` | none | CIDR exceptions that are allowed even if they match denied internal ranges. |
 | `--allow-domain <DOMAIN>` | `FYNTR_ALLOW_DOMAIN` | none | Domain/suffix allowlist for `CONNECT` targets. When a domain matches, addresses blocked by deny CIDRs are filtered out rather than causing the entire connection to fail. If all resolved addresses are blocked, the connection is denied. |
-| `--threat-feed-file <PATH>` | `FYNTR_THREAT_FEED_FILE` | none | Local threat feed file with domain/IP entries to warn on or block. Repeat flag or comma-separate to load multiple feeds. Supports plain domain/IP lines and AdGuard-style `||host^` rules. |
-| `--threat-action <warn\|block>` | `FYNTR_THREAT_ACTION` | `warn` | Action to take when a `CONNECT` target matches a configured threat feed. |
+| `--threat-feed-file <PATH>` | `FYNTR_THREAT_FEED_FILE` | none | Local threat feed file with domain/IP entries to warn on or block (repeat flag or comma-separate to load multiple feeds). The feed is loaded once at startup into an immutable in-memory index. |
+| `--threat-action <warn\|block>` | `FYNTR_THREAT_ACTION` | `warn` | Warn on matching `CONNECT` targets, or reject them with `403 Forbidden` when set to `block`. |
+
+> [!NOTE]
+> `--allow-domain` applies only to CONNECT CIDR policy exceptions. It does not override threat feed matches.
 
 ## Why Fyntr?
 Cloud automation tools such as Terraform can spawn bursts of TCP connections that rapidly open and close, especially when managing many resources in parallel.
