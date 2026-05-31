@@ -358,6 +358,14 @@ impl ServerBuilder {
     }
 
     fn build_connect_policy(&mut self) -> Result<ConnectPolicy> {
+        if self.threat_feed_files.is_empty()
+            && matches!(self.connect_policy.threat_action, ThreatAction::Block)
+        {
+            return Err(anyhow!(
+                "--threat-action block requires at least one --threat-feed-file"
+            ));
+        }
+
         if !self.threat_feed_files.is_empty() {
             self.connect_policy.threat_index =
                 Some(ThreatIndex::from_feed_files(&self.threat_feed_files)?);
@@ -727,6 +735,14 @@ mod tests {
     fn no_warning_when_within_limits() {
         let warnings = nofile_warnings(max_connections_from_raw(100), Some((1000, 2000)));
         assert!(warnings.is_empty(), "no warnings expected within limits");
+    }
+
+    #[test]
+    fn block_threats_requires_threat_feed_file() {
+        let err = ServerBuilder::new().block_threats().build_connect_policy();
+
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("--threat-feed-file"));
     }
 
     #[test]
