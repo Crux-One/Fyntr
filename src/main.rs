@@ -88,7 +88,7 @@ async fn main() -> Result<(), anyhow::Error> {
         server = server.threat_feed_file(path);
     }
     if matches!(cli.threat_action, ThreatActionCli::Block) {
-        server = server.block_threats();
+        server = server.reject_threats();
     }
 
     server.foreground().await

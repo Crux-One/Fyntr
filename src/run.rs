@@ -349,10 +349,10 @@ impl ServerBuilder {
         self
     }
 
-    /// Blocks CONNECT targets that match a configured threat feed.
+    /// Rejects CONNECT targets that match a configured threat feed.
     ///
     /// The default action is warn-only.
-    pub fn block_threats(mut self) -> Self {
+    pub fn reject_threats(mut self) -> Self {
         self.connect_policy.threat_action = ThreatAction::Block;
         self
     }
@@ -738,8 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn block_threats_requires_threat_feed_file() {
-        let err = ServerBuilder::new().block_threats().build_connect_policy();
+    fn reject_threats_requires_threat_feed_file() {
+        let err = ServerBuilder::new().reject_threats().build_connect_policy();
 
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--threat-feed-file"));
