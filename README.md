@@ -27,10 +27,9 @@ No server-side configuration, no inspection, and low baseline memory use.
 
 ## Internals
 - Transparent CONNECT relay: Forwards TLS traffic E2E without termination or inspection.
-- Threat detection: Loads local domain/IP feeds at startup and matches CONNECT hosts against an immutable in-memory index.
 - Traffic shaping: Interleaves packets across active flows using Deficit Round-Robin (DRR).
 - Adaptive quantum tuning: Adjusts DRR quantum from observed packet-size statistics.
-- FD limit guard: Checks file descriptor limits against max connection settings at startup.
+- Threat detection: Checks CONNECT hosts and resolved addresses against local domain/IP feeds loaded at startup.
 - DoS guardrails: Caps request line/header sizes and per-flow queue buffering.
 
 ## Quick Start
@@ -146,12 +145,12 @@ FYNTR_ALLOW_PORT=8443 \
 fyntr
 ```
 
-### Detect `CONNECT` targets with a threat feed:
+### Detect `CONNECT` targets with threat feeds:
 
 ```bash
 fyntr \
-  --threat-feed-file ./phishing-domains-1.txt \
-  --threat-feed-file ./phishing-domains-2.txt \
+  --threat-feed-file ./phishing-domains.txt \
+  --threat-feed-file ./malicious-ips.txt \
   --threat-action block
 ```
 
