@@ -1,11 +1,17 @@
-use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 mod backoff;
 mod status_response;
 
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::{
     io::BufReader,
     net::{
@@ -30,6 +36,7 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
+    threat::{ThreatAction, ThreatMatch},
 };
 
 use self::backoff::connect_to_any_with_backoff;
@@ -116,6 +123,78 @@ impl fmt::Display for ConnectAuthority<'_> {
 
 fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
     ConnectAuthority { host, port }
+}
+
+fn log_threat_match(
+    flow_id: FlowId,
+    action: ThreatAction,
+    target_authority: &ConnectAuthority<'_>,
+    client_addr: SocketAddr,
+    threat_match: &ThreatMatch,
+) {
+    let matched = threat_match.matched();
+    let host = threat_match.host().unwrap_or("");
+    warn!(
+        "flow{}: threat_match=true action={} match_type={} host={} matched={} connect_target={} client_addr={}",
+        flow_id.0,
+        action.as_str(),
+        threat_match.match_type(),
+        host,
+        matched,
+        target_authority,
+        client_addr
+    );
+}
+
+fn resolved_threat_matches(
+    connect_policy: &ConnectPolicy,
+    target: &ResolvedConnectTarget,
+) -> Vec<ThreatMatch> {
+    if target.host.parse::<IpAddr>().is_ok() {
+        return Vec::new();
+    }
+
+    target
+        .addrs
+        .iter()
+        .filter_map(|addr| connect_policy.lookup_threat_ip(&target.host, addr.ip()))
+        .collect()
+}
+
+async fn handle_resolved_threat_matches(
+    session: &mut ConnectSession,
+    target_authority: &ConnectAuthority<'_>,
+    threat_matches: &[ThreatMatch],
+) -> ConnectResult<()> {
+    if threat_matches.is_empty() {
+        return Ok(());
+    }
+
+    let threat_action = session.connect_policy.threat_action();
+    let should_block = matches!(threat_action, ThreatAction::Block);
+    let log_count = if should_block {
+        1
+    } else {
+        threat_matches.len()
+    };
+    for threat_match in threat_matches.iter().take(log_count) {
+        log_threat_match(
+            session.flow_id,
+            threat_action,
+            target_authority,
+            session.client_addr,
+            threat_match,
+        );
+    }
+
+    if should_block {
+        let detail = format!("CONNECT {} blocked by threat feed", target_authority);
+        return session
+            .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+            .await;
+    }
+
+    Ok(())
 }
 
 struct ConnectSession {
@@ -259,6 +338,22 @@ impl ConnectState {
         };
         let target_authority = format_connect_authority(&target_host, target_port);
         info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
+        if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target_host) {
+            let threat_action = session.connect_policy.threat_action();
+            log_threat_match(
+                session.flow_id,
+                threat_action,
+                &target_authority,
+                session.client_addr,
+                &threat_match,
+            );
+            if matches!(threat_action, ThreatAction::Block) {
+                let detail = format!("CONNECT {} blocked by threat feed", target_authority);
+                return session
+                    .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+                    .await;
+            }
+        }
 
         await_with_timeout_response(
             session.flow_id,
@@ -298,6 +393,10 @@ impl ConnectState {
                     .await;
             }
         };
+
+        let resolved_threat_matches = resolved_threat_matches(&session.connect_policy, &target);
+        handle_resolved_threat_matches(&mut session, &target_authority, &resolved_threat_matches)
+            .await?;
 
         Ok(ConnectState::Dialing { session, target })
     }
@@ -613,6 +712,7 @@ mod tests {
         actors::scheduler::TryStartConnectionTask,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
+        threat::{ThreatAction, ThreatIndex},
     };
     use std::{future::Future, time::Duration};
 
@@ -665,6 +765,23 @@ mod tests {
         Arc::new(ConnectPolicy::from_config(ConnectPolicyConfig::default()))
     }
 
+    fn policy_with_blocking_threat_feed(feed: &str) -> Arc<ConnectPolicy> {
+        let config = ConnectPolicyConfig {
+            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
+            threat_action: ThreatAction::Block,
+            ..ConnectPolicyConfig::default()
+        };
+        Arc::new(ConnectPolicy::from_config(config))
+    }
+
+    fn policy_with_threat_feed(feed: &str) -> ConnectPolicy {
+        let config = ConnectPolicyConfig {
+            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
+            ..ConnectPolicyConfig::default()
+        };
+        ConnectPolicy::from_config(config)
+    }
+
     fn policy_with_loopback_and_port_allowed(port: u16) -> Arc<ConnectPolicy> {
         let mut config = ConnectPolicyConfig::default();
         config.allowed_ports.push(port);
@@ -675,6 +792,48 @@ mod tests {
             .allow_cidrs
             .push("::1/128".parse::<ConnectCidr>().unwrap());
         Arc::new(ConnectPolicy::from_config(config))
+    }
+
+    #[test]
+    fn resolved_threat_matches_checks_authorized_addrs() {
+        let policy = policy_with_threat_feed("||1.2.3.4^\n||5.6.7.8^\n");
+        let target = ResolvedConnectTarget {
+            host: "bad.example".to_string(),
+            port: 443,
+            addrs: vec![
+                SocketAddr::new("1.2.3.4".parse().unwrap(), 443),
+                SocketAddr::new("5.6.7.8".parse().unwrap(), 443),
+                SocketAddr::new("9.9.9.9".parse().unwrap(), 443),
+            ],
+        };
+
+        let matches = resolved_threat_matches(&policy, &target);
+
+        assert_eq!(
+            matches,
+            vec![
+                ThreatMatch::Ip {
+                    host: "bad.example".to_string(),
+                    ip: "1.2.3.4".parse().unwrap()
+                },
+                ThreatMatch::Ip {
+                    host: "bad.example".to_string(),
+                    ip: "5.6.7.8".parse().unwrap()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_threat_matches_skips_ip_literal_targets() {
+        let policy = policy_with_threat_feed("||1.2.3.4^\n");
+        let target = ResolvedConnectTarget {
+            host: "1.2.3.4".to_string(),
+            port: 443,
+            addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
+        };
+
+        assert!(resolved_threat_matches(&policy, &target).is_empty());
     }
 
     #[actix_rt::test]
@@ -781,6 +940,30 @@ mod tests {
                 .unwrap();
             read_response(client).await
         })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_403_when_threat_action_blocks_target() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(
+            listener,
+            scheduler,
+            policy_with_blocking_threat_feed("||example.invalid^\n"),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                client
+                    .write_all(b"CONNECT api.example.invalid:443 HTTP/1.1\r\nHost: example\r\n\r\n")
+                    .await
+                    .unwrap();
+                read_response(client).await
+            },
+        )
         .await;
 
         assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");

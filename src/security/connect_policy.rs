@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use tokio::net::lookup_host;
 
 use crate::limits::MAX_RESOLVED_CONNECT_ADDRS;
+use crate::threat::{ThreatAction, ThreatIndex, ThreatMatch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectCidr {
@@ -110,6 +111,8 @@ pub(crate) struct ConnectPolicyConfig {
     pub(crate) deny_cidrs: Vec<ConnectCidr>,
     pub(crate) allow_cidrs: Vec<ConnectCidr>,
     pub(crate) allow_domains: Vec<String>,
+    pub(crate) threat_index: Option<ThreatIndex>,
+    pub(crate) threat_action: ThreatAction,
 }
 
 impl Default for ConnectPolicyConfig {
@@ -120,6 +123,8 @@ impl Default for ConnectPolicyConfig {
             deny_cidrs: default_denied_cidrs(),
             allow_cidrs: Vec::new(),
             allow_domains: Vec::new(),
+            threat_index: None,
+            threat_action: ThreatAction::Warn,
         }
     }
 }
@@ -130,6 +135,8 @@ pub(crate) struct ConnectPolicy {
     deny_cidrs: Vec<ConnectCidr>,
     allow_cidrs: Vec<ConnectCidr>,
     allow_domains: Vec<String>,
+    threat_index: Option<ThreatIndex>,
+    threat_action: ThreatAction,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +175,21 @@ impl ConnectPolicy {
             deny_cidrs: config.deny_cidrs,
             allow_cidrs: config.allow_cidrs,
             allow_domains,
+            threat_index: config.threat_index,
+            threat_action: config.threat_action,
         }
+    }
+
+    pub(crate) fn threat_action(&self) -> ThreatAction {
+        self.threat_action
+    }
+
+    pub(crate) fn lookup_threat_host(&self, host: &str) -> Option<ThreatMatch> {
+        self.threat_index.as_ref()?.lookup_host(host)
+    }
+
+    pub(crate) fn lookup_threat_ip(&self, host: &str, ip: IpAddr) -> Option<ThreatMatch> {
+        self.threat_index.as_ref()?.lookup_ip(host, ip)
     }
 
     pub(crate) async fn resolve_and_authorize(
