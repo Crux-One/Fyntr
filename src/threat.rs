@@ -125,11 +125,7 @@ impl ThreatIndex {
     pub(crate) fn lookup_host(&self, host: &str) -> Option<ThreatMatch> {
         let normalized = normalize_request_host(host)?;
         if let Ok(ip) = normalized.parse::<IpAddr>() {
-            let ip = canonicalize_ip(ip);
-            return self.ips.contains(&ip).then_some(ThreatMatch::Ip {
-                host: normalized,
-                ip,
-            });
+            return self.lookup_ip(&normalized, ip);
         }
 
         let mut candidate = normalized.as_str();
@@ -148,6 +144,14 @@ impl ThreatIndex {
         }
 
         None
+    }
+
+    pub(crate) fn lookup_ip(&self, host: &str, ip: IpAddr) -> Option<ThreatMatch> {
+        let ip = canonicalize_ip(ip);
+        self.ips.contains(&ip).then_some(ThreatMatch::Ip {
+            host: host.to_string(),
+            ip,
+        })
     }
 }
 

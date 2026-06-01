@@ -1,4 +1,10 @@
-use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 mod backoff;
 mod status_response;
@@ -138,6 +144,57 @@ fn log_threat_match(
         target_authority,
         client_addr
     );
+}
+
+fn resolved_threat_matches(
+    connect_policy: &ConnectPolicy,
+    target: &ResolvedConnectTarget,
+) -> Vec<ThreatMatch> {
+    if target.host.parse::<IpAddr>().is_ok() {
+        return Vec::new();
+    }
+
+    target
+        .addrs
+        .iter()
+        .filter_map(|addr| connect_policy.lookup_threat_ip(&target.host, addr.ip()))
+        .collect()
+}
+
+async fn handle_resolved_threat_matches(
+    session: &mut ConnectSession,
+    target_authority: &ConnectAuthority<'_>,
+    threat_matches: &[ThreatMatch],
+) -> ConnectResult<()> {
+    if threat_matches.is_empty() {
+        return Ok(());
+    }
+
+    let threat_action = session.connect_policy.threat_action();
+    let should_block = matches!(threat_action, ThreatAction::Block);
+    let log_count = if should_block {
+        1
+    } else {
+        threat_matches.len()
+    };
+    for threat_match in threat_matches.iter().take(log_count) {
+        log_threat_match(
+            session.flow_id,
+            threat_action,
+            target_authority,
+            session.client_addr,
+            threat_match,
+        );
+    }
+
+    if should_block {
+        let detail = format!("CONNECT {} blocked by threat feed", target_authority);
+        return session
+            .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
+            .await;
+    }
+
+    Ok(())
 }
 
 struct ConnectSession {
@@ -336,6 +393,10 @@ impl ConnectState {
                     .await;
             }
         };
+
+        let resolved_threat_matches = resolved_threat_matches(&session.connect_policy, &target);
+        handle_resolved_threat_matches(&mut session, &target_authority, &resolved_threat_matches)
+            .await?;
 
         Ok(ConnectState::Dialing { session, target })
     }
@@ -713,6 +774,14 @@ mod tests {
         Arc::new(ConnectPolicy::from_config(config))
     }
 
+    fn policy_with_threat_feed(feed: &str) -> ConnectPolicy {
+        let config = ConnectPolicyConfig {
+            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
+            ..ConnectPolicyConfig::default()
+        };
+        ConnectPolicy::from_config(config)
+    }
+
     fn policy_with_loopback_and_port_allowed(port: u16) -> Arc<ConnectPolicy> {
         let mut config = ConnectPolicyConfig::default();
         config.allowed_ports.push(port);
@@ -723,6 +792,48 @@ mod tests {
             .allow_cidrs
             .push("::1/128".parse::<ConnectCidr>().unwrap());
         Arc::new(ConnectPolicy::from_config(config))
+    }
+
+    #[test]
+    fn resolved_threat_matches_checks_authorized_addrs() {
+        let policy = policy_with_threat_feed("||1.2.3.4^\n||5.6.7.8^\n");
+        let target = ResolvedConnectTarget {
+            host: "bad.example".to_string(),
+            port: 443,
+            addrs: vec![
+                SocketAddr::new("1.2.3.4".parse().unwrap(), 443),
+                SocketAddr::new("5.6.7.8".parse().unwrap(), 443),
+                SocketAddr::new("9.9.9.9".parse().unwrap(), 443),
+            ],
+        };
+
+        let matches = resolved_threat_matches(&policy, &target);
+
+        assert_eq!(
+            matches,
+            vec![
+                ThreatMatch::Ip {
+                    host: "bad.example".to_string(),
+                    ip: "1.2.3.4".parse().unwrap()
+                },
+                ThreatMatch::Ip {
+                    host: "bad.example".to_string(),
+                    ip: "5.6.7.8".parse().unwrap()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_threat_matches_skips_ip_literal_targets() {
+        let policy = policy_with_threat_feed("||1.2.3.4^\n");
+        let target = ResolvedConnectTarget {
+            host: "1.2.3.4".to_string(),
+            port: 443,
+            addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
+        };
+
+        assert!(resolved_threat_matches(&policy, &target).is_empty());
     }
 
     #[actix_rt::test]

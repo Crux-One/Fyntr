@@ -188,6 +188,10 @@ impl ConnectPolicy {
         self.threat_index.as_ref()?.lookup_host(host)
     }
 
+    pub(crate) fn lookup_threat_ip(&self, host: &str, ip: IpAddr) -> Option<ThreatMatch> {
+        self.threat_index.as_ref()?.lookup_ip(host, ip)
+    }
+
     pub(crate) async fn resolve_and_authorize(
         &self,
         host: &str,
