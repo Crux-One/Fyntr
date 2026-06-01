@@ -44,7 +44,10 @@ pub(crate) struct ThreatFeedStats {
 }
 
 impl ThreatIndex {
-    pub(crate) fn from_feed_files(paths: &[impl AsRef<Path>]) -> Result<Self> {
+    pub(crate) fn from_feed_files<P>(paths: &[P]) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
         let mut merged = Self {
             domains: HashSet::new(),
             ips: HashSet::new(),
