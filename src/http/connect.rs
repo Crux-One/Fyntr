@@ -132,18 +132,38 @@ fn log_threat_match(
     client_addr: SocketAddr,
     threat_match: &ThreatMatch,
 ) {
-    let matched = threat_match.matched();
-    let host = threat_match.host().unwrap_or("");
-    warn!(
-        "flow{}: threat_match=true action={} match_type={} host={} matched={} connect_target={} client_addr={}",
-        flow_id.0,
-        action.as_str(),
-        threat_match.match_type(),
-        host,
-        matched,
-        target_authority,
-        client_addr
-    );
+    match threat_match {
+        ThreatMatch::Domain {
+            raw_host,
+            ascii_host,
+            matched_domain,
+        } => {
+            warn!(
+                "flow{}: threat_match=true action={} match_type=domain raw_host={} ascii_host={} matched_domain={} connect_target={} client_addr={}",
+                flow_id.0,
+                action.as_str(),
+                raw_host,
+                ascii_host,
+                matched_domain,
+                target_authority,
+                client_addr
+            );
+        }
+        ThreatMatch::Ip {
+            raw_host,
+            matched_ip,
+        } => {
+            warn!(
+                "flow{}: threat_match=true action={} match_type=ip raw_host={} matched_ip={} connect_target={} client_addr={}",
+                flow_id.0,
+                action.as_str(),
+                raw_host,
+                matched_ip,
+                target_authority,
+                client_addr
+            );
+        }
+    }
 }
 
 fn resolved_threat_matches(
@@ -813,12 +833,12 @@ mod tests {
             matches,
             vec![
                 ThreatMatch::Ip {
-                    host: "bad.example".to_string(),
-                    ip: "1.2.3.4".parse().unwrap()
+                    raw_host: "bad.example".to_string(),
+                    matched_ip: "1.2.3.4".parse().unwrap()
                 },
                 ThreatMatch::Ip {
-                    host: "bad.example".to_string(),
-                    ip: "5.6.7.8".parse().unwrap()
+                    raw_host: "bad.example".to_string(),
+                    matched_ip: "5.6.7.8".parse().unwrap()
                 }
             ]
         );

@@ -155,6 +155,7 @@ fyntr \
 ```
 
 Feeds can contain plain domain/IP lines or AdGuard-style rules such as `||example.com^` and `||1.2.3.4^`.
+Domain entries and request hosts are normalized with IDNA ToASCII before matching.
 Unsupported rules are skipped and reported in startup logs. Fyntr fails to start if no supported entries can be loaded.
 
 ## CLI Options
