@@ -1,6 +1,7 @@
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::{
         Arc,
@@ -28,6 +29,7 @@ use crate::{
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
     security::connect_policy::{ConnectCidr, ConnectPolicy, ConnectPolicyConfig},
+    threat::{ThreatAction, ThreatIndex},
 };
 
 pub const DEFAULT_PORT: u16 = 9999;
@@ -250,6 +252,7 @@ pub struct ServerBuilder {
     port: u16,
     max_connections: MaxConnections,
     connect_policy: ConnectPolicyConfig,
+    threat_feed_files: Vec<PathBuf>,
 }
 
 impl Default for ServerBuilder {
@@ -265,6 +268,7 @@ impl ServerBuilder {
             port: DEFAULT_PORT,
             max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
             connect_policy: ConnectPolicyConfig::default(),
+            threat_feed_files: Vec::new(),
         }
     }
 
@@ -333,21 +337,60 @@ impl ServerBuilder {
         self
     }
 
+    /// Loads threat domain/IP entries from a local feed file at startup.
+    ///
+    /// Supported MVP formats are plain domain/IP lines and AdGuard-style `||host^` rules.
+    /// Unsupported rules are skipped, but the server fails to start if no supported entries remain.
+    pub fn threat_feed_file<P>(mut self, path: P) -> Self
+    where
+        P: Into<PathBuf>,
+    {
+        self.threat_feed_files.push(path.into());
+        self
+    }
+
+    /// Rejects CONNECT targets that match a configured threat feed.
+    ///
+    /// The default action is warn-only.
+    pub fn reject_threats(mut self) -> Self {
+        self.connect_policy.threat_action = ThreatAction::Block;
+        self
+    }
+
+    fn build_connect_policy(&mut self) -> Result<ConnectPolicy> {
+        if self.threat_feed_files.is_empty()
+            && matches!(self.connect_policy.threat_action, ThreatAction::Block)
+        {
+            return Err(anyhow!(
+                "--threat-action block requires at least one --threat-feed-file"
+            ));
+        }
+
+        if !self.threat_feed_files.is_empty() {
+            self.connect_policy.threat_index =
+                Some(ThreatIndex::from_feed_files(&self.threat_feed_files)?);
+        }
+
+        Ok(ConnectPolicy::from_config(std::mem::take(
+            &mut self.connect_policy,
+        )))
+    }
+
     /// Runs the server in the background and returns a handle for shutdown.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn background(self) -> Result<ServerHandle> {
-        let bind_addrs = self.bind.resolve(self.port).await?;
-        let connect_policy = Arc::new(ConnectPolicy::from_config(self.connect_policy));
+    pub async fn background(mut self) -> Result<ServerHandle> {
+        let bind_addrs = self.bind.clone().resolve(self.port).await?;
+        let connect_policy = Arc::new(self.build_connect_policy()?);
         start_with_addrs(bind_addrs, self.max_connections, connect_policy).await
     }
 
     /// Runs the server in the foreground to completion without returning a handle.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn foreground(self) -> Result<()> {
-        let bind_addrs = self.bind.resolve(self.port).await?;
-        let connect_policy = Arc::new(ConnectPolicy::from_config(self.connect_policy));
+    pub async fn foreground(mut self) -> Result<()> {
+        let bind_addrs = self.bind.clone().resolve(self.port).await?;
+        let connect_policy = Arc::new(self.build_connect_policy()?);
         server_with_addrs(bind_addrs, self.max_connections, connect_policy).await
     }
 
@@ -692,6 +735,14 @@ mod tests {
     fn no_warning_when_within_limits() {
         let warnings = nofile_warnings(max_connections_from_raw(100), Some((1000, 2000)));
         assert!(warnings.is_empty(), "no warnings expected within limits");
+    }
+
+    #[test]
+    fn reject_threats_requires_threat_feed_file() {
+        let err = ServerBuilder::new().reject_threats().build_connect_policy();
+
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("--threat-feed-file"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ name: Rusty Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.rs"
       - "Cargo.toml"
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

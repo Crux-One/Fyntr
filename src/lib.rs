@@ -6,4 +6,5 @@ pub mod run;
 pub(crate) mod security;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod threat;
 pub(crate) mod util;
