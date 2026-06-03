@@ -2,7 +2,7 @@ name: Rusty Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.rs"
       - "Cargo.toml"
