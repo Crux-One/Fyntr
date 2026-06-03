@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt, fs, net::IpAddr, path::Path, str::FromStr};
 use anyhow::{Context, Result, anyhow};
 use idna::AsciiDenyList;
 use log::{info, warn};
+use unicode_script::{Script, UnicodeScript};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThreatIndex {
@@ -251,6 +252,33 @@ pub(crate) fn normalize_host(
     Ok(NormalizedHost::Domain(ascii_host))
 }
 
+pub(crate) fn has_mixed_scripts(host: &str) -> bool {
+    if host.is_ascii() {
+        return false;
+    }
+
+    host.split('.').any(label_has_mixed_strong_scripts)
+}
+
+fn label_has_mixed_strong_scripts(label: &str) -> bool {
+    let mut scripts = 0u8;
+
+    for ch in label.chars() {
+        match ch.script() {
+            Script::Latin => scripts |= 0b001,
+            Script::Cyrillic => scripts |= 0b010,
+            Script::Greek => scripts |= 0b100,
+            _ => {}
+        }
+
+        if scripts.count_ones() > 1 {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_valid_domain(value: &str) -> bool {
     if value.len() > 253 || value.starts_with('.') || value.ends_with('.') {
         return false;
@@ -447,6 +475,39 @@ mod tests {
         let index: ThreatIndex = "||evil.com^".parse().unwrap();
 
         assert!(index.lookup_host("bad host.com").is_none());
+    }
+
+    #[test]
+    fn detects_latin_cyrillic_mixed_script_label() {
+        assert!(has_mixed_scripts("fаke.invalid"));
+        assert!(has_mixed_scripts("fаkе.invalid"));
+    }
+
+    #[test]
+    fn ordinary_ascii_host_is_not_mixed_script() {
+        assert!(!has_mixed_scripts("example.com"));
+    }
+
+    #[test]
+    fn latin_non_ascii_host_is_not_mixed_script() {
+        assert!(!has_mixed_scripts("bücher.de"));
+    }
+
+    #[test]
+    fn ignored_scripts_do_not_create_mixed_script_warning() {
+        assert!(!has_mixed_scripts("日本語.invalid"));
+        assert!(!has_mixed_scripts("日本abc.invalid"));
+        assert!(!has_mixed_scripts("東京-example.jp"));
+    }
+
+    #[test]
+    fn strong_scripts_in_separate_labels_are_not_mixed_script() {
+        assert!(!has_mixed_scripts("жд.invalid"));
+    }
+
+    #[test]
+    fn detects_latin_greek_mixed_script_label() {
+        assert!(has_mixed_scripts("fαke.invalid"));
     }
 
     #[test]

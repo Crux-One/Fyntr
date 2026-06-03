@@ -36,7 +36,7 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
-    threat::{ThreatAction, ThreatMatch},
+    threat::{NormalizedHost, ThreatAction, ThreatMatch, has_mixed_scripts, normalize_host},
 };
 
 use self::backoff::connect_to_any_with_backoff;
@@ -164,6 +164,26 @@ fn log_threat_match(
             );
         }
     }
+}
+
+fn log_mixed_script_host(
+    flow_id: FlowId,
+    raw_host: &str,
+    target_authority: &ConnectAuthority<'_>,
+    client_addr: SocketAddr,
+) {
+    if !has_mixed_scripts(raw_host) {
+        return;
+    }
+
+    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
+        return;
+    };
+
+    warn!(
+        "flow{}: mixed_script=true reason=mixed_script_host raw_host={} ascii_host={} connect_target={} client_addr={}",
+        flow_id.0, raw_host, ascii_host, target_authority, client_addr
+    );
 }
 
 fn resolved_threat_matches(
@@ -358,6 +378,12 @@ impl ConnectState {
         };
         let target_authority = format_connect_authority(&target_host, target_port);
         info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
+        log_mixed_script_host(
+            session.flow_id,
+            &target_host,
+            &target_authority,
+            session.client_addr,
+        );
         if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target_host) {
             let threat_action = session.connect_policy.threat_action();
             log_threat_match(
@@ -734,13 +760,53 @@ mod tests {
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
         threat::{ThreatAction, ThreatIndex},
     };
-    use std::{future::Future, time::Duration};
+    use std::{
+        future::Future,
+        sync::{Mutex as StdMutex, Once},
+        time::Duration,
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         task, time,
     };
+
+    static TEST_LOGGER: CapturingLogger = CapturingLogger;
+    static LOGGER_INIT: Once = Once::new();
+    static CAPTURED_LOGS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+    static LOG_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                CAPTURED_LOGS.lock().unwrap().push(format!(
+                    "{} {}",
+                    record.target(),
+                    record.args()
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn init_test_logger() {
+        LOGGER_INIT.call_once(|| {
+            let _ = log::set_logger(&TEST_LOGGER);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    fn captured_logs() -> Vec<String> {
+        CAPTURED_LOGS.lock().unwrap().clone()
+    }
 
     async fn read_response(mut stream: TcpStream) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -854,6 +920,38 @@ mod tests {
         };
 
         assert!(resolved_threat_matches(&policy, &target).is_empty());
+    }
+
+    #[test]
+    fn mixed_script_warning_logs_raw_and_ascii_host() {
+        init_test_logger();
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        CAPTURED_LOGS.lock().unwrap().clear();
+
+        let raw_host = "fаke.invalid";
+        let NormalizedHost::Domain(expected_ascii_host) = normalize_host(raw_host).unwrap() else {
+            panic!("test host should normalize as a domain");
+        };
+        let target_authority = format_connect_authority(raw_host, 443);
+        log_mixed_script_host(
+            FlowId(42),
+            raw_host,
+            &target_authority,
+            "127.0.0.1:12345".parse().unwrap(),
+        );
+
+        let logs = captured_logs();
+        assert!(
+            logs.iter().any(|log| {
+                log.contains("mixed_script=true")
+                    && log.contains("reason=mixed_script_host")
+                    && log.contains("raw_host=fаke.invalid")
+                    && log.contains(&format!("ascii_host={expected_ascii_host}"))
+                    && log.contains("connect_target=fаke.invalid:443")
+                    && log.contains("client_addr=127.0.0.1:12345")
+            }),
+            "expected mixed-script warning log, got {logs:?}"
+        );
     }
 
     #[actix_rt::test]
