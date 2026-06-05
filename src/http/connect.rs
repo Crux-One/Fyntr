@@ -8,7 +8,7 @@ use std::{
 
 mod backoff;
 mod status_response;
-mod upstream;
+pub(crate) mod upstream;
 
 use actix::prelude::*;
 use anyhow::anyhow;

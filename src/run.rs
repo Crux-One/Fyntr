@@ -29,6 +29,7 @@ use crate::{
     http::connect::handle_connect_proxy,
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
     security::connect_policy::{ConnectCidr, ConnectPolicy, ConnectPolicyConfig},
+    socks5::handle_socks5_proxy,
     threat::{ThreatAction, ThreatIndex},
 };
 
@@ -213,6 +214,7 @@ fn order_bind_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// A best-effort shutdown signal is sent on drop, but in-flight tasks may still continue briefly.
 pub struct ServerHandle {
     listen_addr: SocketAddr,
+    socks5_listen_addr: Option<SocketAddr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<Result<()>>>,
 }
@@ -221,6 +223,11 @@ impl ServerHandle {
     /// Returns the socket address the server is listening on.
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
+    }
+
+    /// Returns the SOCKS5 listen address when the optional SOCKS5 listener is enabled.
+    pub fn socks5_listen_addr(&self) -> Option<SocketAddr> {
+        self.socks5_listen_addr
     }
 
     /// Stops accepting new connections but does not terminate in-flight tasks.
@@ -253,6 +260,8 @@ pub struct ServerBuilder {
     max_connections: MaxConnections,
     connect_policy: ConnectPolicyConfig,
     threat_feed_files: Vec<PathBuf>,
+    socks5_bind: Option<BindAddress>,
+    socks5_port: Option<u16>,
 }
 
 impl Default for ServerBuilder {
@@ -269,6 +278,8 @@ impl ServerBuilder {
             max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
             connect_policy: ConnectPolicyConfig::default(),
             threat_feed_files: Vec::new(),
+            socks5_bind: None,
+            socks5_port: None,
         }
     }
 
@@ -357,6 +368,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the optional SOCKS5 listener bind address.
+    ///
+    /// This has no effect unless [`Self::socks5_port`] is also set. When omitted, the SOCKS5
+    /// listener uses the main HTTP CONNECT bind address.
+    pub fn socks5_bind<B>(mut self, bind: B) -> Self
+    where
+        B: Into<BindAddress>,
+    {
+        self.socks5_bind = Some(bind.into());
+        self
+    }
+
+    /// Enables a no-auth SOCKS5 CONNECT-only listener on the given port.
+    pub fn socks5_port(mut self, port: u16) -> Self {
+        self.socks5_port = Some(port);
+        self
+    }
+
     fn build_connect_policy(&mut self) -> Result<ConnectPolicy> {
         if self.threat_feed_files.is_empty()
             && matches!(self.connect_policy.threat_action, ThreatAction::Block)
@@ -381,8 +410,15 @@ impl ServerBuilder {
     /// Returns an error if address resolution or binding fails.
     pub async fn background(mut self) -> Result<ServerHandle> {
         let bind_addrs = self.bind.clone().resolve(self.port).await?;
+        let socks5_bind_addrs = self.resolve_socks5_bind_addrs().await?;
         let connect_policy = Arc::new(self.build_connect_policy()?);
-        start_with_addrs(bind_addrs, self.max_connections, connect_policy).await
+        start_with_addrs(
+            bind_addrs,
+            socks5_bind_addrs,
+            self.max_connections,
+            connect_policy,
+        )
+        .await
     }
 
     /// Runs the server in the foreground to completion without returning a handle.
@@ -390,8 +426,15 @@ impl ServerBuilder {
     /// Returns an error if address resolution or binding fails.
     pub async fn foreground(mut self) -> Result<()> {
         let bind_addrs = self.bind.clone().resolve(self.port).await?;
+        let socks5_bind_addrs = self.resolve_socks5_bind_addrs().await?;
         let connect_policy = Arc::new(self.build_connect_policy()?);
-        server_with_addrs(bind_addrs, self.max_connections, connect_policy).await
+        server_with_addrs(
+            bind_addrs,
+            socks5_bind_addrs,
+            self.max_connections,
+            connect_policy,
+        )
+        .await
     }
 
     #[deprecated(note = "use background() instead")]
@@ -403,6 +446,18 @@ impl ServerBuilder {
     pub async fn run(self) -> Result<()> {
         self.foreground().await
     }
+
+    async fn resolve_socks5_bind_addrs(&self) -> Result<Option<Vec<SocketAddr>>> {
+        let Some(port) = self.socks5_port else {
+            return Ok(None);
+        };
+
+        let bind = self
+            .socks5_bind
+            .clone()
+            .unwrap_or_else(|| self.bind.clone());
+        Ok(Some(bind.resolve(port).await?))
+    }
 }
 
 /// Creates a new `ServerBuilder` with default settings.
@@ -412,15 +467,25 @@ pub fn server() -> ServerBuilder {
 
 async fn server_with_addrs(
     bind_addrs: Vec<SocketAddr>,
+    socks5_bind_addrs: Option<Vec<SocketAddr>>,
     max_connections: MaxConnections,
     connect_policy: Arc<ConnectPolicy>,
 ) -> Result<()> {
     let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
-    run_server(listener, max_connections, connect_policy, None).await
+    let socks5_listener = prepare_optional_listener(socks5_bind_addrs).await?;
+    run_server(
+        listener,
+        socks5_listener,
+        max_connections,
+        connect_policy,
+        None,
+    )
+    .await
 }
 
 async fn start_with_addrs(
     bind_addrs: Vec<SocketAddr>,
+    socks5_bind_addrs: Option<Vec<SocketAddr>>,
     max_connections: MaxConnections,
     connect_policy: Arc<ConnectPolicy>,
 ) -> Result<ServerHandle> {
@@ -428,9 +493,16 @@ async fn start_with_addrs(
     let listen_addr = listener
         .local_addr()
         .context("failed to resolve listen address")?;
+    let socks5_listener = prepare_optional_listener(socks5_bind_addrs).await?;
+    let socks5_listen_addr = socks5_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
+        .context("failed to resolve SOCKS5 listen address")?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let join_handle = actix::spawn(run_server(
         listener,
+        socks5_listener,
         max_connections,
         connect_policy,
         Some(shutdown_rx),
@@ -438,9 +510,19 @@ async fn start_with_addrs(
 
     Ok(ServerHandle {
         listen_addr,
+        socks5_listen_addr,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join_handle),
     })
+}
+
+async fn prepare_optional_listener(
+    bind_addrs: Option<Vec<SocketAddr>>,
+) -> Result<Option<TcpListener>> {
+    let Some(bind_addrs) = bind_addrs else {
+        return Ok(None);
+    };
+    bind_listener(bind_addrs).await.map(Some)
 }
 
 async fn prepare_listener(
@@ -453,6 +535,10 @@ async fn prepare_listener(
     let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
+    Ok((bind_listener(bind_addrs).await?, max_connections))
+}
+
+async fn bind_listener(bind_addrs: Vec<SocketAddr>) -> Result<TcpListener> {
     let mut last_err = None;
     for addr in bind_addrs {
         match TcpListener::bind(addr).await {
@@ -462,7 +548,7 @@ async fn prepare_listener(
                     .context("failed to resolve listen address")?;
                 maybe_warn_non_loopback(bound_addr);
                 info!("Starting Fyntr on {}", bound_addr);
-                return Ok((listener, max_connections));
+                return Ok(listener);
             }
             Err(err) => last_err = Some((addr, err)),
         }
@@ -478,6 +564,7 @@ async fn prepare_listener(
 
 async fn run_server(
     listener: TcpListener,
+    socks5_listener: Option<TcpListener>,
     max_connections: MaxConnections,
     connect_policy: Arc<ConnectPolicy>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -493,7 +580,25 @@ async fn run_server(
     let flow_counter = Arc::new(AtomicUsize::new(1));
 
     loop {
-        let accept_result = if let Some(rx) = shutdown_rx.as_mut() {
+        let accept_result = if let Some(socks5_listener) = socks5_listener.as_ref() {
+            if let Some(rx) = shutdown_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = rx => {
+                        info!("Shutdown signal received; stopping accept loop and requesting scheduler shutdown");
+                        scheduler.do_send(SchedulerShutdown);
+                        break;
+                    }
+                    accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+                    accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
+                }
+            } else {
+                tokio::select! {
+                    accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+                    accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
+                }
+            }
+        } else if let Some(rx) = shutdown_rx.as_mut() {
             tokio::select! {
                 biased;
                 _ = rx => {
@@ -501,26 +606,37 @@ async fn run_server(
                     scheduler.do_send(SchedulerShutdown);
                     break;
                 }
-                accept = listener.accept() => accept,
+                accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
             }
         } else {
-            listener.accept().await
+            listener
+                .accept()
+                .await
+                .map(|accepted| (accepted, InboundProtocol::HttpConnect))
         };
 
-        let (client_stream, client_addr) = accept_result?;
+        let ((client_stream, client_addr), protocol) = accept_result?;
         let flow_id = FlowId(flow_counter.fetch_add(1, Ordering::SeqCst));
 
-        info!("flow{}: new connection from {}", flow_id.0, client_addr);
+        info!(
+            "flow{}: new {} connection from {}",
+            flow_id.0,
+            protocol.as_str(),
+            client_addr
+        );
 
         let scheduler = scheduler.clone();
         let pending_reservation = match scheduler.send(TryStartConnectionTask { flow_id }).await {
             Ok(Ok(())) => PendingConnectionReservation::new(scheduler.clone(), flow_id),
             Ok(Err(err)) => {
                 warn!(
-                    "flow{}: rejecting connection from {} before CONNECT parsing: {}",
-                    flow_id.0, client_addr, err
+                    "flow{}: rejecting {} connection from {} before parsing: {}",
+                    flow_id.0,
+                    protocol.as_str(),
+                    client_addr,
+                    err
                 );
-                reject_over_capacity(client_stream).await;
+                reject_over_capacity(client_stream, protocol).await;
                 continue;
             }
             Err(err) => {
@@ -528,7 +644,7 @@ async fn run_server(
                     "flow{}: scheduler unavailable while reserving connection task: {}",
                     flow_id.0, err
                 );
-                reject_over_capacity(client_stream).await;
+                reject_over_capacity(client_stream, protocol).await;
                 continue;
             }
         };
@@ -537,15 +653,30 @@ async fn run_server(
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
-            let result = handle_connect_proxy(
-                client_stream,
-                client_addr,
-                flow_id,
-                scheduler,
-                connect_policy,
-                pending_reservation,
-            )
-            .await;
+            let result = match protocol {
+                InboundProtocol::HttpConnect => {
+                    handle_connect_proxy(
+                        client_stream,
+                        client_addr,
+                        flow_id,
+                        scheduler,
+                        connect_policy,
+                        pending_reservation,
+                    )
+                    .await
+                }
+                InboundProtocol::Socks5 => {
+                    handle_socks5_proxy(
+                        client_stream,
+                        client_addr,
+                        flow_id,
+                        scheduler,
+                        connect_policy,
+                        pending_reservation,
+                    )
+                    .await
+                }
+            };
             if let Err(e) = result {
                 error!("flow{}: error: {}", flow_id.0, e);
             }
@@ -555,12 +686,34 @@ async fn run_server(
     Ok(())
 }
 
-async fn reject_over_capacity(mut client_stream: tokio::net::TcpStream) {
-    if let Err(err) = client_stream
-        .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
-        .await
-    {
-        debug!("failed to write over-capacity response: {}", err);
+#[derive(Clone, Copy)]
+enum InboundProtocol {
+    HttpConnect,
+    Socks5,
+}
+
+impl InboundProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpConnect => "HTTP CONNECT",
+            Self::Socks5 => "SOCKS5",
+        }
+    }
+}
+
+async fn reject_over_capacity(mut client_stream: tokio::net::TcpStream, protocol: InboundProtocol) {
+    match protocol {
+        InboundProtocol::HttpConnect => {
+            if let Err(err) = client_stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                .await
+            {
+                debug!("failed to write over-capacity response: {}", err);
+            }
+        }
+        InboundProtocol::Socks5 => {
+            debug!("closing over-capacity SOCKS5 connection before handshake");
+        }
     }
 }
 
@@ -679,7 +832,7 @@ fn nofile_warnings(max_connections: MaxConnections, limits: Option<(u64, u64)>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     #[test]
@@ -939,6 +1092,107 @@ mod tests {
             }
         }
 
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[actix_rt::test]
+    async fn server_accepts_socks5_connect_ipv4() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_task = actix::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .socks5_port(0)
+            .allow_port(backend_addr.port())
+            .allow_cidr("127.0.0.0/8")
+            .unwrap()
+            .background()
+            .await
+            .expect("background");
+
+        let socks5_addr = handle.socks5_listen_addr().expect("socks5 listener");
+        let mut client = TcpStream::connect(socks5_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&backend_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00);
+
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        backend_task.await.unwrap();
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[actix_rt::test]
+    async fn server_accepts_socks5_domainname_with_local_resolution() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_task = actix::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .socks5_port(0)
+            .allow_port(backend_addr.port())
+            .allow_cidr("127.0.0.0/8")
+            .unwrap()
+            .allow_cidr("::1/128")
+            .unwrap()
+            .allow_domain("localhost")
+            .background()
+            .await
+            .expect("background");
+
+        let socks5_addr = handle.socks5_listen_addr().expect("socks5 listener");
+        let mut client = TcpStream::connect(socks5_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let domain = b"localhost";
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&backend_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00);
+
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        backend_task.await.unwrap();
         handle.shutdown().await.expect("shutdown");
     }
 

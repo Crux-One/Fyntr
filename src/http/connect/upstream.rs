@@ -6,15 +6,15 @@ use crate::{flow::FlowId, security::connect_policy::ResolvedConnectTarget};
 
 use super::backoff::connect_to_any_with_backoff;
 
-pub(super) type UpstreamDialFuture<'a> =
+pub(crate) type UpstreamDialFuture<'a> =
     Pin<Box<dyn Future<Output = io::Result<UpstreamConnection>> + Send + 'a>>;
 
-pub(super) struct UpstreamConnection {
-    pub(super) stream: TcpStream,
-    pub(super) connected_addr: SocketAddr,
+pub(crate) struct UpstreamConnection {
+    pub(crate) stream: TcpStream,
+    pub(crate) connected_addr: SocketAddr,
 }
 
-pub(super) trait UpstreamDialer {
+pub(crate) trait UpstreamDialer {
     fn dial<'a>(
         &'a self,
         flow_id: FlowId,
@@ -23,7 +23,7 @@ pub(super) trait UpstreamDialer {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct DirectConnector;
+pub(crate) struct DirectConnector;
 
 impl UpstreamDialer for DirectConnector {
     fn dial<'a>(
