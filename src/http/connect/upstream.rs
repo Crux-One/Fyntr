@@ -4,17 +4,19 @@ use tokio::net::TcpStream;
 
 use crate::{flow::FlowId, security::connect_policy::ResolvedConnectTarget};
 
-use super::backoff::connect_to_any_with_backoff;
+use super::backoff::connect_to_any_with_backoff_with_log_target;
 
-pub(super) type UpstreamDialFuture<'a> =
+const UPSTREAM_LOG_TARGET: &str = module_path!();
+
+pub(crate) type UpstreamDialFuture<'a> =
     Pin<Box<dyn Future<Output = io::Result<UpstreamConnection>> + Send + 'a>>;
 
-pub(super) struct UpstreamConnection {
-    pub(super) stream: TcpStream,
-    pub(super) connected_addr: SocketAddr,
+pub(crate) struct UpstreamConnection {
+    pub(crate) stream: TcpStream,
+    pub(crate) connected_addr: SocketAddr,
 }
 
-pub(super) trait UpstreamDialer {
+pub(crate) trait UpstreamDialer {
     fn dial<'a>(
         &'a self,
         flow_id: FlowId,
@@ -23,7 +25,7 @@ pub(super) trait UpstreamDialer {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct DirectConnector;
+pub(crate) struct DirectConnector;
 
 impl UpstreamDialer for DirectConnector {
     fn dial<'a>(
@@ -32,8 +34,12 @@ impl UpstreamDialer for DirectConnector {
         target: &'a ResolvedConnectTarget,
     ) -> UpstreamDialFuture<'a> {
         Box::pin(async move {
-            let (stream, connected_addr) =
-                connect_to_any_with_backoff(flow_id, &target.addrs).await?;
+            let (stream, connected_addr) = connect_to_any_with_backoff_with_log_target(
+                flow_id,
+                &target.addrs,
+                UPSTREAM_LOG_TARGET,
+            )
+            .await?;
             Ok(UpstreamConnection {
                 stream,
                 connected_addr,

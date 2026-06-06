@@ -8,7 +8,7 @@ use std::{
 
 mod backoff;
 mod status_response;
-mod upstream;
+pub(crate) mod upstream;
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -779,7 +779,7 @@ mod tests {
     static TEST_LOGGER: CapturingLogger = CapturingLogger;
     static LOGGER_INIT: Once = Once::new();
     static CAPTURED_LOGS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
-    static LOG_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    static LOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct CapturingLogger;
 
@@ -926,10 +926,10 @@ mod tests {
         assert!(resolved_threat_matches(&policy, &target).is_empty());
     }
 
-    #[test]
-    fn mixed_script_warning_logs_raw_and_ascii_host() {
+    #[actix_rt::test]
+    async fn mixed_script_warning_logs_raw_and_ascii_host() {
         init_test_logger();
-        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        let _guard = LOG_TEST_LOCK.lock().await;
         CAPTURED_LOGS.lock().unwrap().clear();
 
         let raw_host = "fаke.invalid";
@@ -1359,5 +1359,43 @@ mod tests {
         let connection = connected.unwrap();
         assert_eq!(connection.connected_addr, reachable_addr);
         drop(connection.stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_connector_logs_backoff_under_upstream_target() {
+        init_test_logger();
+        let _guard = LOG_TEST_LOCK.lock().await;
+        CAPTURED_LOGS.lock().unwrap().clear();
+
+        let unreachable_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let target = ResolvedConnectTarget {
+            host: "127.0.0.1".to_string(),
+            port: unreachable_port,
+            addrs: vec![SocketAddr::from(([127, 0, 0, 1], unreachable_port))],
+        };
+
+        let connect_task =
+            task::spawn(async move { DirectConnector.dial(FlowId(1), &target).await });
+
+        task::yield_now().await;
+        time::advance(CONNECT_BACKOFF_BASE).await;
+        task::yield_now().await;
+        time::advance(CONNECT_BACKOFF_BASE.saturating_mul(2)).await;
+        task::yield_now().await;
+
+        assert!(connect_task.await.unwrap().is_err());
+        let logs = captured_logs();
+        assert!(
+            logs.iter().any(|log| {
+                log.starts_with("fyntr::http::connect::upstream ")
+                    && log.contains("connect round 1/3 failed")
+            }),
+            "expected upstream backoff log target, got {logs:?}"
+        );
     }
 }
