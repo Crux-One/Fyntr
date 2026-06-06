@@ -8,6 +8,7 @@ use std::{
 
 mod backoff;
 mod status_response;
+mod upstream;
 
 use actix::prelude::*;
 use anyhow::anyhow;
@@ -39,10 +40,10 @@ use crate::{
     threat::{NormalizedHost, ThreatAction, ThreatMatch, has_mixed_scripts, normalize_host},
 };
 
-use self::backoff::connect_to_any_with_backoff;
 use self::status_response::{
     StatusLine, StatusLogLevel, classify_input_error, respond_with_status,
 };
+use self::upstream::{DirectConnector, UpstreamDialer};
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
@@ -459,19 +460,21 @@ impl ConnectState {
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
         let target_authority = format_connect_authority(&target.host, target.port);
-        let (backend_stream, connected_addr) =
-            match connect_to_any_with_backoff(session.flow_id, &target.addrs).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let detail = format!(
-                        "failed to connect to {} after retries: {}",
-                        target_authority, e
-                    );
-                    return session
-                        .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
-                        .await;
-                }
-            };
+        let upstream = DirectConnector;
+        let upstream_connection = match upstream.dial(session.flow_id, &target).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                let detail = format!(
+                    "failed to connect to {} after retries: {}",
+                    target_authority, e
+                );
+                return session
+                    .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                    .await;
+            }
+        };
+        let backend_stream = upstream_connection.stream;
+        let connected_addr = upstream_connection.connected_addr;
 
         backend_stream
             .set_nodelay(true)
@@ -752,6 +755,7 @@ mod tests {
         CONNECT_BACKOFF_BASE, CONNECT_BACKOFF_MAX, connect_to_any_with_backoff,
         connect_with_backoff,
     };
+    use super::upstream::{DirectConnector, UpstreamDialer};
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
@@ -1334,5 +1338,26 @@ mod tests {
             start.elapsed() < Duration::from_millis(500),
             "connect_to_any_with_backoff spent too long before trying a fallback address"
         );
+    }
+
+    #[actix_rt::test]
+    async fn direct_connector_dials_resolved_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = listener.local_addr().unwrap();
+        let target = ResolvedConnectTarget {
+            host: "example.test".to_string(),
+            port: reachable_addr.port(),
+            addrs: vec![reachable_addr],
+        };
+
+        let accept = async move {
+            let _ = listener.accept().await.unwrap();
+        };
+        let connector = DirectConnector;
+        let ((), connected) = tokio::join!(accept, connector.dial(FlowId(1), &target));
+
+        let connection = connected.unwrap();
+        assert_eq!(connection.connected_addr, reachable_addr);
+        drop(connection.stream);
     }
 }
