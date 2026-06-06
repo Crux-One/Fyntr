@@ -1144,6 +1144,68 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn server_accepts_next_socks5_connection_after_registered_flow_closes() {
+        async fn spawn_loopback_backend(
+            accept_count: usize,
+        ) -> (SocketAddr, actix_rt::task::JoinHandle<()>) {
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend_addr = backend.local_addr().unwrap();
+            let backend_task = actix::spawn(async move {
+                for _ in 0..accept_count {
+                    let (mut stream, _) = backend.accept().await.unwrap();
+                    let mut request = [0_u8; 4];
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request, b"ping");
+                    stream.write_all(b"pong").await.unwrap();
+                }
+            });
+            (backend_addr, backend_task)
+        }
+
+        async fn socks5_round_trip(socks5_addr: SocketAddr, backend_addr: SocketAddr) {
+            let mut client = TcpStream::connect(socks5_addr).await.unwrap();
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut method = [0_u8; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [0x05, 0x00]);
+
+            let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+            request.extend_from_slice(&backend_addr.port().to_be_bytes());
+            client.write_all(&request).await.unwrap();
+
+            let mut reply = [0_u8; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x05);
+            assert_eq!(reply[1], 0x00);
+
+            client.write_all(b"ping").await.unwrap();
+            let mut response = [0_u8; 4];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"pong");
+        }
+
+        let (backend_addr, backend_task) = spawn_loopback_backend(2).await;
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .socks5_port(0)
+            .max_connections(1)
+            .allow_port(backend_addr.port())
+            .allow_cidr("127.0.0.0/8")
+            .unwrap()
+            .background()
+            .await
+            .expect("background");
+
+        let socks5_addr = handle.socks5_listen_addr().expect("socks5 listener");
+        socks5_round_trip(socks5_addr, backend_addr).await;
+        socks5_round_trip(socks5_addr, backend_addr).await;
+        backend_task.await.unwrap();
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[actix_rt::test]
     async fn server_accepts_socks5_domainname_with_local_resolution() {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
