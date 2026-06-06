@@ -156,8 +156,22 @@ fyntr \
 
 Feeds can contain plain domain/IP lines or AdGuard-style rules such as `||example.com^` and `||1.2.3.4^`.
 Domain entries and request hosts are normalized with IDNA ToASCII before matching.
-Fyntr also warns on suspicious mixed-script Unicode hostname labels, such as Latin mixed with Cyrillic or Greek, but those spoofing signals do not block traffic.
+
 Unsupported rules are skipped and reported in startup logs. Fyntr fails to start if no supported entries can be loaded.
+
+Fyntr also warns on suspicious mixed-script Unicode hostname labels, such as Latin mixed with Cyrillic or Greek. These spoofing signals are warnings only and do not block traffic.
+
+As a concrete example, Fyntr can use the AdGuard Home/Pi-hole and dnscrypt-proxy blocked names and IPs lists from [`curbengh/urlhaus-filter`](https://github.com/curbengh/urlhaus-filter#full-version), which publishes [URLHaus](https://urlhaus.abuse.ch/)-based feeds.
+
+```bash
+# Download the dnscrypt-proxy blocked names/IPs feeds
+wget https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-dnscrypt-blocked-names.txt
+wget https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-dnscrypt-blocked-ips.txt
+fyntr \
+  --threat-feed-file ./urlhaus-filter-dnscrypt-blocked-ips.txt \
+  --threat-feed-file ./urlhaus-filter-dnscrypt-blocked-names.txt \
+  --threat-action block
+```
 
 ## CLI Options
 
