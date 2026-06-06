@@ -8,12 +8,12 @@ use tokio::{
 
 use crate::flow::FlowId;
 
-use super::CONNECT_LOG_TARGET;
-
 const CONNECT_MAX_ATTEMPTS: usize = 3;
 pub(super) const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 pub(super) const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const CONNECT_BACKOFF_LOG_TARGET: &str = module_path!();
 
 #[cfg(test)]
 pub(super) async fn connect_with_backoff(
@@ -29,7 +29,7 @@ pub(super) async fn connect_with_backoff(
             Err(err) if attempt == CONNECT_MAX_ATTEMPTS => return Err(err),
             Err(err) => {
                 warn!(
-                    target: CONNECT_LOG_TARGET,
+                    target: CONNECT_BACKOFF_LOG_TARGET,
                     "flow{}: connect attempt {}/{} to {} failed: {}; backing off {:?}",
                     flow_id.0, attempt, CONNECT_MAX_ATTEMPTS, backend_addr, err, delay
                 );
@@ -41,9 +41,19 @@ pub(super) async fn connect_with_backoff(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn connect_to_any_with_backoff(
     flow_id: FlowId,
     backend_addrs: &[SocketAddr],
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    connect_to_any_with_backoff_with_log_target(flow_id, backend_addrs, CONNECT_BACKOFF_LOG_TARGET)
+        .await
+}
+
+pub(super) async fn connect_to_any_with_backoff_with_log_target(
+    flow_id: FlowId,
+    backend_addrs: &[SocketAddr],
+    log_target: &'static str,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
     if backend_addrs.is_empty() {
         return Err(std::io::Error::new(
@@ -77,7 +87,7 @@ pub(super) async fn connect_to_any_with_backoff(
 
         if attempt < CONNECT_MAX_ATTEMPTS {
             warn!(
-                target: CONNECT_LOG_TARGET,
+                target: log_target,
                 "flow{}: connect round {}/{} failed for all {} addresses; backing off {:?}",
                 flow_id.0,
                 attempt,

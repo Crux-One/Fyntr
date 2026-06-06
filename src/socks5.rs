@@ -390,9 +390,18 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                 "domain",
             )
             .await?;
-            String::from_utf8(name).map_err(|err| {
-                Socks5FlowError::Fatal(anyhow!("invalid SOCKS5 domain name: {}", err))
-            })?
+            match String::from_utf8(name) {
+                Ok(host) => host,
+                Err(err) => {
+                    warn!(
+                        "flow{}: invalid SOCKS5 domain name: {}",
+                        session.flow_id.0, err
+                    );
+                    return session
+                        .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                        .await;
+                }
+            }
         }
         SOCKS5_ATYP_IPV6 => {
             let mut octets = [0_u8; 16];

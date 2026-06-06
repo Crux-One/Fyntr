@@ -4,7 +4,9 @@ use tokio::net::TcpStream;
 
 use crate::{flow::FlowId, security::connect_policy::ResolvedConnectTarget};
 
-use super::backoff::connect_to_any_with_backoff;
+use super::backoff::connect_to_any_with_backoff_with_log_target;
+
+const UPSTREAM_LOG_TARGET: &str = module_path!();
 
 pub(crate) type UpstreamDialFuture<'a> =
     Pin<Box<dyn Future<Output = io::Result<UpstreamConnection>> + Send + 'a>>;
@@ -32,8 +34,12 @@ impl UpstreamDialer for DirectConnector {
         target: &'a ResolvedConnectTarget,
     ) -> UpstreamDialFuture<'a> {
         Box::pin(async move {
-            let (stream, connected_addr) =
-                connect_to_any_with_backoff(flow_id, &target.addrs).await?;
+            let (stream, connected_addr) = connect_to_any_with_backoff_with_log_target(
+                flow_id,
+                &target.addrs,
+                UPSTREAM_LOG_TARGET,
+            )
+            .await?;
             Ok(UpstreamConnection {
                 stream,
                 connected_addr,

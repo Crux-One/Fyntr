@@ -1197,6 +1197,35 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn server_rejects_invalid_socks5_domainname_as_unsupported_address_type() {
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .socks5_port(0)
+            .background()
+            .await
+            .expect("background");
+
+        let socks5_addr = handle.socks5_listen_addr().expect("socks5 listener");
+        let mut client = TcpStream::connect(socks5_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, 1, 0xff];
+        request.extend_from_slice(&443_u16.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x08);
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[actix_rt::test]
     async fn server_foreground_smoke() {
         let server_task = actix::spawn(async move {
             server()
