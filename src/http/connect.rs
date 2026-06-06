@@ -779,7 +779,7 @@ mod tests {
     static TEST_LOGGER: CapturingLogger = CapturingLogger;
     static LOGGER_INIT: Once = Once::new();
     static CAPTURED_LOGS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
-    static LOG_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    static LOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct CapturingLogger;
 
@@ -926,10 +926,10 @@ mod tests {
         assert!(resolved_threat_matches(&policy, &target).is_empty());
     }
 
-    #[test]
-    fn mixed_script_warning_logs_raw_and_ascii_host() {
+    #[actix_rt::test]
+    async fn mixed_script_warning_logs_raw_and_ascii_host() {
         init_test_logger();
-        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        let _guard = LOG_TEST_LOCK.lock().await;
         CAPTURED_LOGS.lock().unwrap().clear();
 
         let raw_host = "fаke.invalid";
@@ -1364,7 +1364,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn direct_connector_logs_backoff_under_upstream_target() {
         init_test_logger();
-        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        let _guard = LOG_TEST_LOCK.lock().await;
         CAPTURED_LOGS.lock().unwrap().clear();
 
         let unreachable_port = {
