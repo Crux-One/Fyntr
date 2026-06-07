@@ -12,7 +12,7 @@ use tokio::{
 use crate::{
     actors::{
         queue::{Close, Enqueue, EnqueueError, QueueActor},
-        scheduler::{RecordDownstreamBytes, Scheduler, Unregister},
+        scheduler::{CanAcceptConnection, RecordDownstreamBytes, Scheduler, Unregister},
     },
     util::{format_bytes, format_rate},
 };
@@ -24,6 +24,41 @@ const ENQUEUE_BACKPRESSURE_LOG_EVERY: u32 = 200;
 const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
 const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
+
+#[derive(Debug)]
+pub(crate) enum SchedulerCapacityError {
+    AtCapacity {
+        phase: &'static str,
+    },
+    Unavailable {
+        phase: &'static str,
+        source: MailboxError,
+    },
+}
+
+impl std::fmt::Display for SchedulerCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AtCapacity { phase } => write!(f, "scheduler at capacity {}", phase),
+            Self::Unavailable { phase, source } => {
+                write!(f, "failed to check capacity {}: {}", phase, source)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchedulerCapacityError {}
+
+pub(crate) async fn ensure_scheduler_capacity(
+    scheduler: &Addr<Scheduler>,
+    phase: &'static str,
+) -> Result<(), SchedulerCapacityError> {
+    match scheduler.send(CanAcceptConnection).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SchedulerCapacityError::AtCapacity { phase }),
+        Err(source) => Err(SchedulerCapacityError::Unavailable { phase, source }),
+    }
+}
 
 /// RAII guard that tears down queue and scheduler registrations if a flow exits early.
 ///

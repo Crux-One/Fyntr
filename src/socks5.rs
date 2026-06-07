@@ -21,13 +21,14 @@ use tokio::{
 use crate::{
     actors::{
         queue::QueueActor,
-        scheduler::{
-            CanAcceptConnection, PendingConnectionReservation, Register, RegisterError, Scheduler,
-        },
+        scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
     flow::{
         FlowId,
-        connection::{FlowCleanup, start_bidirectional_tunnel},
+        connection::{
+            FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
+            start_bidirectional_tunnel,
+        },
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -458,22 +459,20 @@ async fn read_with_timeout(
 
 async fn reject_if_scheduler_at_capacity(
     session: &mut Socks5Session,
-    phase: &str,
+    phase: &'static str,
 ) -> Socks5Result<()> {
-    match session.scheduler.send(CanAcceptConnection).await {
-        Ok(true) => Ok(()),
-        Ok(false) => {
+    match ensure_scheduler_capacity(&session.scheduler, phase).await {
+        Ok(()) => Ok(()),
+        Err(SchedulerCapacityError::AtCapacity { .. }) => {
             warn!(
                 "flow{}: SOCKS5 scheduler at capacity {}",
                 session.flow_id.0, phase
             );
             session.respond_failure(Socks5Reply::GeneralFailure).await
         }
-        Err(err) => Err(Socks5FlowError::Fatal(anyhow!(
-            "failed to check capacity {}: {}",
-            phase,
-            err
-        ))),
+        Err(err @ SchedulerCapacityError::Unavailable { .. }) => {
+            Err(Socks5FlowError::Fatal(err.into()))
+        }
     }
 }
 
