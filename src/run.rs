@@ -691,8 +691,7 @@ async fn accept_next_connection(
                 request_scheduler_shutdown(scheduler);
                 return Ok(None);
             }
-            accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
-            accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
+            accepted = accept_without_shutdown(listener, Some(socks5_listener)) => accepted,
         }
     } else {
         tokio::select! {
@@ -701,14 +700,11 @@ async fn accept_next_connection(
                 request_scheduler_shutdown(scheduler);
                 return Ok(None);
             }
-            accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+            accept = listener.accept() => accept.map(|accepted| accepted_connection_from((accepted, InboundProtocol::HttpConnect))),
         }
     };
 
-    accepted
-        .map(accepted_connection_from)
-        .map(Some)
-        .map_err(Into::into)
+    accepted.map(Some).map_err(Into::into)
 }
 
 async fn accept_without_shutdown(
