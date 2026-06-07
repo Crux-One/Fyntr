@@ -11,7 +11,7 @@ use tokio::{
 
 use crate::{
     actors::{
-        queue::{Enqueue, EnqueueError, QueueActor},
+        queue::{Close, Enqueue, EnqueueError, QueueActor},
         scheduler::{RecordDownstreamBytes, Scheduler, Unregister},
     },
     util::{format_bytes, format_rate},
@@ -24,6 +24,75 @@ const ENQUEUE_BACKPRESSURE_LOG_EVERY: u32 = 200;
 const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
 const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
+
+/// RAII guard that tears down queue and scheduler registrations if a flow exits early.
+///
+/// Dropping sends `Close` to an unregistered queue, or `Unregister` for a registered flow, unless
+/// `disarm` was called after the relay actors took ownership of the flow lifecycle.
+pub(crate) struct FlowCleanup {
+    flow_id: FlowId,
+    scheduler: Addr<Scheduler>,
+    queue_tx: Option<Addr<QueueActor>>,
+    unregister_on_drop: bool,
+    disarmed: bool,
+}
+
+impl FlowCleanup {
+    pub(crate) fn new(flow_id: FlowId, scheduler: Addr<Scheduler>) -> Self {
+        Self {
+            flow_id,
+            scheduler,
+            queue_tx: None,
+            unregister_on_drop: false,
+            disarmed: false,
+        }
+    }
+
+    pub(crate) fn watch_queue(&mut self, queue_tx: Addr<QueueActor>) {
+        self.queue_tx = Some(queue_tx);
+    }
+
+    pub(crate) fn mark_registered(&mut self) {
+        self.unregister_on_drop = true;
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for FlowCleanup {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+
+        if !self.unregister_on_drop
+            && let Some(queue) = &self.queue_tx
+        {
+            queue.do_send(Close);
+        }
+
+        if self.unregister_on_drop {
+            self.scheduler.do_send(Unregister {
+                flow_id: self.flow_id,
+            });
+        }
+    }
+}
+
+pub(crate) fn start_bidirectional_tunnel(
+    flow_id: FlowId,
+    client_read: OwnedReadHalf,
+    queue_tx: Addr<QueueActor>,
+    scheduler: Addr<Scheduler>,
+    backend_read: OwnedReadHalf,
+    client_write: OwnedWriteHalf,
+) {
+    let scheduler_for_client = scheduler.clone();
+    ClientToBackendActor::new(flow_id, client_read, queue_tx, scheduler_for_client).start();
+    BackendToClientActor::new(flow_id, backend_read, client_write, scheduler).start();
+}
 
 pub(crate) struct ClientToBackendActor {
     flow_id: FlowId,
