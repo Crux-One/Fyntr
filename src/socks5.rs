@@ -218,6 +218,9 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     backend_stream
         .set_nodelay(true)
         .map_err(|err| anyhow!("Failed to set TCP_NODELAY: {}", err))?;
+    let bound_addr = backend_stream
+        .local_addr()
+        .map_err(|err| anyhow!("Failed to resolve upstream local address: {}", err))?;
 
     info!(
         "flow{}: SOCKS5 connected to {} via {}",
@@ -266,7 +269,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         }
     }
 
-    send_success_reply(&mut session.client_write).await?;
+    send_success_reply(&mut session.client_write, bound_addr).await?;
 
     let Socks5Session {
         flow_id,
@@ -521,9 +524,38 @@ fn log_mixed_script_host(
     );
 }
 
-async fn send_success_reply(writer: &mut OwnedWriteHalf) -> Socks5Result<()> {
-    write_reply(writer, Socks5Reply::Succeeded).await?;
+async fn send_success_reply(
+    writer: &mut OwnedWriteHalf,
+    bound_addr: SocketAddr,
+) -> Socks5Result<()> {
+    write_reply_with_bound_addr(writer, Socks5Reply::Succeeded, bound_addr).await?;
     Ok(())
+}
+
+async fn write_reply_with_bound_addr(
+    writer: &mut OwnedWriteHalf,
+    reply: Socks5Reply,
+    bound_addr: SocketAddr,
+) -> std::io::Result<()> {
+    writer
+        .write_all(&reply_with_bound_addr_bytes(reply, bound_addr))
+        .await
+}
+
+fn reply_with_bound_addr_bytes(reply: Socks5Reply, bound_addr: SocketAddr) -> Vec<u8> {
+    let mut response = vec![SOCKS5_VERSION, reply as u8, 0x00];
+    match bound_addr.ip() {
+        IpAddr::V4(addr) => {
+            response.push(SOCKS5_ATYP_IPV4);
+            response.extend_from_slice(&addr.octets());
+        }
+        IpAddr::V6(addr) => {
+            response.push(SOCKS5_ATYP_IPV6);
+            response.extend_from_slice(&addr.octets());
+        }
+    }
+    response.extend_from_slice(&bound_addr.port().to_be_bytes());
+    response
 }
 
 async fn write_reply(writer: &mut OwnedWriteHalf, reply: Socks5Reply) -> std::io::Result<()> {
@@ -576,5 +608,37 @@ impl Socks5Session {
     async fn respond_failure<T>(&mut self, reply: Socks5Reply) -> Socks5Result<T> {
         write_reply(&mut self.client_write, reply).await?;
         Err(Socks5FlowError::ResponseSent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_reply_uses_ipv4_bound_address() {
+        let bound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 54321);
+
+        let reply = reply_with_bound_addr_bytes(Socks5Reply::Succeeded, bound_addr);
+
+        assert_eq!(
+            reply,
+            vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0xd4, 0x31]
+        );
+    }
+
+    #[test]
+    fn success_reply_uses_ipv6_bound_address() {
+        let bound_addr =
+            SocketAddr::new(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()), 443);
+
+        let reply = reply_with_bound_addr_bytes(Socks5Reply::Succeeded, bound_addr);
+
+        assert_eq!(reply[0..4], [0x05, 0x00, 0x00, 0x04]);
+        assert_eq!(
+            &reply[4..20],
+            &"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), 443);
     }
 }

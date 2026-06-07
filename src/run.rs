@@ -1161,8 +1161,10 @@ mod tests {
     async fn server_accepts_socks5_connect_ipv4() {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
+        let (backend_peer_tx, backend_peer_rx) = tokio::sync::oneshot::channel();
         let backend_task = actix::spawn(async move {
-            let (mut stream, _) = backend.accept().await.unwrap();
+            let (mut stream, peer_addr) = backend.accept().await.unwrap();
+            backend_peer_tx.send(peer_addr).unwrap();
             let mut request = [0_u8; 4];
             stream.read_exact(&mut request).await.unwrap();
             assert_eq!(&request, b"ping");
@@ -1195,6 +1197,20 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[0], 0x05);
         assert_eq!(reply[1], 0x00);
+        assert_eq!(reply[3], 0x01);
+
+        let backend_peer_addr = backend_peer_rx.await.unwrap();
+        assert_eq!(
+            &reply[4..8],
+            &match backend_peer_addr.ip() {
+                IpAddr::V4(addr) => addr.octets(),
+                IpAddr::V6(_) => panic!("expected IPv4 upstream peer"),
+            }
+        );
+        assert_eq!(
+            u16::from_be_bytes([reply[8], reply[9]]),
+            backend_peer_addr.port()
+        );
 
         client.write_all(b"ping").await.unwrap();
         let mut response = [0_u8; 4];
