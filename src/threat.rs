@@ -90,6 +90,35 @@ pub(crate) fn log_threat_match_for_target(
     }
 }
 
+pub(crate) fn log_threat_matches_for_target(
+    log_target: &'static str,
+    flow_id: FlowId,
+    action: ThreatAction,
+    target_field: &str,
+    target_authority: &impl fmt::Display,
+    client_addr: SocketAddr,
+    threat_matches: &[ThreatMatch],
+) {
+    let should_block = matches!(action, ThreatAction::Block);
+    let log_count = if should_block {
+        1
+    } else {
+        threat_matches.len()
+    };
+
+    for threat_match in threat_matches.iter().take(log_count) {
+        log_threat_match_for_target(
+            log_target,
+            flow_id,
+            action,
+            target_field,
+            target_authority,
+            client_addr,
+            threat_match,
+        );
+    }
+}
+
 pub(crate) fn log_mixed_script_host_for_target(
     log_target: &'static str,
     flow_id: FlowId,
