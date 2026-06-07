@@ -20,15 +20,14 @@ use tokio::{
 
 use crate::{
     actors::{
-        queue::{Close, QueueActor},
+        queue::QueueActor,
         scheduler::{
             CanAcceptConnection, PendingConnectionReservation, Register, RegisterError, Scheduler,
-            Unregister,
         },
     },
     flow::{
         FlowId,
-        connection::{BackendToClientActor, ClientToBackendActor},
+        connection::{FlowCleanup, start_bidirectional_tunnel},
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -104,14 +103,6 @@ struct Socks5Session {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
-}
-
-struct FlowCleanup {
-    flow_id: FlowId,
-    scheduler: Addr<Scheduler>,
-    queue_tx: Option<Addr<QueueActor>>,
-    unregister_on_drop: bool,
-    disarmed: bool,
 }
 
 /// Handles a no-auth SOCKS5 CONNECT flow and relays it through Fyntr's existing scheduler.
@@ -277,9 +268,14 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         ..
     } = session;
     let client_read = client_reader.into_inner();
-    let scheduler_for_client = scheduler.clone();
-    ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler_for_client).start();
-    BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone()).start();
+    start_bidirectional_tunnel(
+        flow_id,
+        client_read,
+        queue_tx,
+        scheduler,
+        backend_read,
+        client_write,
+    );
 
     cleanup.disarm();
     Ok(())
@@ -633,49 +629,5 @@ impl Socks5Session {
     async fn respond_failure<T>(&mut self, reply: Socks5Reply) -> Socks5Result<T> {
         write_reply(&mut self.client_write, reply).await?;
         Err(Socks5FlowError::ResponseSent)
-    }
-}
-
-impl FlowCleanup {
-    fn new(flow_id: FlowId, scheduler: Addr<Scheduler>) -> Self {
-        Self {
-            flow_id,
-            scheduler,
-            queue_tx: None,
-            unregister_on_drop: false,
-            disarmed: false,
-        }
-    }
-
-    fn watch_queue(&mut self, queue_tx: Addr<QueueActor>) {
-        self.queue_tx = Some(queue_tx);
-    }
-
-    fn mark_registered(&mut self) {
-        self.unregister_on_drop = true;
-    }
-
-    fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-}
-
-impl Drop for FlowCleanup {
-    fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
-
-        if !self.unregister_on_drop
-            && let Some(queue) = &self.queue_tx
-        {
-            queue.do_send(Close);
-        }
-
-        if self.unregister_on_drop {
-            self.scheduler.do_send(Unregister {
-                flow_id: self.flow_id,
-            });
-        }
     }
 }
