@@ -31,7 +31,7 @@ use crate::{
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
-    threat::{NormalizedHost, ThreatAction, ThreatMatch, has_mixed_scripts, normalize_host},
+    threat::{ThreatAction, log_mixed_script_host_for_target, log_threat_match_for_target},
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -42,6 +42,8 @@ const SOCKS5_ATYP_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAINNAME: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const SOCKS5_LOG_TARGET: &str = module_path!();
+const SOCKS5_TARGET_FIELD: &str = "socks5_target";
 
 type Socks5Result<T> = Result<T, Socks5FlowError>;
 
@@ -146,9 +148,11 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
 
     if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target.host) {
         let threat_action = session.connect_policy.threat_action();
-        log_threat_match(
+        log_threat_match_for_target(
+            SOCKS5_LOG_TARGET,
             session.flow_id,
             threat_action,
+            SOCKS5_TARGET_FIELD,
             &authority,
             session.client_addr,
             &threat_match,
@@ -500,9 +504,11 @@ async fn handle_resolved_threat_matches(
         threat_matches.len()
     };
     for threat_match in threat_matches.iter().take(log_count) {
-        log_threat_match(
+        log_threat_match_for_target(
+            SOCKS5_LOG_TARGET,
             session.flow_id,
             threat_action,
+            SOCKS5_TARGET_FIELD,
             authority,
             session.client_addr,
             threat_match,
@@ -517,60 +523,19 @@ async fn handle_resolved_threat_matches(
     Ok(())
 }
 
-fn log_threat_match(
-    flow_id: FlowId,
-    action: ThreatAction,
-    authority: &Socks5Authority<'_>,
-    client_addr: SocketAddr,
-    threat_match: &ThreatMatch,
-) {
-    match threat_match {
-        ThreatMatch::Domain {
-            raw_host,
-            ascii_host,
-            matched_domain,
-        } => warn!(
-            "flow{}: threat_match=true action={} match_type=domain raw_host={} ascii_host={} matched_domain={} socks5_target={} client_addr={}",
-            flow_id.0,
-            action.as_str(),
-            raw_host,
-            ascii_host,
-            matched_domain,
-            authority,
-            client_addr
-        ),
-        ThreatMatch::Ip {
-            raw_host,
-            matched_ip,
-        } => warn!(
-            "flow{}: threat_match=true action={} match_type=ip raw_host={} matched_ip={} socks5_target={} client_addr={}",
-            flow_id.0,
-            action.as_str(),
-            raw_host,
-            matched_ip,
-            authority,
-            client_addr
-        ),
-    }
-}
-
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
     authority: &Socks5Authority<'_>,
     client_addr: SocketAddr,
 ) {
-    if raw_host.parse::<IpAddr>().is_ok() || !has_mixed_scripts(raw_host) {
-        return;
-    }
-
-    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
-        return;
-    };
-
-    warn!(
-        "flow{}: mixed_script=true reason=mixed_script_host raw_host={} ascii_host={} socks5_target={} client_addr={}",
-        flow_id.0, raw_host, ascii_host, authority, client_addr
+    log_mixed_script_host_for_target(
+        SOCKS5_LOG_TARGET,
+        flow_id,
+        raw_host,
+        SOCKS5_TARGET_FIELD,
+        authority,
+        client_addr,
     );
 }
 
