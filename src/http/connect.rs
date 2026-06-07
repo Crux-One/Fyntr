@@ -12,7 +12,7 @@ pub(crate) mod upstream;
 
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::{
     io::BufReader,
     net::{
@@ -36,7 +36,9 @@ use crate::{
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
-    threat::{NormalizedHost, ThreatAction, ThreatMatch, has_mixed_scripts, normalize_host},
+    threat::{
+        ThreatAction, ThreatMatch, log_mixed_script_host_for_target, log_threat_match_for_target,
+    },
 };
 
 use self::status_response::{
@@ -47,6 +49,7 @@ use self::upstream::{DirectConnector, UpstreamDialer};
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
 const CONNECT_LOG_TARGET: &str = module_path!();
+const CONNECT_TARGET_FIELD: &str = "connect_target";
 
 #[derive(Debug)]
 enum ConnectFlowError {
@@ -125,64 +128,19 @@ fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
     ConnectAuthority { host, port }
 }
 
-fn log_threat_match(
-    flow_id: FlowId,
-    action: ThreatAction,
-    target_authority: &ConnectAuthority<'_>,
-    client_addr: SocketAddr,
-    threat_match: &ThreatMatch,
-) {
-    match threat_match {
-        ThreatMatch::Domain {
-            raw_host,
-            ascii_host,
-            matched_domain,
-        } => {
-            warn!(
-                "flow{}: threat_match=true action={} match_type=domain raw_host={} ascii_host={} matched_domain={} connect_target={} client_addr={}",
-                flow_id.0,
-                action.as_str(),
-                raw_host,
-                ascii_host,
-                matched_domain,
-                target_authority,
-                client_addr
-            );
-        }
-        ThreatMatch::Ip {
-            raw_host,
-            matched_ip,
-        } => {
-            warn!(
-                "flow{}: threat_match=true action={} match_type=ip raw_host={} matched_ip={} connect_target={} client_addr={}",
-                flow_id.0,
-                action.as_str(),
-                raw_host,
-                matched_ip,
-                target_authority,
-                client_addr
-            );
-        }
-    }
-}
-
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
     target_authority: &ConnectAuthority<'_>,
     client_addr: SocketAddr,
 ) {
-    if !has_mixed_scripts(raw_host) {
-        return;
-    }
-
-    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
-        return;
-    };
-
-    warn!(
-        "flow{}: mixed_script=true reason=mixed_script_host raw_host={} ascii_host={} connect_target={} client_addr={}",
-        flow_id.0, raw_host, ascii_host, target_authority, client_addr
+    log_mixed_script_host_for_target(
+        CONNECT_LOG_TARGET,
+        flow_id,
+        raw_host,
+        CONNECT_TARGET_FIELD,
+        target_authority,
+        client_addr,
     );
 }
 
@@ -218,9 +176,11 @@ async fn handle_resolved_threat_matches(
         threat_matches.len()
     };
     for threat_match in threat_matches.iter().take(log_count) {
-        log_threat_match(
+        log_threat_match_for_target(
+            CONNECT_LOG_TARGET,
             session.flow_id,
             threat_action,
+            CONNECT_TARGET_FIELD,
             target_authority,
             session.client_addr,
             threat_match,
@@ -376,9 +336,11 @@ impl ConnectState {
         );
         if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target_host) {
             let threat_action = session.connect_policy.threat_action();
-            log_threat_match(
+            log_threat_match_for_target(
+                CONNECT_LOG_TARGET,
                 session.flow_id,
                 threat_action,
+                CONNECT_TARGET_FIELD,
                 &target_authority,
                 session.client_addr,
                 &threat_match,
@@ -708,7 +670,7 @@ mod tests {
         actors::scheduler::TryStartConnectionTask,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
-        threat::{ThreatAction, ThreatIndex},
+        threat::{NormalizedHost, ThreatAction, ThreatIndex, normalize_host},
     };
     use std::{
         future::Future,
