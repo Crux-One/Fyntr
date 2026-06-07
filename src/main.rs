@@ -21,6 +21,14 @@ struct Cli {
     #[clap(long, env = "FYNTR_PORT", default_value_t = DEFAULT_PORT)]
     port: u16,
 
+    /// Optional address for the SOCKS5 listener. Defaults to --bind when --socks5-port is set.
+    #[clap(long, env = "FYNTR_SOCKS5_BIND")]
+    socks5_bind: Option<BindAddress>,
+
+    /// Enable a no-auth SOCKS5 CONNECT-only listener on this port.
+    #[clap(long, env = "FYNTR_SOCKS5_PORT")]
+    socks5_port: Option<u16>,
+
     /// Maximum number of concurrent connections allowed
     #[clap(long, env = "FYNTR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
@@ -68,6 +76,13 @@ async fn main() -> Result<(), anyhow::Error> {
         .bind(cli.bind)
         .port(cli.port)
         .max_connections(cli.max_connections);
+
+    if let Some(bind) = cli.socks5_bind {
+        server = server.socks5_bind(bind);
+    }
+    if let Some(port) = cli.socks5_port {
+        server = server.socks5_port(port);
+    }
 
     if cli.no_default_allow_port {
         server = server.no_default_allow_port();

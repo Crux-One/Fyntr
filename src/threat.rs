@@ -1,9 +1,17 @@
-use std::{collections::HashSet, fmt, fs, net::IpAddr, path::Path, str::FromStr};
+use std::{
+    collections::HashSet,
+    fmt, fs,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, anyhow};
 use idna::AsciiDenyList;
 use log::{info, warn};
 use unicode_script::{Script, UnicodeScript};
+
+use crate::flow::FlowId;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThreatIndex {
@@ -37,6 +45,101 @@ impl ThreatAction {
             Self::Block => "block",
         }
     }
+}
+
+pub(crate) fn log_threat_match_for_target(
+    log_target: &'static str,
+    flow_id: FlowId,
+    action: ThreatAction,
+    target_field: &str,
+    target_authority: &impl fmt::Display,
+    client_addr: SocketAddr,
+    threat_match: &ThreatMatch,
+) {
+    match threat_match {
+        ThreatMatch::Domain {
+            raw_host,
+            ascii_host,
+            matched_domain,
+        } => warn!(
+            target: log_target,
+            "flow{}: threat_match=true action={} match_type=domain raw_host={} ascii_host={} matched_domain={} {}={} client_addr={}",
+            flow_id.0,
+            action.as_str(),
+            raw_host,
+            ascii_host,
+            matched_domain,
+            target_field,
+            target_authority,
+            client_addr
+        ),
+        ThreatMatch::Ip {
+            raw_host,
+            matched_ip,
+        } => warn!(
+            target: log_target,
+            "flow{}: threat_match=true action={} match_type=ip raw_host={} matched_ip={} {}={} client_addr={}",
+            flow_id.0,
+            action.as_str(),
+            raw_host,
+            matched_ip,
+            target_field,
+            target_authority,
+            client_addr
+        ),
+    }
+}
+
+pub(crate) fn log_threat_matches_for_target(
+    log_target: &'static str,
+    flow_id: FlowId,
+    action: ThreatAction,
+    target_field: &str,
+    target_authority: &impl fmt::Display,
+    client_addr: SocketAddr,
+    threat_matches: &[ThreatMatch],
+) {
+    let should_block = matches!(action, ThreatAction::Block);
+    let log_count = if should_block {
+        1
+    } else {
+        threat_matches.len()
+    };
+
+    for threat_match in threat_matches.iter().take(log_count) {
+        log_threat_match_for_target(
+            log_target,
+            flow_id,
+            action,
+            target_field,
+            target_authority,
+            client_addr,
+            threat_match,
+        );
+    }
+}
+
+pub(crate) fn log_mixed_script_host_for_target(
+    log_target: &'static str,
+    flow_id: FlowId,
+    raw_host: &str,
+    target_field: &str,
+    target_authority: &impl fmt::Display,
+    client_addr: SocketAddr,
+) {
+    if raw_host.parse::<IpAddr>().is_ok() || !has_mixed_scripts(raw_host) {
+        return;
+    }
+
+    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
+        return;
+    };
+
+    warn!(
+        target: log_target,
+        "flow{}: mixed_script=true reason=mixed_script_host raw_host={} ascii_host={} {}={} client_addr={}",
+        flow_id.0, raw_host, ascii_host, target_field, target_authority, client_addr
+    );
 }
 
 #[derive(Clone, Debug, Default)]

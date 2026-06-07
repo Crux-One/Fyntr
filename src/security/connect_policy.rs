@@ -192,6 +192,21 @@ impl ConnectPolicy {
         self.threat_index.as_ref()?.lookup_ip(host, ip)
     }
 
+    pub(crate) fn resolved_threat_matches(
+        &self,
+        target: &ResolvedConnectTarget,
+    ) -> Vec<ThreatMatch> {
+        if target.host.parse::<IpAddr>().is_ok() {
+            return Vec::new();
+        }
+
+        target
+            .addrs
+            .iter()
+            .filter_map(|addr| self.lookup_threat_ip(&target.host, addr.ip()))
+            .collect()
+    }
+
     pub(crate) async fn resolve_and_authorize(
         &self,
         host: &str,

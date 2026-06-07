@@ -1,17 +1,12 @@
-use std::{
-    fmt,
-    future::Future,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 mod backoff;
 mod status_response;
+pub(crate) mod upstream;
 
 use actix::prelude::*;
 use anyhow::anyhow;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::{
     io::BufReader,
     net::{
@@ -24,29 +19,33 @@ use tokio::{
 
 use crate::{
     actors::{
-        queue::{Close, QueueActor},
-        scheduler::{
-            CanAcceptConnection, PendingConnectionReservation, Register, RegisterError, Scheduler,
-            Unregister,
-        },
+        queue::QueueActor,
+        scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
     flow::{
         FlowId,
-        connection::{BackendToClientActor, ClientToBackendActor},
+        connection::{
+            FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
+            start_bidirectional_tunnel,
+        },
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
-    threat::{NormalizedHost, ThreatAction, ThreatMatch, has_mixed_scripts, normalize_host},
+    threat::{
+        ThreatAction, ThreatMatch, log_mixed_script_host_for_target, log_threat_match_for_target,
+        log_threat_matches_for_target,
+    },
 };
 
-use self::backoff::connect_to_any_with_backoff;
 use self::status_response::{
     StatusLine, StatusLogLevel, classify_input_error, respond_with_status,
 };
+use self::upstream::{DirectConnector, UpstreamDialer};
 
 type ConnectResult<T> = Result<T, ConnectFlowError>;
 
 const CONNECT_LOG_TARGET: &str = module_path!();
+const CONNECT_TARGET_FIELD: &str = "connect_target";
 
 #[derive(Debug)]
 enum ConnectFlowError {
@@ -125,80 +124,20 @@ fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
     ConnectAuthority { host, port }
 }
 
-fn log_threat_match(
-    flow_id: FlowId,
-    action: ThreatAction,
-    target_authority: &ConnectAuthority<'_>,
-    client_addr: SocketAddr,
-    threat_match: &ThreatMatch,
-) {
-    match threat_match {
-        ThreatMatch::Domain {
-            raw_host,
-            ascii_host,
-            matched_domain,
-        } => {
-            warn!(
-                "flow{}: threat_match=true action={} match_type=domain raw_host={} ascii_host={} matched_domain={} connect_target={} client_addr={}",
-                flow_id.0,
-                action.as_str(),
-                raw_host,
-                ascii_host,
-                matched_domain,
-                target_authority,
-                client_addr
-            );
-        }
-        ThreatMatch::Ip {
-            raw_host,
-            matched_ip,
-        } => {
-            warn!(
-                "flow{}: threat_match=true action={} match_type=ip raw_host={} matched_ip={} connect_target={} client_addr={}",
-                flow_id.0,
-                action.as_str(),
-                raw_host,
-                matched_ip,
-                target_authority,
-                client_addr
-            );
-        }
-    }
-}
-
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
     target_authority: &ConnectAuthority<'_>,
     client_addr: SocketAddr,
 ) {
-    if !has_mixed_scripts(raw_host) {
-        return;
-    }
-
-    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
-        return;
-    };
-
-    warn!(
-        "flow{}: mixed_script=true reason=mixed_script_host raw_host={} ascii_host={} connect_target={} client_addr={}",
-        flow_id.0, raw_host, ascii_host, target_authority, client_addr
+    log_mixed_script_host_for_target(
+        CONNECT_LOG_TARGET,
+        flow_id,
+        raw_host,
+        CONNECT_TARGET_FIELD,
+        target_authority,
+        client_addr,
     );
-}
-
-fn resolved_threat_matches(
-    connect_policy: &ConnectPolicy,
-    target: &ResolvedConnectTarget,
-) -> Vec<ThreatMatch> {
-    if target.host.parse::<IpAddr>().is_ok() {
-        return Vec::new();
-    }
-
-    target
-        .addrs
-        .iter()
-        .filter_map(|addr| connect_policy.lookup_threat_ip(&target.host, addr.ip()))
-        .collect()
 }
 
 async fn handle_resolved_threat_matches(
@@ -211,23 +150,17 @@ async fn handle_resolved_threat_matches(
     }
 
     let threat_action = session.connect_policy.threat_action();
-    let should_block = matches!(threat_action, ThreatAction::Block);
-    let log_count = if should_block {
-        1
-    } else {
-        threat_matches.len()
-    };
-    for threat_match in threat_matches.iter().take(log_count) {
-        log_threat_match(
-            session.flow_id,
-            threat_action,
-            target_authority,
-            session.client_addr,
-            threat_match,
-        );
-    }
+    log_threat_matches_for_target(
+        CONNECT_LOG_TARGET,
+        session.flow_id,
+        threat_action,
+        CONNECT_TARGET_FIELD,
+        target_authority,
+        session.client_addr,
+        threat_matches,
+    );
 
-    if should_block {
+    if matches!(threat_action, ThreatAction::Block) {
         let detail = format!("CONNECT {} blocked by threat feed", target_authority);
         return session
             .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
@@ -245,16 +178,6 @@ struct ConnectSession {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
-}
-
-/// RAII guard that tears down queue and scheduler registrations if the flow exits early.
-/// Dropping sends `Close` to the queue and `Unregister` to the scheduler unless `disarm` was called.
-struct FlowCleanup {
-    flow_id: FlowId,
-    scheduler: Addr<Scheduler>,
-    queue_tx: Option<Addr<QueueActor>>,
-    unregister_on_drop: bool,
-    disarmed: bool,
 }
 
 /// State machine for a CONNECT flow: Validating → Dialing → Registering → Established → Finished.
@@ -282,28 +205,22 @@ enum ConnectState {
 impl ConnectState {
     async fn reject_if_scheduler_at_capacity(
         session: &mut ConnectSession,
-        phase: &str,
+        phase: &'static str,
     ) -> ConnectResult<()> {
-        match session.scheduler.send(CanAcceptConnection).await {
-            Ok(false) => {
-                let detail = format!("scheduler at capacity {}", phase);
+        match ensure_scheduler_capacity(&session.scheduler, phase).await {
+            Ok(()) => Ok(()),
+            Err(SchedulerCapacityError::AtCapacity { .. }) => {
                 session
                     .respond(
                         StatusLine::SERVICE_UNAVAILABLE,
                         StatusLogLevel::Warn,
-                        detail,
+                        format!("scheduler at capacity {}", phase),
                     )
                     .await
             }
-            Ok(true) => Ok(()),
-            Err(e) => {
-                let detail = format!("failed to check capacity {}: {}", phase, e);
+            Err(err @ SchedulerCapacityError::Unavailable { .. }) => {
                 session
-                    .respond(
-                        StatusLine::SERVICE_UNAVAILABLE,
-                        StatusLogLevel::Error,
-                        detail,
-                    )
+                    .respond(StatusLine::SERVICE_UNAVAILABLE, StatusLogLevel::Error, err)
                     .await
             }
         }
@@ -386,9 +303,11 @@ impl ConnectState {
         );
         if let Some(threat_match) = session.connect_policy.lookup_threat_host(&target_host) {
             let threat_action = session.connect_policy.threat_action();
-            log_threat_match(
+            log_threat_match_for_target(
+                CONNECT_LOG_TARGET,
                 session.flow_id,
                 threat_action,
+                CONNECT_TARGET_FIELD,
                 &target_authority,
                 session.client_addr,
                 &threat_match,
@@ -440,7 +359,7 @@ impl ConnectState {
             }
         };
 
-        let resolved_threat_matches = resolved_threat_matches(&session.connect_policy, &target);
+        let resolved_threat_matches = session.connect_policy.resolved_threat_matches(&target);
         handle_resolved_threat_matches(&mut session, &target_authority, &resolved_threat_matches)
             .await?;
 
@@ -459,19 +378,21 @@ impl ConnectState {
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
         let target_authority = format_connect_authority(&target.host, target.port);
-        let (backend_stream, connected_addr) =
-            match connect_to_any_with_backoff(session.flow_id, &target.addrs).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let detail = format!(
-                        "failed to connect to {} after retries: {}",
-                        target_authority, e
-                    );
-                    return session
-                        .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
-                        .await;
-                }
-            };
+        let upstream = DirectConnector;
+        let upstream_connection = match upstream.dial(session.flow_id, &target).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                let detail = format!(
+                    "failed to connect to {} after retries: {}",
+                    target_authority, e
+                );
+                return session
+                    .respond(StatusLine::BAD_GATEWAY, StatusLogLevel::Error, detail)
+                    .await;
+            }
+        };
+        let backend_stream = upstream_connection.stream;
+        let connected_addr = upstream_connection.connected_addr;
 
         backend_stream
             .set_nodelay(true)
@@ -572,11 +493,14 @@ impl ConnectState {
         }
 
         let client_read = client_reader.into_inner();
-        let scheduler_for_client = scheduler.clone();
-
-        ClientToBackendActor::new(flow_id, client_read, queue_tx.clone(), scheduler_for_client)
-            .start();
-        BackendToClientActor::new(flow_id, backend_read, client_write, scheduler.clone()).start();
+        start_bidirectional_tunnel(
+            flow_id,
+            client_read,
+            queue_tx,
+            scheduler,
+            backend_read,
+            client_write,
+        );
 
         cleanup.disarm();
         Ok(ConnectState::Finished(flow_id))
@@ -635,52 +559,6 @@ impl ConnectSession {
         detail: impl fmt::Display,
     ) -> ConnectResult<T> {
         respond_with_status(self.flow_id, &mut self.client_write, status, level, detail).await
-    }
-}
-
-impl FlowCleanup {
-    fn new(flow_id: FlowId, scheduler: Addr<Scheduler>) -> Self {
-        Self {
-            flow_id,
-            scheduler,
-            queue_tx: None,
-            unregister_on_drop: false,
-            disarmed: false,
-        }
-    }
-
-    fn watch_queue(&mut self, queue_tx: Addr<QueueActor>) {
-        self.queue_tx = Some(queue_tx);
-    }
-
-    fn mark_registered(&mut self) {
-        self.unregister_on_drop = true;
-    }
-
-    fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-}
-
-impl Drop for FlowCleanup {
-    fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
-
-        // Once registered, the scheduler owns queue cleanup on Unregister.
-        // Avoid racing a graceful Close with a StopNow triggered by Unregister.
-        if !self.unregister_on_drop
-            && let Some(queue) = &self.queue_tx
-        {
-            queue.do_send(Close);
-        }
-
-        if self.unregister_on_drop {
-            self.scheduler.do_send(Unregister {
-                flow_id: self.flow_id,
-            });
-        }
     }
 }
 
@@ -752,13 +630,14 @@ mod tests {
         CONNECT_BACKOFF_BASE, CONNECT_BACKOFF_MAX, connect_to_any_with_backoff,
         connect_with_backoff,
     };
+    use super::upstream::{DirectConnector, UpstreamDialer};
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
         actors::scheduler::TryStartConnectionTask,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
-        threat::{ThreatAction, ThreatIndex},
+        threat::{NormalizedHost, ThreatAction, ThreatIndex, normalize_host},
     };
     use std::{
         future::Future,
@@ -775,7 +654,7 @@ mod tests {
     static TEST_LOGGER: CapturingLogger = CapturingLogger;
     static LOGGER_INIT: Once = Once::new();
     static CAPTURED_LOGS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
-    static LOG_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    static LOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct CapturingLogger;
 
@@ -893,7 +772,7 @@ mod tests {
             ],
         };
 
-        let matches = resolved_threat_matches(&policy, &target);
+        let matches = policy.resolved_threat_matches(&target);
 
         assert_eq!(
             matches,
@@ -919,13 +798,13 @@ mod tests {
             addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
         };
 
-        assert!(resolved_threat_matches(&policy, &target).is_empty());
+        assert!(policy.resolved_threat_matches(&target).is_empty());
     }
 
-    #[test]
-    fn mixed_script_warning_logs_raw_and_ascii_host() {
+    #[actix_rt::test]
+    async fn mixed_script_warning_logs_raw_and_ascii_host() {
         init_test_logger();
-        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        let _guard = LOG_TEST_LOCK.lock().await;
         CAPTURED_LOGS.lock().unwrap().clear();
 
         let raw_host = "fаke.invalid";
@@ -1333,6 +1212,65 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "connect_to_any_with_backoff spent too long before trying a fallback address"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn direct_connector_dials_resolved_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = listener.local_addr().unwrap();
+        let target = ResolvedConnectTarget {
+            host: "example.test".to_string(),
+            port: reachable_addr.port(),
+            addrs: vec![reachable_addr],
+        };
+
+        let accept = async move {
+            let _ = listener.accept().await.unwrap();
+        };
+        let connector = DirectConnector;
+        let ((), connected) = tokio::join!(accept, connector.dial(FlowId(1), &target));
+
+        let connection = connected.unwrap();
+        assert_eq!(connection.connected_addr, reachable_addr);
+        drop(connection.stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_connector_logs_backoff_under_upstream_target() {
+        init_test_logger();
+        let _guard = LOG_TEST_LOCK.lock().await;
+        CAPTURED_LOGS.lock().unwrap().clear();
+
+        let unreachable_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let target = ResolvedConnectTarget {
+            host: "127.0.0.1".to_string(),
+            port: unreachable_port,
+            addrs: vec![SocketAddr::from(([127, 0, 0, 1], unreachable_port))],
+        };
+
+        let connect_task =
+            task::spawn(async move { DirectConnector.dial(FlowId(1), &target).await });
+
+        task::yield_now().await;
+        time::advance(CONNECT_BACKOFF_BASE).await;
+        task::yield_now().await;
+        time::advance(CONNECT_BACKOFF_BASE.saturating_mul(2)).await;
+        task::yield_now().await;
+
+        assert!(connect_task.await.unwrap().is_err());
+        let logs = captured_logs();
+        assert!(
+            logs.iter().any(|log| {
+                log.starts_with("fyntr::http::connect::upstream ")
+                    && log.contains("connect round 1/3 failed")
+            }),
+            "expected upstream backoff log target, got {logs:?}"
         );
     }
 }

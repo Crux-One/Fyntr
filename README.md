@@ -31,6 +31,7 @@ No server-side configuration, no inspection, and low baseline memory use.
 - Adaptive quantum tuning: Adjusts DRR quantum from observed packet-size statistics.
 - Threat detection: Checks CONNECT hosts and resolved addresses against local domain/IP feeds loaded at startup.
 - DoS guardrails: Caps request line/header sizes and per-flow queue buffering.
+- SOCKS5 support: Adds an optional no-auth SOCKS5 CONNECT listener with local DNS resolution.
 
 ## Quick Start
 
@@ -156,8 +157,31 @@ fyntr \
 
 Feeds can contain plain domain/IP lines or AdGuard-style rules such as `||example.com^` and `||1.2.3.4^`.
 Domain entries and request hosts are normalized with IDNA ToASCII before matching.
-Fyntr also warns on suspicious mixed-script Unicode hostname labels, such as Latin mixed with Cyrillic or Greek, but those spoofing signals do not block traffic.
+
 Unsupported rules are skipped and reported in startup logs. Fyntr fails to start if no supported entries can be loaded.
+
+Fyntr also warns on suspicious mixed-script Unicode hostname labels, such as Latin mixed with Cyrillic or Greek. These spoofing signals are warnings only and do not block traffic.
+
+As a concrete example, Fyntr can use the AdGuard Home/Pi-hole and dnscrypt-proxy blocked names and IPs lists from [`curbengh/urlhaus-filter`](https://github.com/curbengh/urlhaus-filter#full-version), which publishes [URLHaus](https://urlhaus.abuse.ch/)-based feeds.
+
+```bash
+# Download the dnscrypt-proxy blocked names/IPs feeds
+wget https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-dnscrypt-blocked-names.txt
+wget https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-dnscrypt-blocked-ips.txt
+fyntr \
+  --threat-feed-file ./urlhaus-filter-dnscrypt-blocked-ips.txt \
+  --threat-feed-file ./urlhaus-filter-dnscrypt-blocked-names.txt \
+  --threat-action block
+```
+
+### Enable a SOCKS5 listener:
+
+```bash
+fyntr --socks5-port 1080
+```
+
+The SOCKS5 listener supports `CONNECT` requests only, without authentication. `DOMAINNAME` targets are resolved locally by Fyntr.
+`UDP ASSOCIATE`, `BIND`, and SOCKS5 username/password authentication are not supported.
 
 ## CLI Options
 
@@ -167,6 +191,8 @@ Unsupported rules are skipped and reported in startup logs. Fyntr fails to start
 | --- | --- | --- | --- |
 | `--bind <ADDR>` | `FYNTR_BIND` | `127.0.0.1` | Address/hostname to bind on (e.g. `127.0.0.1`, `::1`, `localhost`, `0.0.0.0`). Supports both IPv4 and IPv6. Binding to non-loopback interfaces without auth can expose the proxy on the network. |
 | `--port <PORT>` | `FYNTR_PORT` | `9999` | Port to listen on (use `0` to auto-select an available port). |
+| `--socks5-bind <ADDR>` | `FYNTR_SOCKS5_BIND` | same as `--bind` | Optional address/hostname for the SOCKS5 listener. Only used when `--socks5-port` is set. |
+| `--socks5-port <PORT>` | `FYNTR_SOCKS5_PORT` | disabled | Enable a no-auth SOCKS5 `CONNECT` listener on this port. |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
 
 ### CONNECT Policy
@@ -200,5 +226,5 @@ This matters most when scheduling overhead, rather than bandwidth, is the primar
 
 ## Limitations
 1. In certain environments, DRR scheduling can reduce upload throughput, especially on low-spec hardware, as a trade-off for more stable responsiveness.
-2. Currently, Fyntr supports only HTTP CONNECT tunneling (commonly used for HTTPS) and does not support plain HTTP proxying.
+2. Fyntr supports HTTP CONNECT tunneling and optional SOCKS5 CONNECT tunneling, but does not support plain HTTP proxying, SOCKS5 UDP ASSOCIATE, or SOCKS5 BIND.
 3. Fyntr has no built-in authentication. Exposing a public bind address can allow unauthorized proxy use.
