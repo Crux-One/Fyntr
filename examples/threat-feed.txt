@@ -1,0 +1,6 @@
+# Example threat feed for `cargo run --example threat_feed`.
+# Fyntr supports plain domain/IP entries and AdGuard-style `||host^` rules.
+
+||malware.test^
+phishing.example
+203.0.113.10

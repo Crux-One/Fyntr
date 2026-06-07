@@ -8,12 +8,16 @@ async fn main() -> anyhow::Result<()> {
 
     let handle = run::server()
         .bind("127.0.0.1")
-        .port(0) // 0 lets the OS pick an available port
+        .port(0) // 0 lets the OS pick an available HTTP CONNECT port
+        .socks5_port(0) // 0 lets the OS pick an available SOCKS5 port
         .max_connections(512)
         .background()
         .await?;
 
-    println!("Fyntr listening on {}", handle.listen_addr());
+    println!("Fyntr HTTP CONNECT listening on {}", handle.listen_addr());
+    if let Some(addr) = handle.socks5_listen_addr() {
+        println!("Fyntr SOCKS5 listening on {}", addr);
+    }
 
     // ... run your app ...
 
