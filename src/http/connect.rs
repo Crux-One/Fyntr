@@ -1,10 +1,4 @@
-use std::{
-    fmt,
-    future::Future,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 mod backoff;
 mod status_response;
@@ -38,6 +32,7 @@ use crate::{
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
     threat::{
         ThreatAction, ThreatMatch, log_mixed_script_host_for_target, log_threat_match_for_target,
+        log_threat_matches_for_target,
     },
 };
 
@@ -144,21 +139,6 @@ fn log_mixed_script_host(
     );
 }
 
-fn resolved_threat_matches(
-    connect_policy: &ConnectPolicy,
-    target: &ResolvedConnectTarget,
-) -> Vec<ThreatMatch> {
-    if target.host.parse::<IpAddr>().is_ok() {
-        return Vec::new();
-    }
-
-    target
-        .addrs
-        .iter()
-        .filter_map(|addr| connect_policy.lookup_threat_ip(&target.host, addr.ip()))
-        .collect()
-}
-
 async fn handle_resolved_threat_matches(
     session: &mut ConnectSession,
     target_authority: &ConnectAuthority<'_>,
@@ -169,25 +149,17 @@ async fn handle_resolved_threat_matches(
     }
 
     let threat_action = session.connect_policy.threat_action();
-    let should_block = matches!(threat_action, ThreatAction::Block);
-    let log_count = if should_block {
-        1
-    } else {
-        threat_matches.len()
-    };
-    for threat_match in threat_matches.iter().take(log_count) {
-        log_threat_match_for_target(
-            CONNECT_LOG_TARGET,
-            session.flow_id,
-            threat_action,
-            CONNECT_TARGET_FIELD,
-            target_authority,
-            session.client_addr,
-            threat_match,
-        );
-    }
+    log_threat_matches_for_target(
+        CONNECT_LOG_TARGET,
+        session.flow_id,
+        threat_action,
+        CONNECT_TARGET_FIELD,
+        target_authority,
+        session.client_addr,
+        threat_matches,
+    );
 
-    if should_block {
+    if matches!(threat_action, ThreatAction::Block) {
         let detail = format!("CONNECT {} blocked by threat feed", target_authority);
         return session
             .respond(StatusLine::FORBIDDEN, StatusLogLevel::Warn, detail)
@@ -392,7 +364,7 @@ impl ConnectState {
             }
         };
 
-        let resolved_threat_matches = resolved_threat_matches(&session.connect_policy, &target);
+        let resolved_threat_matches = session.connect_policy.resolved_threat_matches(&target);
         handle_resolved_threat_matches(&mut session, &target_authority, &resolved_threat_matches)
             .await?;
 
@@ -805,7 +777,7 @@ mod tests {
             ],
         };
 
-        let matches = resolved_threat_matches(&policy, &target);
+        let matches = policy.resolved_threat_matches(&target);
 
         assert_eq!(
             matches,
@@ -831,7 +803,7 @@ mod tests {
             addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
         };
 
-        assert!(resolved_threat_matches(&policy, &target).is_empty());
+        assert!(policy.resolved_threat_matches(&target).is_empty());
     }
 
     #[actix_rt::test]

@@ -31,7 +31,10 @@ use crate::{
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
-    threat::{ThreatAction, log_mixed_script_host_for_target, log_threat_match_for_target},
+    threat::{
+        ThreatAction, log_mixed_script_host_for_target, log_threat_match_for_target,
+        log_threat_matches_for_target,
+    },
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -479,43 +482,23 @@ async fn handle_resolved_threat_matches(
     authority: &Socks5Authority<'_>,
     target: &ResolvedConnectTarget,
 ) -> Socks5Result<()> {
-    if target.host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-
-    let threat_matches: Vec<_> = target
-        .addrs
-        .iter()
-        .filter_map(|addr| {
-            session
-                .connect_policy
-                .lookup_threat_ip(&target.host, addr.ip())
-        })
-        .collect();
+    let threat_matches = session.connect_policy.resolved_threat_matches(target);
     if threat_matches.is_empty() {
         return Ok(());
     }
 
     let threat_action = session.connect_policy.threat_action();
-    let should_block = matches!(threat_action, ThreatAction::Block);
-    let log_count = if should_block {
-        1
-    } else {
-        threat_matches.len()
-    };
-    for threat_match in threat_matches.iter().take(log_count) {
-        log_threat_match_for_target(
-            SOCKS5_LOG_TARGET,
-            session.flow_id,
-            threat_action,
-            SOCKS5_TARGET_FIELD,
-            authority,
-            session.client_addr,
-            threat_match,
-        );
-    }
+    log_threat_matches_for_target(
+        SOCKS5_LOG_TARGET,
+        session.flow_id,
+        threat_action,
+        SOCKS5_TARGET_FIELD,
+        authority,
+        session.client_addr,
+        &threat_matches,
+    );
 
-    if should_block {
+    if matches!(threat_action, ThreatAction::Block) {
         return session
             .respond_failure(Socks5Reply::ConnectionNotAllowed)
             .await;
