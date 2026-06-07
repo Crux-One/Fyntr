@@ -20,13 +20,14 @@ use tokio::{
 use crate::{
     actors::{
         queue::QueueActor,
-        scheduler::{
-            CanAcceptConnection, PendingConnectionReservation, Register, RegisterError, Scheduler,
-        },
+        scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
     flow::{
         FlowId,
-        connection::{FlowCleanup, start_bidirectional_tunnel},
+        connection::{
+            FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
+            start_bidirectional_tunnel,
+        },
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -204,28 +205,22 @@ enum ConnectState {
 impl ConnectState {
     async fn reject_if_scheduler_at_capacity(
         session: &mut ConnectSession,
-        phase: &str,
+        phase: &'static str,
     ) -> ConnectResult<()> {
-        match session.scheduler.send(CanAcceptConnection).await {
-            Ok(false) => {
-                let detail = format!("scheduler at capacity {}", phase);
+        match ensure_scheduler_capacity(&session.scheduler, phase).await {
+            Ok(()) => Ok(()),
+            Err(SchedulerCapacityError::AtCapacity { .. }) => {
                 session
                     .respond(
                         StatusLine::SERVICE_UNAVAILABLE,
                         StatusLogLevel::Warn,
-                        detail,
+                        format!("scheduler at capacity {}", phase),
                     )
                     .await
             }
-            Ok(true) => Ok(()),
-            Err(e) => {
-                let detail = format!("failed to check capacity {}: {}", phase, e);
+            Err(err @ SchedulerCapacityError::Unavailable { .. }) => {
                 session
-                    .respond(
-                        StatusLine::SERVICE_UNAVAILABLE,
-                        StatusLogLevel::Error,
-                        detail,
-                    )
+                    .respond(StatusLine::SERVICE_UNAVAILABLE, StatusLogLevel::Error, err)
                     .await
             }
         }
