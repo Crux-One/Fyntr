@@ -580,42 +580,22 @@ async fn run_server(
     let flow_counter = Arc::new(AtomicUsize::new(1));
 
     loop {
-        let accept_result = if let Some(socks5_listener) = socks5_listener.as_ref() {
-            if let Some(rx) = shutdown_rx.as_mut() {
-                tokio::select! {
-                    biased;
-                    _ = rx => {
-                        info!("Shutdown signal received; stopping accept loop and requesting scheduler shutdown");
-                        scheduler.do_send(SchedulerShutdown);
-                        break;
-                    }
-                    accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
-                    accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
-                }
-            } else {
-                tokio::select! {
-                    accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
-                    accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
-                }
-            }
-        } else if let Some(rx) = shutdown_rx.as_mut() {
-            tokio::select! {
-                biased;
-                _ = rx => {
-                    info!("Shutdown signal received; stopping accept loop and requesting scheduler shutdown");
-                    scheduler.do_send(SchedulerShutdown);
-                    break;
-                }
-                accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
-            }
-        } else {
-            listener
-                .accept()
-                .await
-                .map(|accepted| (accepted, InboundProtocol::HttpConnect))
+        let Some(accepted) = accept_next_connection(
+            &listener,
+            socks5_listener.as_ref(),
+            shutdown_rx.as_mut(),
+            &scheduler,
+        )
+        .await?
+        else {
+            break;
         };
 
-        let ((client_stream, client_addr), protocol) = accept_result?;
+        let AcceptedConnection {
+            client_stream,
+            client_addr,
+            protocol,
+        } = accepted;
         let flow_id = FlowId(flow_counter.fetch_add(1, Ordering::SeqCst));
 
         info!(
@@ -684,6 +664,88 @@ async fn run_server(
     }
 
     Ok(())
+}
+
+struct AcceptedConnection {
+    client_stream: tokio::net::TcpStream,
+    client_addr: SocketAddr,
+    protocol: InboundProtocol,
+}
+
+async fn accept_next_connection(
+    listener: &TcpListener,
+    socks5_listener: Option<&TcpListener>,
+    shutdown_rx: Option<&mut oneshot::Receiver<()>>,
+    scheduler: &Addr<Scheduler>,
+) -> Result<Option<AcceptedConnection>> {
+    let Some(rx) = shutdown_rx else {
+        return Ok(Some(
+            accept_without_shutdown(listener, socks5_listener).await?,
+        ));
+    };
+
+    let accepted = if let Some(socks5_listener) = socks5_listener {
+        tokio::select! {
+            biased;
+            _ = rx => {
+                request_scheduler_shutdown(scheduler);
+                return Ok(None);
+            }
+            accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+            accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = rx => {
+                request_scheduler_shutdown(scheduler);
+                return Ok(None);
+            }
+            accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+        }
+    };
+
+    accepted
+        .map(accepted_connection_from)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+async fn accept_without_shutdown(
+    listener: &TcpListener,
+    socks5_listener: Option<&TcpListener>,
+) -> std::io::Result<AcceptedConnection> {
+    let ((client_stream, client_addr), protocol) = if let Some(socks5_listener) = socks5_listener {
+        tokio::select! {
+            accept = listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::HttpConnect)),
+            accept = socks5_listener.accept() => accept.map(|accepted| (accepted, InboundProtocol::Socks5)),
+        }?
+    } else {
+        (listener.accept().await?, InboundProtocol::HttpConnect)
+    };
+
+    Ok(accepted_connection_from((
+        (client_stream, client_addr),
+        protocol,
+    )))
+}
+
+fn accepted_connection_from(
+    ((client_stream, client_addr), protocol): (
+        (tokio::net::TcpStream, SocketAddr),
+        InboundProtocol,
+    ),
+) -> AcceptedConnection {
+    AcceptedConnection {
+        client_stream,
+        client_addr,
+        protocol,
+    }
+}
+
+fn request_scheduler_shutdown(scheduler: &Addr<Scheduler>) {
+    info!("Shutdown signal received; stopping accept loop and requesting scheduler shutdown");
+    scheduler.do_send(SchedulerShutdown);
 }
 
 #[derive(Clone, Copy)]
