@@ -109,6 +109,7 @@ struct Socks5Session {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
+    idle_timeout: Option<Duration>,
 }
 
 /// Handles a no-auth SOCKS5 CONNECT flow and relays it through Fyntr's existing scheduler.
@@ -119,6 +120,7 @@ pub(crate) async fn handle_socks5_proxy(
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
     pending_reservation: PendingConnectionReservation,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let session = Socks5Session::new(
         client_stream,
@@ -127,6 +129,7 @@ pub(crate) async fn handle_socks5_proxy(
         scheduler,
         connect_policy,
         pending_reservation,
+        idle_timeout,
     );
 
     match run_socks5_flow(session).await {
@@ -276,6 +279,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         scheduler,
         client_reader,
         client_write,
+        idle_timeout,
         ..
     } = session;
     let client_read = client_reader.into_inner();
@@ -286,6 +290,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         scheduler,
         backend_read,
         client_write,
+        idle_timeout,
     );
 
     cleanup.disarm();
@@ -592,6 +597,7 @@ impl Socks5Session {
         scheduler: Addr<Scheduler>,
         connect_policy: Arc<ConnectPolicy>,
         pending_reservation: PendingConnectionReservation,
+        idle_timeout: Option<Duration>,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
@@ -602,6 +608,7 @@ impl Socks5Session {
             client_reader: BufReader::new(client_read),
             client_write,
             pending_reservation: Some(pending_reservation),
+            idle_timeout,
         }
     }
 

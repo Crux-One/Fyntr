@@ -17,6 +17,10 @@ use crate::{
     util::{format_bytes, format_rate},
 };
 
+use super::idle_timeout::{
+    TunnelShutdownReceiver, TunnelTrafficSignal, start_idle_timeout_monitor,
+};
+
 const BUFFER_SIZE: usize = 8 * 1024; // 8 KB
 const ENQUEUE_BACKPRESSURE_RETRY_BASE_DELAY: Duration = Duration::from_millis(5);
 const ENQUEUE_BACKPRESSURE_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
@@ -123,10 +127,33 @@ pub(crate) fn start_bidirectional_tunnel(
     scheduler: Addr<Scheduler>,
     backend_read: OwnedReadHalf,
     client_write: OwnedWriteHalf,
+    idle_timeout: Option<Duration>,
 ) {
     let scheduler_for_client = scheduler.clone();
-    ClientToBackendActor::new(flow_id, client_read, queue_tx, scheduler_for_client).start();
-    BackendToClientActor::new(flow_id, backend_read, client_write, scheduler).start();
+    let traffic_signal = TunnelTrafficSignal::new();
+
+    if let Some(timeout) = idle_timeout {
+        start_idle_timeout_monitor(flow_id, scheduler.clone(), &traffic_signal, timeout);
+    }
+
+    ClientToBackendActor::new(
+        flow_id,
+        client_read,
+        queue_tx,
+        scheduler_for_client,
+        traffic_signal.clone(),
+        traffic_signal.subscribe_shutdown(),
+    )
+    .start();
+    BackendToClientActor::new(
+        flow_id,
+        backend_read,
+        client_write,
+        scheduler,
+        traffic_signal.clone(),
+        traffic_signal.subscribe_shutdown(),
+    )
+    .start();
 }
 
 pub(crate) struct ClientToBackendActor {
@@ -134,20 +161,26 @@ pub(crate) struct ClientToBackendActor {
     client: Option<OwnedReadHalf>,
     queue_tx: Addr<QueueActor>,
     scheduler: Addr<Scheduler>,
+    traffic_signal: TunnelTrafficSignal,
+    shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
 impl ClientToBackendActor {
-    pub(crate) fn new(
+    fn new(
         flow_id: FlowId,
         client: OwnedReadHalf,
         queue_tx: Addr<QueueActor>,
         scheduler: Addr<Scheduler>,
+        traffic_signal: TunnelTrafficSignal,
+        shutdown_rx: TunnelShutdownReceiver,
     ) -> Self {
         Self {
             flow_id,
             client: Some(client),
             queue_tx,
             scheduler,
+            traffic_signal,
+            shutdown_rx: Some(shutdown_rx),
         }
     }
 
@@ -205,6 +238,11 @@ impl Actor for ClientToBackendActor {
         let flow_id = self.flow_id;
         let queue_tx = self.queue_tx.clone();
         let scheduler = self.scheduler.clone();
+        let traffic_signal = self.traffic_signal.clone();
+        let mut shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .expect("ClientToBackendActor started without shutdown receiver");
         let mut client = self
             .client
             .take()
@@ -217,35 +255,49 @@ impl Actor for ClientToBackendActor {
                 let start_time = Instant::now();
 
                 loop {
-                    match client.read(&mut buf).await {
-                        Ok(0) => {
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            let (total_value, total_unit) = format_bytes(total_read);
-
-                            if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
-                                info!(
-                                    "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
-                                    flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                debug!(
+                                    "flow{}: client-to-backend relay stopping after idle timeout",
+                                    flow_id.0
                                 );
-                            } else {
-                                info!(
-                                    "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s)",
-                                    flow_id.0, total_value, total_unit, elapsed
-                                );
-                            }
-
-                            break;
-                        }
-                        Ok(n) => {
-                            total_read += n as u64;
-                            let chunk = Bytes::copy_from_slice(&buf[..n]);
-                            if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
                                 break;
                             }
                         }
-                        Err(e) => {
-                            warn!("flow{}: read error: {}", flow_id.0, e);
-                            break;
+                        read_result = client.read(&mut buf) => {
+                            match read_result {
+                                Ok(0) => {
+                                    let elapsed = start_time.elapsed().as_secs_f64();
+                                    let (total_value, total_unit) = format_bytes(total_read);
+
+                                    if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
+                                        info!(
+                                            "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
+                                            flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+                                        );
+                                    } else {
+                                        info!(
+                                            "flow{}: client connection closed (upstream total: {:.2} {} in {:.2}s)",
+                                            flow_id.0, total_value, total_unit, elapsed
+                                        );
+                                    }
+
+                                    break;
+                                }
+                                Ok(n) => {
+                                    traffic_signal.record();
+                                    total_read += n as u64;
+                                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                    if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("flow{}: read error: {}", flow_id.0, e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -258,7 +310,7 @@ impl Actor for ClientToBackendActor {
     }
 }
 
-async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
+pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
     // Unregister this flow from the scheduler to signal completion and trigger cleanup.
     let mut delay = Duration::from_millis(UNREGISTER_RETRY_DELAY_MS);
     let max_delay = Duration::from_secs(UNREGISTER_RETRY_MAX_DELAY_SECS);
@@ -294,20 +346,26 @@ pub(crate) struct BackendToClientActor {
     backend: Option<OwnedReadHalf>,
     client: Option<OwnedWriteHalf>,
     scheduler: Addr<Scheduler>,
+    traffic_signal: TunnelTrafficSignal,
+    shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
 impl BackendToClientActor {
-    pub(crate) fn new(
+    fn new(
         flow_id: FlowId,
         backend: OwnedReadHalf,
         client: OwnedWriteHalf,
         scheduler: Addr<Scheduler>,
+        traffic_signal: TunnelTrafficSignal,
+        shutdown_rx: TunnelShutdownReceiver,
     ) -> Self {
         Self {
             flow_id,
             backend: Some(backend),
             client: Some(client),
             scheduler,
+            traffic_signal,
+            shutdown_rx: Some(shutdown_rx),
         }
     }
 }
@@ -326,6 +384,11 @@ impl Actor for BackendToClientActor {
             .take()
             .expect("BackendToClientActor started without client stream");
         let scheduler = self.scheduler.clone();
+        let traffic_signal = self.traffic_signal.clone();
+        let mut shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .expect("BackendToClientActor started without shutdown receiver");
 
         ctx.spawn(
             async move {
@@ -333,35 +396,62 @@ impl Actor for BackendToClientActor {
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
                 loop {
-                    match backend.read(&mut buf).await {
-                        Ok(0) => {
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            let (total_value, total_unit) = format_bytes(total_read);
-
-                            if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
-                                info!(
-                                    "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
-                                    flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                debug!(
+                                    "flow{}: backend-to-client relay stopping after idle timeout",
+                                    flow_id.0
                                 );
-                            } else {
-                                info!(
-                                    "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s)",
-                                    flow_id.0, total_value, total_unit, elapsed
-                                );
-                            }
-                            break;
-                        }
-                        Ok(n) => {
-                            total_read += n as u64;
-                            if let Err(e) = client.write_all(&buf[..n]).await {
-                                warn!("flow{}: client write error: {}", flow_id.0, e);
                                 break;
                             }
-                            scheduler.do_send(RecordDownstreamBytes { bytes: n });
                         }
-                        Err(e) => {
-                            warn!("flow{}: backend read error: {}", flow_id.0, e);
-                            break;
+                        read_result = backend.read(&mut buf) => {
+                            match read_result {
+                                Ok(0) => {
+                                    let elapsed = start_time.elapsed().as_secs_f64();
+                                    let (total_value, total_unit) = format_bytes(total_read);
+
+                                    if let Some((avg_value, avg_unit)) = format_rate(total_read, elapsed) {
+                                        info!(
+                                            "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s, avg: {:.2} {})",
+                                            flow_id.0, total_value, total_unit, elapsed, avg_value, avg_unit
+                                        );
+                                    } else {
+                                        info!(
+                                            "flow{}: backend connection closed (downstream total: {:.2} {} in {:.2}s)",
+                                            flow_id.0, total_value, total_unit, elapsed
+                                        );
+                                    }
+                                    break;
+                                }
+                                Ok(n) => {
+                                    traffic_signal.record();
+                                    total_read += n as u64;
+                                    tokio::select! {
+                                        write_result = client.write_all(&buf[..n]) => {
+                                            if let Err(e) = write_result {
+                                                warn!("flow{}: client write error: {}", flow_id.0, e);
+                                                break;
+                                            }
+                                        }
+                                        changed = shutdown_rx.changed() => {
+                                            if changed.is_err() || *shutdown_rx.borrow() {
+                                                debug!(
+                                                    "flow{}: backend-to-client relay stopping during client write after idle timeout",
+                                                    flow_id.0
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    scheduler.do_send(RecordDownstreamBytes { bytes: n });
+                                }
+                                Err(e) => {
+                                    warn!("flow{}: backend read error: {}", flow_id.0, e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -403,6 +493,36 @@ mod tests {
         read_half
     }
 
+    async fn build_live_read_half() -> (OwnedReadHalf, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server = accept_handle.await.unwrap();
+        let (read_half, _write_half) = server.into_split();
+        (read_half, client)
+    }
+
+    async fn build_live_write_half() -> (OwnedWriteHalf, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server = accept_handle.await.unwrap();
+        let (_read_half, write_half) = server.into_split();
+        (write_half, client)
+    }
+
     async fn fill_queue_until_buffer_exceeded(queue: &Addr<QueueActor>) {
         let packet = Bytes::from(vec![0u8; MAX_QUEUE_PACKET_BYTES]);
         loop {
@@ -431,7 +551,16 @@ mod tests {
             .unwrap();
 
         let client_read = build_server_read_half().await;
-        ClientToBackendActor::new(FlowId(5), client_read, queue.clone(), scheduler).start();
+        let traffic_signal = TunnelTrafficSignal::new();
+        ClientToBackendActor::new(
+            FlowId(5),
+            client_read,
+            queue.clone(),
+            scheduler,
+            traffic_signal.clone(),
+            traffic_signal.subscribe_shutdown(),
+        )
+        .start();
 
         let mut stopped = false;
         for _ in 0..20 {
@@ -446,6 +575,47 @@ mod tests {
             stopped,
             "queue should stop after client disconnect unregisters flow"
         );
+    }
+
+    #[actix_rt::test]
+    async fn idle_timeout_unregisters_flow_and_stops_queue() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(6),
+                queue_addr: queue.clone(),
+                backend_write,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (client_read, _client_peer) = build_live_read_half().await;
+        let (backend_read, _backend_peer) = build_live_read_half().await;
+        let (client_write, _client_write_peer) = build_live_write_half().await;
+        start_bidirectional_tunnel(
+            FlowId(6),
+            client_read,
+            queue.clone(),
+            scheduler,
+            backend_read,
+            client_write,
+            Some(Duration::from_millis(20)),
+        );
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(stopped, "queue should stop after tunnel idle timeout");
     }
 
     #[actix_rt::test]

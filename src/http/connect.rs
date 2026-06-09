@@ -178,6 +178,7 @@ struct ConnectSession {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
+    idle_timeout: Option<Duration>,
 }
 
 /// State machine for a CONNECT flow: Validating → Dialing → Registering → Established → Finished.
@@ -485,6 +486,7 @@ impl ConnectState {
             scheduler,
             client_reader,
             mut client_write,
+            idle_timeout,
             ..
         } = session;
 
@@ -500,6 +502,7 @@ impl ConnectState {
             scheduler,
             backend_read,
             client_write,
+            idle_timeout,
         );
 
         cleanup.disarm();
@@ -539,6 +542,7 @@ impl ConnectSession {
         scheduler: Addr<Scheduler>,
         connect_policy: Arc<ConnectPolicy>,
         pending_reservation: PendingConnectionReservation,
+        idle_timeout: Option<Duration>,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
@@ -549,6 +553,7 @@ impl ConnectSession {
             client_reader: BufReader::new(client_read),
             client_write,
             pending_reservation: Some(pending_reservation),
+            idle_timeout,
         }
     }
 
@@ -603,6 +608,7 @@ pub(crate) async fn handle_connect_proxy(
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
     pending_reservation: PendingConnectionReservation,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
     let session = ConnectSession::new(
         client_stream,
@@ -611,6 +617,7 @@ pub(crate) async fn handle_connect_proxy(
         scheduler,
         connect_policy,
         pending_reservation,
+        idle_timeout,
     );
 
     match run_connect_flow(session).await {
@@ -717,6 +724,7 @@ mod tests {
                 scheduler,
                 connect_policy,
                 pending_reservation,
+                None,
             )
             .await
             .unwrap();
