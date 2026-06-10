@@ -194,6 +194,7 @@ The SOCKS5 listener supports `CONNECT` requests only, without authentication. `D
 | `--socks5-bind <ADDR>` | `FYNTR_SOCKS5_BIND` | same as `--bind` | Optional address/hostname for the SOCKS5 listener. Only used when `--socks5-port` is set. |
 | `--socks5-port <PORT>` | `FYNTR_SOCKS5_PORT` | disabled | Enable a no-auth SOCKS5 `CONNECT` listener on this port. |
 | `--max-connections <MAX_CONNECTIONS>` | `FYNTR_MAX_CONNECTIONS` | `1000` | Maximum number of concurrent connections allowed (set `0` for unlimited). |
+| `--idle-timeout <SECONDS>` | `FYNTR_IDLE_TIMEOUT` | `300` | Idle timeout for established connections (set `0` to disable). |
 
 ### CONNECT Policy
 

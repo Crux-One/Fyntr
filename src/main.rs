@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
-use fyntr::run::{self, BindAddress, DEFAULT_BIND, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
+use fyntr::run::{
+    self, BindAddress, DEFAULT_BIND, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_PORT,
+};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ThreatActionCli {
@@ -32,6 +35,14 @@ struct Cli {
     /// Maximum number of concurrent connections allowed
     #[clap(long, env = "FYNTR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
+
+    /// Established tunnel idle timeout in seconds (0 to disable)
+    #[clap(
+        long = "idle-timeout",
+        env = "FYNTR_IDLE_TIMEOUT",
+        default_value_t = DEFAULT_IDLE_TIMEOUT_SECS
+    )]
+    idle_timeout: u64,
 
     /// CONNECT destination ports to allow (repeat flag or comma-separate).
     #[clap(
@@ -75,7 +86,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut server = run::server()
         .bind(cli.bind)
         .port(cli.port)
-        .max_connections(cli.max_connections);
+        .max_connections(cli.max_connections)
+        .idle_timeout(Duration::from_secs(cli.idle_timeout));
 
     if let Some(bind) = cli.socks5_bind {
         server = server.socks5_bind(bind);
