@@ -8,16 +8,16 @@ use tokio::{
 use super::{FlowId, connection::unregister_flow};
 use crate::actors::scheduler::Scheduler;
 
-pub(super) type TunnelShutdownReceiver = watch::Receiver<bool>;
+pub(crate) type TunnelShutdownReceiver = watch::Receiver<bool>;
 
 #[derive(Clone)]
-pub(super) struct TunnelTrafficSignal {
+pub(crate) struct TunnelTrafficSignal {
     activity_tx: watch::Sender<Instant>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl TunnelTrafficSignal {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (activity_tx, _activity_rx) = watch::channel(Instant::now());
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         Self {
@@ -26,16 +26,21 @@ impl TunnelTrafficSignal {
         }
     }
 
-    pub(super) fn record(&self) {
+    pub(crate) fn record(&self) {
         let _ = self.activity_tx.send(Instant::now());
     }
 
-    pub(super) fn subscribe_shutdown(&self) -> TunnelShutdownReceiver {
+    pub(crate) fn subscribe_shutdown(&self) -> TunnelShutdownReceiver {
         self.shutdown_tx.subscribe()
     }
 
-    fn subscribe_activity(&self) -> watch::Receiver<Instant> {
+    pub(crate) fn subscribe_activity(&self) -> watch::Receiver<Instant> {
         self.activity_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_for_test(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     fn shutdown_sender(&self) -> watch::Sender<bool> {

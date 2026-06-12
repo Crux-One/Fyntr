@@ -120,17 +120,29 @@ impl Drop for FlowCleanup {
     }
 }
 
-pub(crate) fn start_bidirectional_tunnel(
-    flow_id: FlowId,
-    client_read: OwnedReadHalf,
-    queue_tx: Addr<QueueActor>,
-    scheduler: Addr<Scheduler>,
-    backend_read: OwnedReadHalf,
-    client_write: OwnedWriteHalf,
-    idle_timeout: Option<Duration>,
-) {
+pub(crate) struct BidirectionalTunnel {
+    pub(crate) flow_id: FlowId,
+    pub(crate) client_read: OwnedReadHalf,
+    pub(crate) queue_tx: Addr<QueueActor>,
+    pub(crate) scheduler: Addr<Scheduler>,
+    pub(crate) backend_read: OwnedReadHalf,
+    pub(crate) client_write: OwnedWriteHalf,
+    pub(crate) traffic_signal: TunnelTrafficSignal,
+    pub(crate) idle_timeout: Option<Duration>,
+}
+
+pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
+    let BidirectionalTunnel {
+        flow_id,
+        client_read,
+        queue_tx,
+        scheduler,
+        backend_read,
+        client_write,
+        traffic_signal,
+        idle_timeout,
+    } = tunnel;
     let scheduler_for_client = scheduler.clone();
-    let traffic_signal = TunnelTrafficSignal::new();
 
     if let Some(timeout) = idle_timeout {
         start_idle_timeout_monitor(flow_id, scheduler.clone(), &traffic_signal, timeout);
@@ -545,6 +557,7 @@ mod tests {
                 flow_id: FlowId(5),
                 queue_addr: queue.clone(),
                 backend_write,
+                traffic_signal: TunnelTrafficSignal::new(),
             })
             .await
             .unwrap()
@@ -588,6 +601,7 @@ mod tests {
                 flow_id: FlowId(6),
                 queue_addr: queue.clone(),
                 backend_write,
+                traffic_signal: TunnelTrafficSignal::new(),
             })
             .await
             .unwrap()
@@ -596,15 +610,17 @@ mod tests {
         let (client_read, _client_peer) = build_live_read_half().await;
         let (backend_read, _backend_peer) = build_live_read_half().await;
         let (client_write, _client_write_peer) = build_live_write_half().await;
-        start_bidirectional_tunnel(
-            FlowId(6),
+        let traffic_signal = TunnelTrafficSignal::new();
+        start_bidirectional_tunnel(BidirectionalTunnel {
+            flow_id: FlowId(6),
             client_read,
-            queue.clone(),
+            queue_tx: queue.clone(),
             scheduler,
             backend_read,
             client_write,
-            Some(Duration::from_millis(20)),
-        );
+            traffic_signal,
+            idle_timeout: Some(Duration::from_millis(20)),
+        });
 
         let mut stopped = false;
         for _ in 0..20 {
