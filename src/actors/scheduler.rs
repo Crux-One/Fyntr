@@ -431,12 +431,16 @@ impl Scheduler {
                 break;
             };
 
-            let maybe_target = self
-                .flow(flow)
-                .map(|entry| (entry.queue_addr(), entry.backend_write()));
+            let maybe_target = self.flow(flow).map(|entry| {
+                (
+                    entry.queue_addr(),
+                    entry.backend_write(),
+                    entry.traffic_signal(),
+                )
+            });
 
-            if let Some((queue_addr, backend_write)) = maybe_target {
-                self.request_dequeue(flow, queue_addr, backend_write, ctx);
+            if let Some((queue_addr, backend_write, traffic_signal)) = maybe_target {
+                self.request_dequeue(flow, queue_addr, backend_write, traffic_signal, ctx);
             }
             self.ready_set.remove(&flow);
         }
@@ -447,6 +451,7 @@ impl Scheduler {
         flow: FlowId,
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        traffic_signal: TunnelTrafficSignal,
         ctx: &mut <Self as Actor>::Context,
     ) {
         queue_addr
@@ -455,7 +460,7 @@ impl Scheduler {
             })
             .into_actor(self)
             .map(move |res, act, ctx| {
-                act.handle_dequeue_response(flow, backend_write, res, ctx);
+                act.handle_dequeue_response(flow, backend_write, traffic_signal, res, ctx);
             })
             .spawn(ctx);
     }
@@ -464,11 +469,14 @@ impl Scheduler {
         &mut self,
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        traffic_signal: TunnelTrafficSignal,
         res: Result<Option<DequeueResult>, MailboxError>,
         ctx: &mut <Self as Actor>::Context,
     ) {
         match res {
-            Ok(Some(result)) => self.handle_dequeue_success(flow, backend_write, result),
+            Ok(Some(result)) => {
+                self.handle_dequeue_success(flow, backend_write, traffic_signal, result)
+            }
             Ok(None) => self.handle_empty_dequeue(flow),
             Err(e) => self.handle_dequeue_error(flow, e, ctx),
         }
@@ -478,8 +486,17 @@ impl Scheduler {
         &mut self,
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        traffic_signal: TunnelTrafficSignal,
         result: DequeueResult,
     ) {
+        if self.flow(flow).is_none() {
+            debug!(
+                "flow{}: skipping dequeued backend write because flow is no longer registered",
+                flow.0
+            );
+            return;
+        }
+
         debug!(
             "flow{}: dequeue granted (remaining_queue={})",
             flow.0, result.remaining
@@ -491,10 +508,7 @@ impl Scheduler {
         if result.ready_for_more {
             self.mark_flow_ready(flow);
         }
-        let traffic_signal = self.flow(flow).map(|entry| entry.traffic_signal());
-        if let Some(traffic_signal) = &traffic_signal {
-            traffic_signal.record();
-        }
+        traffic_signal.record();
         self.spawn_backend_write(flow, backend_write, result.packet, traffic_signal);
     }
 
@@ -535,55 +549,48 @@ impl Scheduler {
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
         data: bytes::Bytes,
-        traffic_signal: Option<TunnelTrafficSignal>,
+        traffic_signal: TunnelTrafficSignal,
     ) {
         actix::spawn(async move {
-            if let Some(traffic_signal) = traffic_signal {
-                let mut shutdown_rx = traffic_signal.subscribe_shutdown();
+            let mut shutdown_rx = traffic_signal.subscribe_shutdown();
 
-                if *shutdown_rx.borrow() {
-                    return;
-                }
+            if *shutdown_rx.borrow() {
+                return;
+            }
 
-                let mut bw = tokio::select! {
-                    guard = backend_write.lock() => guard,
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            debug!(
-                                "flow{}: backend write task stopping while waiting for write lock after idle timeout",
-                                flow.0
-                            );
-                            return;
-                        }
-                        backend_write.lock().await
+            let mut bw = tokio::select! {
+                guard = backend_write.lock() => guard,
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        debug!(
+                            "flow{}: backend write task stopping while waiting for write lock after idle timeout",
+                            flow.0
+                        );
+                        return;
                     }
-                };
-
-                if *shutdown_rx.borrow() {
-                    return;
+                    backend_write.lock().await
                 }
+            };
 
-                tokio::select! {
-                    write_result = bw.write_all(&data) => {
-                        if let Err(e) = write_result {
-                            warn!("flow{}: backend write error: {}", flow.0, e);
-                        } else {
-                            traffic_signal.record();
-                        }
-                    }
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            debug!(
-                                "flow{}: backend write task stopping after idle timeout",
-                                flow.0
-                            );
-                        }
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            tokio::select! {
+                write_result = bw.write_all(&data) => {
+                    if let Err(e) = write_result {
+                        warn!("flow{}: backend write error: {}", flow.0, e);
+                    } else {
+                        traffic_signal.record();
                     }
                 }
-            } else {
-                let mut bw = backend_write.lock().await;
-                if let Err(e) = bw.write_all(&data).await {
-                    warn!("flow{}: backend write error: {}", flow.0, e);
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        debug!(
+                            "flow{}: backend write task stopping after idle timeout",
+                            flow.0
+                        );
+                    }
                 }
             }
         });
@@ -864,6 +871,39 @@ mod tests {
             read_result.is_err(),
             "backend write task should exit while waiting for the write lock after idle shutdown"
         );
+    }
+
+    #[actix_rt::test]
+    async fn stale_dequeue_response_after_unregister_does_not_write_to_backend() {
+        let mut scheduler = Scheduler::new(1024, Duration::from_secs(3600));
+        let queue = QueueActor::new().start();
+        let (backend_write, mut backend_peer) = make_live_backend_write().await;
+        let traffic_signal = TunnelTrafficSignal::new();
+        let flow = FlowId(13);
+
+        scheduler.register(flow, queue, backend_write.clone(), traffic_signal.clone());
+        assert!(scheduler.unregister(flow));
+
+        scheduler.handle_dequeue_success(
+            flow,
+            backend_write,
+            traffic_signal,
+            DequeueResult {
+                packet: bytes::Bytes::from_static(b"stale dequeue response"),
+                remaining: 0,
+                ready_for_more: false,
+            },
+        );
+
+        let mut buf = [0u8; 64];
+        let read_result = timeout(Duration::from_millis(50), backend_peer.read(&mut buf)).await;
+        match read_result {
+            Err(_) | Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!(
+                "stale dequeue responses after unregister must not write to the backend, read {n} bytes"
+            ),
+            Ok(Err(e)) => panic!("backend peer read failed unexpectedly: {e}"),
+        }
     }
 
     #[actix_rt::test]
