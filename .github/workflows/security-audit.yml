@@ -28,6 +28,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Audit dependencies
         uses: rustsec/audit-check@v2.0.0
         with:
