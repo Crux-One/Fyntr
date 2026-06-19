@@ -27,7 +27,7 @@ impl TunnelTrafficSignal {
     }
 
     pub(crate) fn record(&self) {
-        let _ = self.activity_tx.send(Instant::now());
+        self.activity_tx.send_replace(Instant::now());
     }
 
     pub(crate) fn subscribe_shutdown(&self) -> TunnelShutdownReceiver {

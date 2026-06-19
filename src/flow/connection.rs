@@ -144,6 +144,8 @@ pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
     } = tunnel;
     let scheduler_for_client = scheduler.clone();
 
+    traffic_signal.record();
+
     if let Some(timeout) = idle_timeout {
         start_idle_timeout_monitor(flow_id, scheduler.clone(), &traffic_signal, timeout);
     }
@@ -632,6 +634,48 @@ mod tests {
         }
 
         assert!(stopped, "queue should stop after tunnel idle timeout");
+    }
+
+    #[actix_rt::test]
+    async fn idle_timeout_starts_when_tunnel_starts() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let traffic_signal = TunnelTrafficSignal::new();
+        scheduler
+            .send(Register {
+                flow_id: FlowId(7),
+                queue_addr: queue.clone(),
+                backend_write,
+                traffic_signal: traffic_signal.clone(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        sleep(Duration::from_millis(120)).await;
+
+        let (client_read, _client_peer) = build_live_read_half().await;
+        let (backend_read, _backend_peer) = build_live_read_half().await;
+        let (client_write, _client_write_peer) = build_live_write_half().await;
+        start_bidirectional_tunnel(BidirectionalTunnel {
+            flow_id: FlowId(7),
+            client_read,
+            queue_tx: queue.clone(),
+            scheduler,
+            backend_read,
+            client_write,
+            traffic_signal,
+            idle_timeout: Some(Duration::from_millis(100)),
+        });
+
+        sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            queue.send(Dequeue { max_bytes: 1024 }).await.is_ok(),
+            "idle timeout should start from tunnel start, not signal creation"
+        );
     }
 
     #[actix_rt::test]
