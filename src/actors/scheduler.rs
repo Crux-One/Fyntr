@@ -14,7 +14,10 @@ use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Inst
 
 use crate::{
     actors::queue::{AddQuantum, BindScheduler, Dequeue, DequeueResult, QueueActor, StopNow},
-    flow::{FlowId, idle_timeout::TunnelTrafficSignal},
+    flow::{
+        FlowId,
+        idle_timeout::{TunnelActivity, TunnelLifecycle},
+    },
     limits::{MAX_DEQUEUE_BYTES, MaxConnections, max_connections_display},
     util::{format_bytes, format_rate},
 };
@@ -30,7 +33,7 @@ pub(crate) struct Register {
     pub flow_id: FlowId,
     pub queue_addr: Addr<QueueActor>,
     pub backend_write: Arc<Mutex<OwnedWriteHalf>>,
-    pub traffic_signal: TunnelTrafficSignal,
+    pub tunnel_lifecycle: TunnelLifecycle,
 }
 
 /// Returns whether the scheduler can admit another connection right now.
@@ -65,7 +68,7 @@ pub(crate) struct RecordDownstreamBytes {
 struct FlowEntry {
     queue_addr: Addr<QueueActor>,
     backend_write: Arc<Mutex<OwnedWriteHalf>>,
-    traffic_signal: TunnelTrafficSignal,
+    tunnel_lifecycle: TunnelLifecycle,
     stats: FlowStats,
 }
 
@@ -73,12 +76,12 @@ impl FlowEntry {
     fn new(
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
     ) -> Self {
         Self {
             queue_addr,
             backend_write,
-            traffic_signal,
+            tunnel_lifecycle,
             stats: FlowStats::new(),
         }
     }
@@ -91,8 +94,8 @@ impl FlowEntry {
         self.backend_write.clone()
     }
 
-    fn traffic_signal(&self) -> TunnelTrafficSignal {
-        self.traffic_signal.clone()
+    fn tunnel_lifecycle(&self) -> TunnelLifecycle {
+        self.tunnel_lifecycle.clone()
     }
 
     fn update_stats(&mut self, bytes: usize) {
@@ -318,12 +321,12 @@ impl Scheduler {
         id: FlowId,
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
     ) {
         self.finish_pending_connection_task(id);
         self.flows.insert(
             id,
-            FlowEntry::new(queue_addr, backend_write, traffic_signal),
+            FlowEntry::new(queue_addr, backend_write, tunnel_lifecycle),
         );
     }
 
@@ -363,9 +366,9 @@ impl Handler<Register> for Scheduler {
         let flow_id = msg.flow_id;
         let queue_addr = msg.queue_addr;
         let backend_write = msg.backend_write;
-        let traffic_signal = msg.traffic_signal;
+        let tunnel_lifecycle = msg.tunnel_lifecycle;
 
-        self.register(flow_id, queue_addr.clone(), backend_write, traffic_signal);
+        self.register(flow_id, queue_addr.clone(), backend_write, tunnel_lifecycle);
         queue_addr.do_send(BindScheduler {
             flow_id,
             scheduler: ctx.address(),
@@ -435,12 +438,12 @@ impl Scheduler {
                 (
                     entry.queue_addr(),
                     entry.backend_write(),
-                    entry.traffic_signal(),
+                    entry.tunnel_lifecycle(),
                 )
             });
 
-            if let Some((queue_addr, backend_write, traffic_signal)) = maybe_target {
-                self.request_dequeue(flow, queue_addr, backend_write, traffic_signal, ctx);
+            if let Some((queue_addr, backend_write, tunnel_lifecycle)) = maybe_target {
+                self.request_dequeue(flow, queue_addr, backend_write, tunnel_lifecycle, ctx);
             }
             self.ready_set.remove(&flow);
         }
@@ -451,7 +454,7 @@ impl Scheduler {
         flow: FlowId,
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         ctx: &mut <Self as Actor>::Context,
     ) {
         queue_addr
@@ -460,7 +463,7 @@ impl Scheduler {
             })
             .into_actor(self)
             .map(move |res, act, ctx| {
-                act.handle_dequeue_response(flow, backend_write, traffic_signal, res, ctx);
+                act.handle_dequeue_response(flow, backend_write, tunnel_lifecycle, res, ctx);
             })
             .spawn(ctx);
     }
@@ -469,13 +472,13 @@ impl Scheduler {
         &mut self,
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         res: Result<Option<DequeueResult>, MailboxError>,
         ctx: &mut <Self as Actor>::Context,
     ) {
         match res {
             Ok(Some(result)) => {
-                self.handle_dequeue_success(flow, backend_write, traffic_signal, result)
+                self.handle_dequeue_success(flow, backend_write, tunnel_lifecycle, result)
             }
             Ok(None) => self.handle_empty_dequeue(flow),
             Err(e) => self.handle_dequeue_error(flow, e, ctx),
@@ -486,7 +489,7 @@ impl Scheduler {
         &mut self,
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         result: DequeueResult,
     ) {
         if self.flow(flow).is_none() {
@@ -508,8 +511,8 @@ impl Scheduler {
         if result.ready_for_more {
             self.mark_flow_ready(flow);
         }
-        traffic_signal.record();
-        self.spawn_backend_write(flow, backend_write, result.packet, traffic_signal);
+        tunnel_lifecycle.record_activity(TunnelActivity::QueueDequeued);
+        self.spawn_backend_write(flow, backend_write, result.packet, tunnel_lifecycle);
     }
 
     fn handle_empty_dequeue(&mut self, flow: FlowId) {
@@ -549,10 +552,10 @@ impl Scheduler {
         flow: FlowId,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
         data: bytes::Bytes,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
     ) {
         actix::spawn(async move {
-            let mut shutdown_rx = traffic_signal.subscribe_shutdown();
+            let mut shutdown_rx = tunnel_lifecycle.subscribe_shutdown();
 
             if *shutdown_rx.borrow() {
                 return;
@@ -581,7 +584,7 @@ impl Scheduler {
                     if let Err(e) = write_result {
                         warn!("flow{}: backend write error: {}", flow.0, e);
                     } else {
-                        traffic_signal.record();
+                        tunnel_lifecycle.record_activity(TunnelActivity::BackendWrite);
                     }
                 }
                 changed = shutdown_rx.changed() => {
@@ -720,8 +723,8 @@ mod tests {
         time::{sleep, timeout},
     };
 
-    fn test_traffic_signal() -> TunnelTrafficSignal {
-        TunnelTrafficSignal::new()
+    fn test_tunnel_lifecycle() -> TunnelLifecycle {
+        TunnelLifecycle::new()
     }
 
     async fn make_live_backend_write() -> (Arc<Mutex<OwnedWriteHalf>>, TcpStream) {
@@ -788,19 +791,19 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn upstream_dequeue_refreshes_tunnel_traffic_signal() {
+    async fn upstream_dequeue_refreshes_tunnel_lifecycle() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
 
         let queue = QueueActor::new().start();
         let (backend_write, _backend_peer) = make_live_backend_write().await;
-        let traffic_signal = TunnelTrafficSignal::new();
-        let mut activity_rx = traffic_signal.subscribe_activity();
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        let mut activity_rx = tunnel_lifecycle.subscribe_activity();
         scheduler
             .send(Register {
                 flow_id: FlowId(11),
                 queue_addr: queue.clone(),
                 backend_write,
-                traffic_signal,
+                tunnel_lifecycle,
             })
             .await
             .unwrap()
@@ -834,13 +837,13 @@ mod tests {
         let queue = QueueActor::new().start();
         let (backend_write, mut backend_peer) = make_live_backend_write().await;
         let write_guard = backend_write.lock().await;
-        let traffic_signal = TunnelTrafficSignal::new();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         scheduler
             .send(Register {
                 flow_id: FlowId(12),
                 queue_addr: queue.clone(),
                 backend_write: backend_write.clone(),
-                traffic_signal: traffic_signal.clone(),
+                tunnel_lifecycle: tunnel_lifecycle.clone(),
             })
             .await
             .unwrap()
@@ -861,7 +864,7 @@ mod tests {
             .unwrap();
         scheduler.send(QuantumTick).await.unwrap();
 
-        traffic_signal.shutdown_for_test();
+        tunnel_lifecycle.shutdown_for_test();
         sleep(Duration::from_millis(10)).await;
         drop(write_guard);
 
@@ -878,16 +881,16 @@ mod tests {
         let mut scheduler = Scheduler::new(1024, Duration::from_secs(3600));
         let queue = QueueActor::new().start();
         let (backend_write, mut backend_peer) = make_live_backend_write().await;
-        let traffic_signal = TunnelTrafficSignal::new();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         let flow = FlowId(13);
 
-        scheduler.register(flow, queue, backend_write.clone(), traffic_signal.clone());
+        scheduler.register(flow, queue, backend_write.clone(), tunnel_lifecycle.clone());
         assert!(scheduler.unregister(flow));
 
         scheduler.handle_dequeue_success(
             flow,
             backend_write,
-            traffic_signal,
+            tunnel_lifecycle,
             DequeueResult {
                 packet: bytes::Bytes::from_static(b"stale dequeue response"),
                 remaining: 0,
@@ -919,7 +922,7 @@ mod tests {
                 flow_id: FlowId(1),
                 queue_addr: queue1,
                 backend_write: backend_write1,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap();
@@ -932,7 +935,7 @@ mod tests {
                 flow_id: FlowId(2),
                 queue_addr: queue2,
                 backend_write: backend_write2,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap();
@@ -955,7 +958,7 @@ mod tests {
                 flow_id: FlowId(10),
                 queue_addr: queue1,
                 backend_write: backend_write1,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -975,7 +978,7 @@ mod tests {
                 flow_id: FlowId(20),
                 queue_addr: queue2,
                 backend_write: backend_write2,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap();
@@ -998,7 +1001,7 @@ mod tests {
                 flow_id: FlowId(1),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1021,7 +1024,7 @@ mod tests {
                 flow_id: FlowId(1),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1044,7 +1047,7 @@ mod tests {
                 flow_id: FlowId(1),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1073,7 +1076,7 @@ mod tests {
                 flow_id: FlowId(42),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1162,7 +1165,7 @@ mod tests {
                 flow_id: FlowId(1),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1196,7 +1199,7 @@ mod tests {
                     flow_id: id,
                     queue_addr: queue,
                     backend_write,
-                    traffic_signal: test_traffic_signal(),
+                    tunnel_lifecycle: test_tunnel_lifecycle(),
                 })
                 .await
                 .unwrap()
@@ -1238,7 +1241,7 @@ mod tests {
                 flow_id: FlowId(99),
                 queue_addr: queue.clone(),
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1317,7 +1320,7 @@ mod tests {
                 flow_id: FlowId(7),
                 queue_addr: queue.clone(),
                 backend_write,
-                traffic_signal: test_traffic_signal(),
+                tunnel_lifecycle: test_tunnel_lifecycle(),
             })
             .await
             .unwrap()
@@ -1353,7 +1356,11 @@ mod tests {
         let default_quantum = 8192;
 
         // Case 1: No stats -> default_quantum
-        let flow = FlowEntry::new(queue.clone(), backend_write.clone(), test_traffic_signal());
+        let flow = FlowEntry::new(
+            queue.clone(),
+            backend_write.clone(),
+            test_tunnel_lifecycle(),
+        );
         assert_eq!(
             flow.recommended_quantum(default_quantum),
             default_quantum,
@@ -1361,7 +1368,11 @@ mod tests {
         );
 
         // Case 2: Small packets (< 200 bytes) -> MIN_QUANTUM (1500)
-        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone(), test_traffic_signal());
+        let mut flow = FlowEntry::new(
+            queue.clone(),
+            backend_write.clone(),
+            test_tunnel_lifecycle(),
+        );
         flow.update_stats(100); // Set avg to 100
         assert_eq!(
             flow.recommended_quantum(default_quantum),
@@ -1370,7 +1381,11 @@ mod tests {
         );
 
         // Case 3: Normal packets -> Scaled (avg * 10)
-        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone(), test_traffic_signal());
+        let mut flow = FlowEntry::new(
+            queue.clone(),
+            backend_write.clone(),
+            test_tunnel_lifecycle(),
+        );
         flow.update_stats(500); // Set avg to 500
         // Target = 500 * 10 = 5000
         assert_eq!(
@@ -1380,7 +1395,11 @@ mod tests {
         );
 
         // Case 4: Large packets -> MAX_QUANTUM (16384)
-        let mut flow = FlowEntry::new(queue.clone(), backend_write.clone(), test_traffic_signal());
+        let mut flow = FlowEntry::new(
+            queue.clone(),
+            backend_write.clone(),
+            test_tunnel_lifecycle(),
+        );
         flow.update_stats(2000); // Set avg to 2000
         // Target = 2000 * 10 = 20000 -> Clamped to 16384
         assert_eq!(
@@ -1396,7 +1415,7 @@ mod tests {
         let backend_write = make_backend_write().await;
         let default_quantum = 4096;
 
-        let mut flow = FlowEntry::new(queue, backend_write, test_traffic_signal());
+        let mut flow = FlowEntry::new(queue, backend_write, test_tunnel_lifecycle());
 
         // Initial tiny packets force the minimum quantum.
         flow.update_stats(100);

@@ -28,7 +28,7 @@ use crate::{
             BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
             start_bidirectional_tunnel,
         },
-        idle_timeout::TunnelTrafficSignal,
+        idle_timeout::TunnelLifecycle,
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -195,13 +195,13 @@ enum ConnectState {
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
     },
     Established {
         session: ConnectSession,
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
     },
     Finished(FlowId),
 }
@@ -409,7 +409,7 @@ impl ConnectState {
 
         let (backend_read, backend_write) = backend_stream.into_split();
         let queue_tx = QueueActor::new().start();
-        let traffic_signal = TunnelTrafficSignal::new();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         cleanup.watch_queue(queue_tx.clone());
 
         Ok(ConnectState::Registering {
@@ -417,7 +417,7 @@ impl ConnectState {
             queue_tx,
             backend_read,
             backend_write: Arc::new(Mutex::new(backend_write)),
-            traffic_signal,
+            tunnel_lifecycle,
         })
     }
 
@@ -426,7 +426,7 @@ impl ConnectState {
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         match session
@@ -435,7 +435,7 @@ impl ConnectState {
                 flow_id: session.flow_id,
                 queue_addr: queue_tx.clone(),
                 backend_write: backend_write.clone(),
-                traffic_signal: traffic_signal.clone(),
+                tunnel_lifecycle: tunnel_lifecycle.clone(),
             })
             .await
         {
@@ -448,7 +448,7 @@ impl ConnectState {
                     session,
                     queue_tx,
                     backend_read,
-                    traffic_signal,
+                    tunnel_lifecycle,
                 })
             }
             Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
@@ -487,7 +487,7 @@ impl ConnectState {
         session: ConnectSession,
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         let ConnectSession {
@@ -511,7 +511,7 @@ impl ConnectState {
             scheduler,
             backend_read,
             client_write,
-            traffic_signal,
+            tunnel_lifecycle,
             idle_timeout,
         });
 
@@ -530,14 +530,14 @@ impl ConnectState {
                 queue_tx,
                 backend_read,
                 backend_write,
-                traffic_signal,
+                tunnel_lifecycle,
             } => {
                 Self::advance_registering(
                     session,
                     queue_tx,
                     backend_read,
                     backend_write,
-                    traffic_signal,
+                    tunnel_lifecycle,
                     cleanup,
                 )
                 .await
@@ -546,10 +546,16 @@ impl ConnectState {
                 session,
                 queue_tx,
                 backend_read,
-                traffic_signal,
+                tunnel_lifecycle,
             } => {
-                Self::advance_established(session, queue_tx, backend_read, traffic_signal, cleanup)
-                    .await
+                Self::advance_established(
+                    session,
+                    queue_tx,
+                    backend_read,
+                    tunnel_lifecycle,
+                    cleanup,
+                )
+                .await
             }
             ConnectState::Finished(flow_id) => Ok(ConnectState::Finished(flow_id)),
         }
@@ -1009,7 +1015,7 @@ mod tests {
                 flow_id: FlowId(42),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: TunnelTrafficSignal::new(),
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()
@@ -1053,7 +1059,7 @@ mod tests {
                 flow_id: FlowId(42),
                 queue_addr: queue,
                 backend_write,
-                traffic_signal: TunnelTrafficSignal::new(),
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()

@@ -29,7 +29,7 @@ use crate::{
             BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
             start_bidirectional_tunnel,
         },
-        idle_timeout::TunnelTrafficSignal,
+        idle_timeout::TunnelLifecycle,
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -234,7 +234,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     let (backend_read, backend_write) = backend_stream.into_split();
     let queue_tx = QueueActor::new().start();
     let backend_write = Arc::new(Mutex::new(backend_write));
-    let traffic_signal = TunnelTrafficSignal::new();
+    let tunnel_lifecycle = TunnelLifecycle::new();
     let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
     cleanup.watch_queue(queue_tx.clone());
 
@@ -244,7 +244,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
             flow_id: session.flow_id,
             queue_addr: queue_tx.clone(),
             backend_write: backend_write.clone(),
-            traffic_signal: traffic_signal.clone(),
+            tunnel_lifecycle: tunnel_lifecycle.clone(),
         })
         .await
     {
@@ -293,7 +293,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         scheduler,
         backend_read,
         client_write,
-        traffic_signal,
+        tunnel_lifecycle,
         idle_timeout,
     });
 
