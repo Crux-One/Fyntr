@@ -10,13 +10,22 @@ use crate::actors::scheduler::Scheduler;
 
 pub(crate) type TunnelShutdownReceiver = watch::Receiver<bool>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunnelActivity {
+    TunnelStarted,
+    ClientRead,
+    BackendRead,
+    QueueDequeued,
+    BackendWrite,
+}
+
 #[derive(Clone)]
-pub(crate) struct TunnelTrafficSignal {
+pub(crate) struct TunnelLifecycle {
     activity_tx: watch::Sender<Instant>,
     shutdown_tx: watch::Sender<bool>,
 }
 
-impl TunnelTrafficSignal {
+impl TunnelLifecycle {
     pub(crate) fn new() -> Self {
         let (activity_tx, _activity_rx) = watch::channel(Instant::now());
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
@@ -26,8 +35,8 @@ impl TunnelTrafficSignal {
         }
     }
 
-    pub(crate) fn record(&self) {
-        let _ = self.activity_tx.send(Instant::now());
+    pub(crate) fn record_activity(&self, _activity: TunnelActivity) {
+        self.activity_tx.send_replace(Instant::now());
     }
 
     pub(crate) fn subscribe_shutdown(&self) -> TunnelShutdownReceiver {
@@ -51,11 +60,11 @@ impl TunnelTrafficSignal {
 pub(super) fn start_idle_timeout_monitor(
     flow_id: FlowId,
     scheduler: Addr<Scheduler>,
-    traffic_signal: &TunnelTrafficSignal,
+    tunnel_lifecycle: &TunnelLifecycle,
     idle_timeout: Duration,
 ) {
-    let mut activity_rx = traffic_signal.subscribe_activity();
-    let shutdown_tx = traffic_signal.shutdown_sender();
+    let mut activity_rx = tunnel_lifecycle.subscribe_activity();
+    let shutdown_tx = tunnel_lifecycle.shutdown_sender();
 
     actix::spawn(async move {
         loop {

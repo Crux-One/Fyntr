@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::idle_timeout::{
-    TunnelShutdownReceiver, TunnelTrafficSignal, start_idle_timeout_monitor,
+    TunnelActivity, TunnelLifecycle, TunnelShutdownReceiver, start_idle_timeout_monitor,
 };
 
 const BUFFER_SIZE: usize = 8 * 1024; // 8 KB
@@ -127,7 +127,7 @@ pub(crate) struct BidirectionalTunnel {
     pub(crate) scheduler: Addr<Scheduler>,
     pub(crate) backend_read: OwnedReadHalf,
     pub(crate) client_write: OwnedWriteHalf,
-    pub(crate) traffic_signal: TunnelTrafficSignal,
+    pub(crate) tunnel_lifecycle: TunnelLifecycle,
     pub(crate) idle_timeout: Option<Duration>,
 }
 
@@ -139,13 +139,15 @@ pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
         scheduler,
         backend_read,
         client_write,
-        traffic_signal,
+        tunnel_lifecycle,
         idle_timeout,
     } = tunnel;
     let scheduler_for_client = scheduler.clone();
 
+    tunnel_lifecycle.record_activity(TunnelActivity::TunnelStarted);
+
     if let Some(timeout) = idle_timeout {
-        start_idle_timeout_monitor(flow_id, scheduler.clone(), &traffic_signal, timeout);
+        start_idle_timeout_monitor(flow_id, scheduler.clone(), &tunnel_lifecycle, timeout);
     }
 
     ClientToBackendActor::new(
@@ -153,8 +155,8 @@ pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
         client_read,
         queue_tx,
         scheduler_for_client,
-        traffic_signal.clone(),
-        traffic_signal.subscribe_shutdown(),
+        tunnel_lifecycle.clone(),
+        tunnel_lifecycle.subscribe_shutdown(),
     )
     .start();
     BackendToClientActor::new(
@@ -162,8 +164,8 @@ pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
         backend_read,
         client_write,
         scheduler,
-        traffic_signal.clone(),
-        traffic_signal.subscribe_shutdown(),
+        tunnel_lifecycle.clone(),
+        tunnel_lifecycle.subscribe_shutdown(),
     )
     .start();
 }
@@ -173,7 +175,7 @@ pub(crate) struct ClientToBackendActor {
     client: Option<OwnedReadHalf>,
     queue_tx: Addr<QueueActor>,
     scheduler: Addr<Scheduler>,
-    traffic_signal: TunnelTrafficSignal,
+    tunnel_lifecycle: TunnelLifecycle,
     shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
@@ -183,7 +185,7 @@ impl ClientToBackendActor {
         client: OwnedReadHalf,
         queue_tx: Addr<QueueActor>,
         scheduler: Addr<Scheduler>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         shutdown_rx: TunnelShutdownReceiver,
     ) -> Self {
         Self {
@@ -191,7 +193,7 @@ impl ClientToBackendActor {
             client: Some(client),
             queue_tx,
             scheduler,
-            traffic_signal,
+            tunnel_lifecycle,
             shutdown_rx: Some(shutdown_rx),
         }
     }
@@ -250,7 +252,7 @@ impl Actor for ClientToBackendActor {
         let flow_id = self.flow_id;
         let queue_tx = self.queue_tx.clone();
         let scheduler = self.scheduler.clone();
-        let traffic_signal = self.traffic_signal.clone();
+        let tunnel_lifecycle = self.tunnel_lifecycle.clone();
         let mut shutdown_rx = self
             .shutdown_rx
             .take()
@@ -298,7 +300,7 @@ impl Actor for ClientToBackendActor {
                                     break;
                                 }
                                 Ok(n) => {
-                                    traffic_signal.record();
+                                    tunnel_lifecycle.record_activity(TunnelActivity::ClientRead);
                                     total_read += n as u64;
                                     let chunk = Bytes::copy_from_slice(&buf[..n]);
                                     if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
@@ -358,7 +360,7 @@ pub(crate) struct BackendToClientActor {
     backend: Option<OwnedReadHalf>,
     client: Option<OwnedWriteHalf>,
     scheduler: Addr<Scheduler>,
-    traffic_signal: TunnelTrafficSignal,
+    tunnel_lifecycle: TunnelLifecycle,
     shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
@@ -368,7 +370,7 @@ impl BackendToClientActor {
         backend: OwnedReadHalf,
         client: OwnedWriteHalf,
         scheduler: Addr<Scheduler>,
-        traffic_signal: TunnelTrafficSignal,
+        tunnel_lifecycle: TunnelLifecycle,
         shutdown_rx: TunnelShutdownReceiver,
     ) -> Self {
         Self {
@@ -376,7 +378,7 @@ impl BackendToClientActor {
             backend: Some(backend),
             client: Some(client),
             scheduler,
-            traffic_signal,
+            tunnel_lifecycle,
             shutdown_rx: Some(shutdown_rx),
         }
     }
@@ -396,7 +398,7 @@ impl Actor for BackendToClientActor {
             .take()
             .expect("BackendToClientActor started without client stream");
         let scheduler = self.scheduler.clone();
-        let traffic_signal = self.traffic_signal.clone();
+        let tunnel_lifecycle = self.tunnel_lifecycle.clone();
         let mut shutdown_rx = self
             .shutdown_rx
             .take()
@@ -438,7 +440,7 @@ impl Actor for BackendToClientActor {
                                     break;
                                 }
                                 Ok(n) => {
-                                    traffic_signal.record();
+                                    tunnel_lifecycle.record_activity(TunnelActivity::BackendRead);
                                     total_read += n as u64;
                                     tokio::select! {
                                         write_result = client.write_all(&buf[..n]) => {
@@ -557,21 +559,21 @@ mod tests {
                 flow_id: FlowId(5),
                 queue_addr: queue.clone(),
                 backend_write,
-                traffic_signal: TunnelTrafficSignal::new(),
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()
             .unwrap();
 
         let client_read = build_server_read_half().await;
-        let traffic_signal = TunnelTrafficSignal::new();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         ClientToBackendActor::new(
             FlowId(5),
             client_read,
             queue.clone(),
             scheduler,
-            traffic_signal.clone(),
-            traffic_signal.subscribe_shutdown(),
+            tunnel_lifecycle.clone(),
+            tunnel_lifecycle.subscribe_shutdown(),
         )
         .start();
 
@@ -601,7 +603,7 @@ mod tests {
                 flow_id: FlowId(6),
                 queue_addr: queue.clone(),
                 backend_write,
-                traffic_signal: TunnelTrafficSignal::new(),
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()
@@ -610,7 +612,7 @@ mod tests {
         let (client_read, _client_peer) = build_live_read_half().await;
         let (backend_read, _backend_peer) = build_live_read_half().await;
         let (client_write, _client_write_peer) = build_live_write_half().await;
-        let traffic_signal = TunnelTrafficSignal::new();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         start_bidirectional_tunnel(BidirectionalTunnel {
             flow_id: FlowId(6),
             client_read,
@@ -618,7 +620,7 @@ mod tests {
             scheduler,
             backend_read,
             client_write,
-            traffic_signal,
+            tunnel_lifecycle,
             idle_timeout: Some(Duration::from_millis(20)),
         });
 
@@ -632,6 +634,48 @@ mod tests {
         }
 
         assert!(stopped, "queue should stop after tunnel idle timeout");
+    }
+
+    #[actix_rt::test]
+    async fn idle_timeout_starts_when_tunnel_starts() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        scheduler
+            .send(Register {
+                flow_id: FlowId(7),
+                queue_addr: queue.clone(),
+                backend_write,
+                tunnel_lifecycle: tunnel_lifecycle.clone(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        sleep(Duration::from_millis(120)).await;
+
+        let (client_read, _client_peer) = build_live_read_half().await;
+        let (backend_read, _backend_peer) = build_live_read_half().await;
+        let (client_write, _client_write_peer) = build_live_write_half().await;
+        start_bidirectional_tunnel(BidirectionalTunnel {
+            flow_id: FlowId(7),
+            client_read,
+            queue_tx: queue.clone(),
+            scheduler,
+            backend_read,
+            client_write,
+            tunnel_lifecycle,
+            idle_timeout: Some(Duration::from_millis(100)),
+        });
+
+        sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            queue.send(Dequeue { max_bytes: 1024 }).await.is_ok(),
+            "idle timeout should start from tunnel start, not signal creation"
+        );
     }
 
     #[actix_rt::test]
