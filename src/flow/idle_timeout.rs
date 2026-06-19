@@ -49,7 +49,7 @@ impl TunnelLifecycle {
 
     #[cfg(test)]
     pub(crate) fn shutdown_for_test(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
     }
 
     fn shutdown_sender(&self) -> watch::Sender<bool> {
@@ -78,7 +78,7 @@ pub(super) fn start_idle_timeout_monitor(
                             flow_id.0,
                             idle_for.as_secs_f64()
                         );
-                        let _ = shutdown_tx.send(true);
+                        shutdown_tx.send_replace(true);
                         unregister_flow(scheduler, flow_id).await;
                         return;
                     }

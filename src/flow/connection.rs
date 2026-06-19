@@ -137,6 +137,22 @@ impl TunnelContext {
         self.lifecycle.subscribe_shutdown()
     }
 
+    fn initial_idle_shutdown_requested(
+        &self,
+        shutdown_rx: &TunnelShutdownReceiver,
+        relay_name: &str,
+    ) -> bool {
+        if !*shutdown_rx.borrow() {
+            return false;
+        }
+
+        debug!(
+            "flow{}: {} relay stopping after idle timeout",
+            self.flow_id.0, relay_name
+        );
+        true
+    }
+
     fn start_idle_timeout_monitor(&self) {
         if let Some(timeout) = self.idle_timeout {
             start_idle_timeout_monitor(
@@ -252,6 +268,13 @@ impl Actor for ClientToBackendActor {
 
         ctx.spawn(
             async move {
+                if tunnel_context
+                    .initial_idle_shutdown_requested(&shutdown_rx, "client-to-backend")
+                {
+                    tunnel_context.unregister().await;
+                    return;
+                }
+
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
@@ -378,6 +401,12 @@ impl Actor for BackendToClientActor {
 
         ctx.spawn(
             async move {
+                if tunnel_context
+                    .initial_idle_shutdown_requested(&shutdown_rx, "backend-to-client")
+                {
+                    return;
+                }
+
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
@@ -563,6 +592,53 @@ mod tests {
         assert!(
             stopped,
             "queue should stop after client disconnect unregisters flow"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn client_to_backend_actor_honors_initial_idle_shutdown() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(8),
+                queue_addr: queue.clone(),
+                backend_write,
+                tunnel_lifecycle: TunnelLifecycle::new(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (client_read, _client_peer) = build_live_read_half().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        tunnel_lifecycle.shutdown_for_test();
+        ClientToBackendActor::new(
+            TunnelContext {
+                flow_id: FlowId(8),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: None,
+            },
+            client_read,
+            queue.clone(),
+        )
+        .start();
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            stopped,
+            "queue should stop when relay starts after idle shutdown was already requested"
         );
     }
 
