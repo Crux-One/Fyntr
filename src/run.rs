@@ -35,6 +35,7 @@ use crate::{
 
 pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
 const DEFAULT_TICK_MS: u64 = 5; // 5 ms
@@ -258,6 +259,7 @@ pub struct ServerBuilder {
     bind: BindAddress,
     port: u16,
     max_connections: MaxConnections,
+    idle_timeout: Option<Duration>,
     connect_policy: ConnectPolicyConfig,
     threat_feed_files: Vec<PathBuf>,
     socks5_bind: Option<BindAddress>,
@@ -276,6 +278,7 @@ impl ServerBuilder {
             bind: BindAddress::from(DEFAULT_BIND),
             port: DEFAULT_PORT,
             max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
+            idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
             connect_policy: ConnectPolicyConfig::default(),
             threat_feed_files: Vec::new(),
             socks5_bind: None,
@@ -301,6 +304,16 @@ impl ServerBuilder {
     /// Sets the maximum number of concurrent connections (0 for unlimited).
     pub fn max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections_from_raw(max_connections);
+        self
+    }
+
+    /// Sets the established tunnel idle timeout. Use `Duration::ZERO` to disable it.
+    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = if idle_timeout.is_zero() {
+            None
+        } else {
+            Some(idle_timeout)
+        };
         self
     }
 
@@ -416,6 +429,7 @@ impl ServerBuilder {
             bind_addrs,
             socks5_bind_addrs,
             self.max_connections,
+            self.idle_timeout,
             connect_policy,
         )
         .await
@@ -432,6 +446,7 @@ impl ServerBuilder {
             bind_addrs,
             socks5_bind_addrs,
             self.max_connections,
+            self.idle_timeout,
             connect_policy,
         )
         .await
@@ -469,6 +484,7 @@ async fn server_with_addrs(
     bind_addrs: Vec<SocketAddr>,
     socks5_bind_addrs: Option<Vec<SocketAddr>>,
     max_connections: MaxConnections,
+    idle_timeout: Option<Duration>,
     connect_policy: Arc<ConnectPolicy>,
 ) -> Result<()> {
     let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
@@ -477,6 +493,7 @@ async fn server_with_addrs(
         listener,
         socks5_listener,
         max_connections,
+        idle_timeout,
         connect_policy,
         None,
     )
@@ -487,6 +504,7 @@ async fn start_with_addrs(
     bind_addrs: Vec<SocketAddr>,
     socks5_bind_addrs: Option<Vec<SocketAddr>>,
     max_connections: MaxConnections,
+    idle_timeout: Option<Duration>,
     connect_policy: Arc<ConnectPolicy>,
 ) -> Result<ServerHandle> {
     let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
@@ -504,6 +522,7 @@ async fn start_with_addrs(
         listener,
         socks5_listener,
         max_connections,
+        idle_timeout,
         connect_policy,
         Some(shutdown_rx),
     ));
@@ -566,6 +585,7 @@ async fn run_server(
     listener: TcpListener,
     socks5_listener: Option<TcpListener>,
     max_connections: MaxConnections,
+    idle_timeout: Option<Duration>,
     connect_policy: Arc<ConnectPolicy>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
@@ -642,6 +662,7 @@ async fn run_server(
                         scheduler,
                         connect_policy,
                         pending_reservation,
+                        idle_timeout,
                     )
                     .await
                 }
@@ -653,6 +674,7 @@ async fn run_server(
                         scheduler,
                         connect_policy,
                         pending_reservation,
+                        idle_timeout,
                     )
                     .await
                 }

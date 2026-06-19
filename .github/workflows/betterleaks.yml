@@ -26,5 +26,5 @@ jobs:
             -e GIT_CONFIG_VALUE_0=/work \
             -v "$PWD:/work" \
             -w /work \
-            ghcr.io/betterleaks/betterleaks:v1.4.0@sha256:2ffed1b824e1fbd7a206eef6da75ce7ebf0abde5525301643fe53e03730032d6 \
+            ghcr.io/betterleaks/betterleaks:v1.5.0@sha256:e78fa87a9113506302d7f08698f8e1065c8c5bb363e43b2db058ea4464189922 \
             git .

@@ -25,9 +25,10 @@ use crate::{
     flow::{
         FlowId,
         connection::{
-            FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
+            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
             start_bidirectional_tunnel,
         },
+        idle_timeout::TunnelLifecycle,
     },
     http::request::{read_request_line, send_connect_response, skip_headers},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -178,6 +179,7 @@ struct ConnectSession {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
+    idle_timeout: Option<Duration>,
 }
 
 /// State machine for a CONNECT flow: Validating → Dialing → Registering → Established → Finished.
@@ -193,11 +195,13 @@ enum ConnectState {
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        tunnel_lifecycle: TunnelLifecycle,
     },
     Established {
         session: ConnectSession,
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
+        tunnel_lifecycle: TunnelLifecycle,
     },
     Finished(FlowId),
 }
@@ -405,6 +409,7 @@ impl ConnectState {
 
         let (backend_read, backend_write) = backend_stream.into_split();
         let queue_tx = QueueActor::new().start();
+        let tunnel_lifecycle = TunnelLifecycle::new();
         cleanup.watch_queue(queue_tx.clone());
 
         Ok(ConnectState::Registering {
@@ -412,6 +417,7 @@ impl ConnectState {
             queue_tx,
             backend_read,
             backend_write: Arc::new(Mutex::new(backend_write)),
+            tunnel_lifecycle,
         })
     }
 
@@ -420,6 +426,7 @@ impl ConnectState {
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
+        tunnel_lifecycle: TunnelLifecycle,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         match session
@@ -428,6 +435,7 @@ impl ConnectState {
                 flow_id: session.flow_id,
                 queue_addr: queue_tx.clone(),
                 backend_write: backend_write.clone(),
+                tunnel_lifecycle: tunnel_lifecycle.clone(),
             })
             .await
         {
@@ -440,6 +448,7 @@ impl ConnectState {
                     session,
                     queue_tx,
                     backend_read,
+                    tunnel_lifecycle,
                 })
             }
             Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
@@ -478,6 +487,7 @@ impl ConnectState {
         session: ConnectSession,
         queue_tx: Addr<QueueActor>,
         backend_read: OwnedReadHalf,
+        tunnel_lifecycle: TunnelLifecycle,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         let ConnectSession {
@@ -485,6 +495,7 @@ impl ConnectState {
             scheduler,
             client_reader,
             mut client_write,
+            idle_timeout,
             ..
         } = session;
 
@@ -493,14 +504,16 @@ impl ConnectState {
         }
 
         let client_read = client_reader.into_inner();
-        start_bidirectional_tunnel(
+        start_bidirectional_tunnel(BidirectionalTunnel {
             flow_id,
             client_read,
             queue_tx,
             scheduler,
             backend_read,
             client_write,
-        );
+            tunnel_lifecycle,
+            idle_timeout,
+        });
 
         cleanup.disarm();
         Ok(ConnectState::Finished(flow_id))
@@ -517,15 +530,33 @@ impl ConnectState {
                 queue_tx,
                 backend_read,
                 backend_write,
+                tunnel_lifecycle,
             } => {
-                Self::advance_registering(session, queue_tx, backend_read, backend_write, cleanup)
-                    .await
+                Self::advance_registering(
+                    session,
+                    queue_tx,
+                    backend_read,
+                    backend_write,
+                    tunnel_lifecycle,
+                    cleanup,
+                )
+                .await
             }
             ConnectState::Established {
                 session,
                 queue_tx,
                 backend_read,
-            } => Self::advance_established(session, queue_tx, backend_read, cleanup).await,
+                tunnel_lifecycle,
+            } => {
+                Self::advance_established(
+                    session,
+                    queue_tx,
+                    backend_read,
+                    tunnel_lifecycle,
+                    cleanup,
+                )
+                .await
+            }
             ConnectState::Finished(flow_id) => Ok(ConnectState::Finished(flow_id)),
         }
     }
@@ -539,6 +570,7 @@ impl ConnectSession {
         scheduler: Addr<Scheduler>,
         connect_policy: Arc<ConnectPolicy>,
         pending_reservation: PendingConnectionReservation,
+        idle_timeout: Option<Duration>,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
@@ -549,6 +581,7 @@ impl ConnectSession {
             client_reader: BufReader::new(client_read),
             client_write,
             pending_reservation: Some(pending_reservation),
+            idle_timeout,
         }
     }
 
@@ -603,6 +636,7 @@ pub(crate) async fn handle_connect_proxy(
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
     pending_reservation: PendingConnectionReservation,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
     let session = ConnectSession::new(
         client_stream,
@@ -611,6 +645,7 @@ pub(crate) async fn handle_connect_proxy(
         scheduler,
         connect_policy,
         pending_reservation,
+        idle_timeout,
     );
 
     match run_connect_flow(session).await {
@@ -717,6 +752,7 @@ mod tests {
                 scheduler,
                 connect_policy,
                 pending_reservation,
+                None,
             )
             .await
             .unwrap();
@@ -979,6 +1015,7 @@ mod tests {
                 flow_id: FlowId(42),
                 queue_addr: queue,
                 backend_write,
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()
@@ -1022,6 +1059,7 @@ mod tests {
                 flow_id: FlowId(42),
                 queue_addr: queue,
                 backend_write,
+                tunnel_lifecycle: TunnelLifecycle::new(),
             })
             .await
             .unwrap()

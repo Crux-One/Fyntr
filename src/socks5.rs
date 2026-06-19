@@ -26,9 +26,10 @@ use crate::{
     flow::{
         FlowId,
         connection::{
-            FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
+            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
             start_bidirectional_tunnel,
         },
+        idle_timeout::TunnelLifecycle,
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -109,6 +110,7 @@ struct Socks5Session {
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
+    idle_timeout: Option<Duration>,
 }
 
 /// Handles a no-auth SOCKS5 CONNECT flow and relays it through Fyntr's existing scheduler.
@@ -119,6 +121,7 @@ pub(crate) async fn handle_socks5_proxy(
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
     pending_reservation: PendingConnectionReservation,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let session = Socks5Session::new(
         client_stream,
@@ -127,6 +130,7 @@ pub(crate) async fn handle_socks5_proxy(
         scheduler,
         connect_policy,
         pending_reservation,
+        idle_timeout,
     );
 
     match run_socks5_flow(session).await {
@@ -230,6 +234,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     let (backend_read, backend_write) = backend_stream.into_split();
     let queue_tx = QueueActor::new().start();
     let backend_write = Arc::new(Mutex::new(backend_write));
+    let tunnel_lifecycle = TunnelLifecycle::new();
     let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
     cleanup.watch_queue(queue_tx.clone());
 
@@ -239,6 +244,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
             flow_id: session.flow_id,
             queue_addr: queue_tx.clone(),
             backend_write: backend_write.clone(),
+            tunnel_lifecycle: tunnel_lifecycle.clone(),
         })
         .await
     {
@@ -276,17 +282,20 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         scheduler,
         client_reader,
         client_write,
+        idle_timeout,
         ..
     } = session;
     let client_read = client_reader.into_inner();
-    start_bidirectional_tunnel(
+    start_bidirectional_tunnel(BidirectionalTunnel {
         flow_id,
         client_read,
         queue_tx,
         scheduler,
         backend_read,
         client_write,
-    );
+        tunnel_lifecycle,
+        idle_timeout,
+    });
 
     cleanup.disarm();
     Ok(())
@@ -592,6 +601,7 @@ impl Socks5Session {
         scheduler: Addr<Scheduler>,
         connect_policy: Arc<ConnectPolicy>,
         pending_reservation: PendingConnectionReservation,
+        idle_timeout: Option<Duration>,
     ) -> Self {
         let (client_read, client_write) = client_stream.into_split();
         Self {
@@ -602,6 +612,7 @@ impl Socks5Session {
             client_reader: BufReader::new(client_read),
             client_write,
             pending_reservation: Some(pending_reservation),
+            idle_timeout,
         }
     }
 
