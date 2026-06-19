@@ -25,8 +25,8 @@ use crate::{
     flow::{
         FlowId,
         connection::{
-            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, ensure_scheduler_capacity,
-            start_bidirectional_tunnel,
+            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, TunnelContext, TunnelIo,
+            ensure_scheduler_capacity, start_bidirectional_tunnel,
         },
         idle_timeout::TunnelLifecycle,
     },
@@ -505,14 +505,18 @@ impl ConnectState {
 
         let client_read = client_reader.into_inner();
         start_bidirectional_tunnel(BidirectionalTunnel {
-            flow_id,
-            client_read,
-            queue_tx,
-            scheduler,
-            backend_read,
-            client_write,
-            tunnel_lifecycle,
-            idle_timeout,
+            context: TunnelContext {
+                flow_id,
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout,
+            },
+            io: TunnelIo {
+                client_read,
+                queue_tx,
+                backend_read,
+                client_write,
+            },
         });
 
         cleanup.disarm();
