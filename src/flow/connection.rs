@@ -496,6 +496,9 @@ impl Actor for BackendToClientActor {
                         }
                     }
                 }
+                // Backend-side close reasons are informational here: they are logged for
+                // observability, but do not drive scheduler unregister. Flow lifecycle
+                // ownership remains with the existing unregister path.
                 debug!(
                     "flow{}: backend-to-client relay finished ({:?})",
                     flow_id.0, close_reason
