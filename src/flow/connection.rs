@@ -29,6 +29,17 @@ const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
 const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunnelCloseReason {
+    IdleTimeout,
+    ClientClosed,
+    BackendClosed,
+    ClientReadError,
+    BackendReadError,
+    ClientWriteError,
+    QueueClosed,
+}
+
 #[derive(Debug)]
 pub(crate) enum SchedulerCapacityError {
     AtCapacity {
@@ -120,81 +131,89 @@ impl Drop for FlowCleanup {
     }
 }
 
-pub(crate) struct BidirectionalTunnel {
+#[derive(Clone)]
+pub(crate) struct TunnelContext {
     pub(crate) flow_id: FlowId,
-    pub(crate) client_read: OwnedReadHalf,
-    pub(crate) queue_tx: Addr<QueueActor>,
     pub(crate) scheduler: Addr<Scheduler>,
-    pub(crate) backend_read: OwnedReadHalf,
-    pub(crate) client_write: OwnedWriteHalf,
-    pub(crate) tunnel_lifecycle: TunnelLifecycle,
+    pub(crate) lifecycle: TunnelLifecycle,
     pub(crate) idle_timeout: Option<Duration>,
 }
 
-pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
-    let BidirectionalTunnel {
-        flow_id,
-        client_read,
-        queue_tx,
-        scheduler,
-        backend_read,
-        client_write,
-        tunnel_lifecycle,
-        idle_timeout,
-    } = tunnel;
-    let scheduler_for_client = scheduler.clone();
-
-    tunnel_lifecycle.record_activity(TunnelActivity::TunnelStarted);
-
-    if let Some(timeout) = idle_timeout {
-        start_idle_timeout_monitor(flow_id, scheduler.clone(), &tunnel_lifecycle, timeout);
+impl TunnelContext {
+    fn record_activity(&self, activity: TunnelActivity) {
+        self.lifecycle.record_activity(activity);
     }
 
-    ClientToBackendActor::new(
-        flow_id,
-        client_read,
-        queue_tx,
-        scheduler_for_client,
-        tunnel_lifecycle.clone(),
-        tunnel_lifecycle.subscribe_shutdown(),
-    )
-    .start();
-    BackendToClientActor::new(
-        flow_id,
-        backend_read,
-        client_write,
-        scheduler,
-        tunnel_lifecycle.clone(),
-        tunnel_lifecycle.subscribe_shutdown(),
-    )
-    .start();
+    fn subscribe_shutdown(&self) -> TunnelShutdownReceiver {
+        self.lifecycle.subscribe_shutdown()
+    }
+
+    fn initial_idle_shutdown_requested(
+        &self,
+        shutdown_rx: &TunnelShutdownReceiver,
+        relay_name: &str,
+    ) -> bool {
+        if !*shutdown_rx.borrow() {
+            return false;
+        }
+
+        debug!(
+            "flow{}: {} relay stopping after idle timeout",
+            self.flow_id.0, relay_name
+        );
+        true
+    }
+
+    fn start_idle_timeout_monitor(&self) {
+        if let Some(timeout) = self.idle_timeout {
+            start_idle_timeout_monitor(
+                self.flow_id,
+                self.scheduler.clone(),
+                &self.lifecycle,
+                timeout,
+            );
+        }
+    }
+
+    async fn unregister(&self, reason: TunnelCloseReason) {
+        unregister_flow(self.scheduler.clone(), self.flow_id, reason).await;
+    }
+}
+
+pub(crate) struct TunnelIo {
+    pub(crate) client_read: OwnedReadHalf,
+    pub(crate) queue_tx: Addr<QueueActor>,
+    pub(crate) backend_read: OwnedReadHalf,
+    pub(crate) client_write: OwnedWriteHalf,
+}
+
+pub(crate) struct BidirectionalTunnel {
+    pub(crate) context: TunnelContext,
+    pub(crate) io: TunnelIo,
+}
+
+pub(crate) fn start_bidirectional_tunnel(tunnel: BidirectionalTunnel) {
+    let BidirectionalTunnel { context, io } = tunnel;
+
+    context.record_activity(TunnelActivity::TunnelStarted);
+    context.start_idle_timeout_monitor();
+
+    ClientToBackendActor::new(context.clone(), io.client_read, io.queue_tx).start();
+    BackendToClientActor::new(context, io.backend_read, io.client_write).start();
 }
 
 pub(crate) struct ClientToBackendActor {
-    flow_id: FlowId,
+    context: TunnelContext,
     client: Option<OwnedReadHalf>,
     queue_tx: Addr<QueueActor>,
-    scheduler: Addr<Scheduler>,
-    tunnel_lifecycle: TunnelLifecycle,
-    shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
 impl ClientToBackendActor {
-    fn new(
-        flow_id: FlowId,
-        client: OwnedReadHalf,
-        queue_tx: Addr<QueueActor>,
-        scheduler: Addr<Scheduler>,
-        tunnel_lifecycle: TunnelLifecycle,
-        shutdown_rx: TunnelShutdownReceiver,
-    ) -> Self {
+    fn new(context: TunnelContext, client: OwnedReadHalf, queue_tx: Addr<QueueActor>) -> Self {
         Self {
-            flow_id,
+            context,
             client: Some(client),
             queue_tx,
-            scheduler,
-            tunnel_lifecycle,
-            shutdown_rx: Some(shutdown_rx),
         }
     }
 
@@ -249,14 +268,10 @@ impl Actor for ClientToBackendActor {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let flow_id = self.flow_id;
+        let tunnel_context = self.context.clone();
+        let flow_id = tunnel_context.flow_id;
         let queue_tx = self.queue_tx.clone();
-        let scheduler = self.scheduler.clone();
-        let tunnel_lifecycle = self.tunnel_lifecycle.clone();
-        let mut shutdown_rx = self
-            .shutdown_rx
-            .take()
-            .expect("ClientToBackendActor started without shutdown receiver");
+        let mut shutdown_rx = tunnel_context.subscribe_shutdown();
         let mut client = self
             .client
             .take()
@@ -264,9 +279,17 @@ impl Actor for ClientToBackendActor {
 
         ctx.spawn(
             async move {
+                if tunnel_context
+                    .initial_idle_shutdown_requested(&shutdown_rx, "client-to-backend")
+                {
+                    tunnel_context.unregister(TunnelCloseReason::IdleTimeout).await;
+                    return;
+                }
+
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
+                let close_reason;
 
                 loop {
                     tokio::select! {
@@ -276,6 +299,7 @@ impl Actor for ClientToBackendActor {
                                     "flow{}: client-to-backend relay stopping after idle timeout",
                                     flow_id.0
                                 );
+                                close_reason = TunnelCloseReason::IdleTimeout;
                                 break;
                             }
                         }
@@ -297,18 +321,21 @@ impl Actor for ClientToBackendActor {
                                         );
                                     }
 
+                                    close_reason = TunnelCloseReason::ClientClosed;
                                     break;
                                 }
                                 Ok(n) => {
-                                    tunnel_lifecycle.record_activity(TunnelActivity::ClientRead);
+                                    tunnel_context.record_activity(TunnelActivity::ClientRead);
                                     total_read += n as u64;
                                     let chunk = Bytes::copy_from_slice(&buf[..n]);
                                     if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
+                                        close_reason = TunnelCloseReason::QueueClosed;
                                         break;
                                     }
                                 }
                                 Err(e) => {
                                     warn!("flow{}: read error: {}", flow_id.0, e);
+                                    close_reason = TunnelCloseReason::ClientReadError;
                                     break;
                                 }
                             }
@@ -316,7 +343,7 @@ impl Actor for ClientToBackendActor {
                     }
                 }
 
-                unregister_flow(scheduler, flow_id).await;
+                tunnel_context.unregister(close_reason).await;
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
@@ -324,7 +351,11 @@ impl Actor for ClientToBackendActor {
     }
 }
 
-pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
+pub(super) async fn unregister_flow(
+    scheduler: Addr<Scheduler>,
+    flow_id: FlowId,
+    reason: TunnelCloseReason,
+) {
     // Unregister this flow from the scheduler to signal completion and trigger cleanup.
     let mut delay = Duration::from_millis(UNREGISTER_RETRY_DELAY_MS);
     let max_delay = Duration::from_secs(UNREGISTER_RETRY_MAX_DELAY_SECS);
@@ -332,21 +363,21 @@ pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId)
         match scheduler.send(Unregister { flow_id }).await {
             Ok(_) => {
                 debug!(
-                    "flow{}: successfully unregistered from scheduler",
-                    flow_id.0
+                    "flow{}: successfully unregistered from scheduler ({:?})",
+                    flow_id.0, reason
                 );
                 return;
             }
             Err(e) if attempt == UNREGISTER_RETRY_LIMIT => {
                 warn!(
-                    "flow{}: failed to unregister from scheduler after {} attempts: {}",
-                    flow_id.0, attempt, e
+                    "flow{}: failed to unregister from scheduler after {} attempts ({:?}): {}",
+                    flow_id.0, attempt, reason, e
                 );
             }
             Err(e) => {
                 warn!(
-                    "flow{}: unregister attempt {}/{} failed: {}; retrying",
-                    flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, e
+                    "flow{}: unregister attempt {}/{} failed ({:?}): {}; retrying",
+                    flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, reason, e
                 );
                 sleep(delay).await;
                 delay = delay.saturating_mul(2).min(max_delay);
@@ -356,30 +387,17 @@ pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId)
 }
 
 pub(crate) struct BackendToClientActor {
-    flow_id: FlowId,
+    context: TunnelContext,
     backend: Option<OwnedReadHalf>,
     client: Option<OwnedWriteHalf>,
-    scheduler: Addr<Scheduler>,
-    tunnel_lifecycle: TunnelLifecycle,
-    shutdown_rx: Option<TunnelShutdownReceiver>,
 }
 
 impl BackendToClientActor {
-    fn new(
-        flow_id: FlowId,
-        backend: OwnedReadHalf,
-        client: OwnedWriteHalf,
-        scheduler: Addr<Scheduler>,
-        tunnel_lifecycle: TunnelLifecycle,
-        shutdown_rx: TunnelShutdownReceiver,
-    ) -> Self {
+    fn new(context: TunnelContext, backend: OwnedReadHalf, client: OwnedWriteHalf) -> Self {
         Self {
-            flow_id,
+            context,
             backend: Some(backend),
             client: Some(client),
-            scheduler,
-            tunnel_lifecycle,
-            shutdown_rx: Some(shutdown_rx),
         }
     }
 }
@@ -388,7 +406,8 @@ impl Actor for BackendToClientActor {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let flow_id = self.flow_id;
+        let tunnel_context = self.context.clone();
+        let flow_id = tunnel_context.flow_id;
         let mut backend = self
             .backend
             .take()
@@ -397,18 +416,21 @@ impl Actor for BackendToClientActor {
             .client
             .take()
             .expect("BackendToClientActor started without client stream");
-        let scheduler = self.scheduler.clone();
-        let tunnel_lifecycle = self.tunnel_lifecycle.clone();
-        let mut shutdown_rx = self
-            .shutdown_rx
-            .take()
-            .expect("BackendToClientActor started without shutdown receiver");
+        let scheduler = tunnel_context.scheduler.clone();
+        let mut shutdown_rx = tunnel_context.subscribe_shutdown();
 
         ctx.spawn(
             async move {
+                if tunnel_context
+                    .initial_idle_shutdown_requested(&shutdown_rx, "backend-to-client")
+                {
+                    return;
+                }
+
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
+                let close_reason;
                 loop {
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
@@ -417,6 +439,7 @@ impl Actor for BackendToClientActor {
                                     "flow{}: backend-to-client relay stopping after idle timeout",
                                     flow_id.0
                                 );
+                                close_reason = TunnelCloseReason::IdleTimeout;
                                 break;
                             }
                         }
@@ -437,15 +460,17 @@ impl Actor for BackendToClientActor {
                                             flow_id.0, total_value, total_unit, elapsed
                                         );
                                     }
+                                    close_reason = TunnelCloseReason::BackendClosed;
                                     break;
                                 }
                                 Ok(n) => {
-                                    tunnel_lifecycle.record_activity(TunnelActivity::BackendRead);
+                                    tunnel_context.record_activity(TunnelActivity::BackendRead);
                                     total_read += n as u64;
                                     tokio::select! {
                                         write_result = client.write_all(&buf[..n]) => {
                                             if let Err(e) = write_result {
                                                 warn!("flow{}: client write error: {}", flow_id.0, e);
+                                                close_reason = TunnelCloseReason::ClientWriteError;
                                                 break;
                                             }
                                         }
@@ -455,6 +480,7 @@ impl Actor for BackendToClientActor {
                                                     "flow{}: backend-to-client relay stopping during client write after idle timeout",
                                                     flow_id.0
                                                 );
+                                                close_reason = TunnelCloseReason::IdleTimeout;
                                                 break;
                                             }
                                         }
@@ -463,12 +489,20 @@ impl Actor for BackendToClientActor {
                                 }
                                 Err(e) => {
                                     warn!("flow{}: backend read error: {}", flow_id.0, e);
+                                    close_reason = TunnelCloseReason::BackendReadError;
                                     break;
                                 }
                             }
                         }
                     }
                 }
+                // Backend-side close reasons are informational here: they are logged for
+                // observability, but do not drive scheduler unregister. Flow lifecycle
+                // ownership remains with the existing unregister path.
+                debug!(
+                    "flow{}: backend-to-client relay finished ({:?})",
+                    flow_id.0, close_reason
+                );
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
@@ -568,12 +602,14 @@ mod tests {
         let client_read = build_server_read_half().await;
         let tunnel_lifecycle = TunnelLifecycle::new();
         ClientToBackendActor::new(
-            FlowId(5),
+            TunnelContext {
+                flow_id: FlowId(5),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: None,
+            },
             client_read,
             queue.clone(),
-            scheduler,
-            tunnel_lifecycle.clone(),
-            tunnel_lifecycle.subscribe_shutdown(),
         )
         .start();
 
@@ -589,6 +625,85 @@ mod tests {
         assert!(
             stopped,
             "queue should stop after client disconnect unregisters flow"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn client_to_backend_actor_honors_initial_idle_shutdown() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let queue = QueueActor::new().start();
+        let backend_write = make_backend_write().await;
+        scheduler
+            .send(Register {
+                flow_id: FlowId(8),
+                queue_addr: queue.clone(),
+                backend_write,
+                tunnel_lifecycle: TunnelLifecycle::new(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (client_read, _client_peer) = build_live_read_half().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        tunnel_lifecycle.shutdown_for_test();
+        ClientToBackendActor::new(
+            TunnelContext {
+                flow_id: FlowId(8),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: None,
+            },
+            client_read,
+            queue.clone(),
+        )
+        .start();
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+                stopped = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            stopped,
+            "queue should stop when relay starts after idle shutdown was already requested"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn backend_to_client_actor_honors_initial_idle_shutdown() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let (backend_read, _backend_peer) = build_live_read_half().await;
+        let (client_write, mut client_peer) = build_live_write_half().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        tunnel_lifecycle.shutdown_for_test();
+        BackendToClientActor::new(
+            TunnelContext {
+                flow_id: FlowId(9),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: None,
+            },
+            backend_read,
+            client_write,
+        )
+        .start();
+
+        let mut buf = [0_u8; 1];
+        let read_result = timeout(Duration::from_secs(1), client_peer.read(&mut buf))
+            .await
+            .expect("backend-to-client actor should stop promptly after initial idle shutdown")
+            .expect("client peer read should complete without I/O error");
+
+        assert_eq!(
+            read_result, 0,
+            "client write half should close when relay starts after idle shutdown was already requested"
         );
     }
 
@@ -614,14 +729,18 @@ mod tests {
         let (client_write, _client_write_peer) = build_live_write_half().await;
         let tunnel_lifecycle = TunnelLifecycle::new();
         start_bidirectional_tunnel(BidirectionalTunnel {
-            flow_id: FlowId(6),
-            client_read,
-            queue_tx: queue.clone(),
-            scheduler,
-            backend_read,
-            client_write,
-            tunnel_lifecycle,
-            idle_timeout: Some(Duration::from_millis(20)),
+            context: TunnelContext {
+                flow_id: FlowId(6),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: Some(Duration::from_millis(20)),
+            },
+            io: TunnelIo {
+                client_read,
+                queue_tx: queue.clone(),
+                backend_read,
+                client_write,
+            },
         });
 
         let mut stopped = false;
@@ -660,14 +779,18 @@ mod tests {
         let (backend_read, _backend_peer) = build_live_read_half().await;
         let (client_write, _client_write_peer) = build_live_write_half().await;
         start_bidirectional_tunnel(BidirectionalTunnel {
-            flow_id: FlowId(7),
-            client_read,
-            queue_tx: queue.clone(),
-            scheduler,
-            backend_read,
-            client_write,
-            tunnel_lifecycle,
-            idle_timeout: Some(Duration::from_millis(100)),
+            context: TunnelContext {
+                flow_id: FlowId(7),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: Some(Duration::from_millis(100)),
+            },
+            io: TunnelIo {
+                client_read,
+                queue_tx: queue.clone(),
+                backend_read,
+                client_write,
+            },
         });
 
         sleep(Duration::from_millis(20)).await;
