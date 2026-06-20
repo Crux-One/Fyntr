@@ -5,7 +5,10 @@ use tokio::{
     time::{Duration, Instant, sleep_until},
 };
 
-use super::{FlowId, connection::unregister_flow};
+use super::{
+    FlowId,
+    connection::{TunnelCloseReason, unregister_flow},
+};
 use crate::actors::scheduler::Scheduler;
 
 pub(crate) type TunnelShutdownReceiver = watch::Receiver<bool>;
@@ -78,8 +81,8 @@ pub(super) fn start_idle_timeout_monitor(
                             flow_id.0,
                             idle_for.as_secs_f64()
                         );
-                        shutdown_tx.send_replace(true);
-                        unregister_flow(scheduler, flow_id).await;
+                        let _ = shutdown_tx.send_replace(true);
+                        unregister_flow(scheduler, flow_id, TunnelCloseReason::IdleTimeout).await;
                         return;
                     }
                 }

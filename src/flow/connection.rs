@@ -29,6 +29,17 @@ const UNREGISTER_RETRY_LIMIT: usize = 3;
 const UNREGISTER_RETRY_DELAY_MS: u64 = 50;
 const UNREGISTER_RETRY_MAX_DELAY_SECS: u64 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunnelCloseReason {
+    IdleTimeout,
+    ClientClosed,
+    BackendClosed,
+    ClientReadError,
+    BackendReadError,
+    ClientWriteError,
+    QueueClosed,
+}
+
 #[derive(Debug)]
 pub(crate) enum SchedulerCapacityError {
     AtCapacity {
@@ -164,8 +175,8 @@ impl TunnelContext {
         }
     }
 
-    async fn unregister(&self) {
-        unregister_flow(self.scheduler.clone(), self.flow_id).await;
+    async fn unregister(&self, reason: TunnelCloseReason) {
+        unregister_flow(self.scheduler.clone(), self.flow_id, reason).await;
     }
 }
 
@@ -271,13 +282,14 @@ impl Actor for ClientToBackendActor {
                 if tunnel_context
                     .initial_idle_shutdown_requested(&shutdown_rx, "client-to-backend")
                 {
-                    tunnel_context.unregister().await;
+                    tunnel_context.unregister(TunnelCloseReason::IdleTimeout).await;
                     return;
                 }
 
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
+                let close_reason;
 
                 loop {
                     tokio::select! {
@@ -287,6 +299,7 @@ impl Actor for ClientToBackendActor {
                                     "flow{}: client-to-backend relay stopping after idle timeout",
                                     flow_id.0
                                 );
+                                close_reason = TunnelCloseReason::IdleTimeout;
                                 break;
                             }
                         }
@@ -308,6 +321,7 @@ impl Actor for ClientToBackendActor {
                                         );
                                     }
 
+                                    close_reason = TunnelCloseReason::ClientClosed;
                                     break;
                                 }
                                 Ok(n) => {
@@ -315,11 +329,13 @@ impl Actor for ClientToBackendActor {
                                     total_read += n as u64;
                                     let chunk = Bytes::copy_from_slice(&buf[..n]);
                                     if !Self::enqueue_with_backpressure(flow_id, &queue_tx, chunk).await {
+                                        close_reason = TunnelCloseReason::QueueClosed;
                                         break;
                                     }
                                 }
                                 Err(e) => {
                                     warn!("flow{}: read error: {}", flow_id.0, e);
+                                    close_reason = TunnelCloseReason::ClientReadError;
                                     break;
                                 }
                             }
@@ -327,7 +343,7 @@ impl Actor for ClientToBackendActor {
                     }
                 }
 
-                tunnel_context.unregister().await;
+                tunnel_context.unregister(close_reason).await;
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
@@ -335,7 +351,11 @@ impl Actor for ClientToBackendActor {
     }
 }
 
-pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId) {
+pub(super) async fn unregister_flow(
+    scheduler: Addr<Scheduler>,
+    flow_id: FlowId,
+    reason: TunnelCloseReason,
+) {
     // Unregister this flow from the scheduler to signal completion and trigger cleanup.
     let mut delay = Duration::from_millis(UNREGISTER_RETRY_DELAY_MS);
     let max_delay = Duration::from_secs(UNREGISTER_RETRY_MAX_DELAY_SECS);
@@ -343,21 +363,21 @@ pub(super) async fn unregister_flow(scheduler: Addr<Scheduler>, flow_id: FlowId)
         match scheduler.send(Unregister { flow_id }).await {
             Ok(_) => {
                 debug!(
-                    "flow{}: successfully unregistered from scheduler",
-                    flow_id.0
+                    "flow{}: successfully unregistered from scheduler ({:?})",
+                    flow_id.0, reason
                 );
                 return;
             }
             Err(e) if attempt == UNREGISTER_RETRY_LIMIT => {
                 warn!(
-                    "flow{}: failed to unregister from scheduler after {} attempts: {}",
-                    flow_id.0, attempt, e
+                    "flow{}: failed to unregister from scheduler after {} attempts ({:?}): {}",
+                    flow_id.0, attempt, reason, e
                 );
             }
             Err(e) => {
                 warn!(
-                    "flow{}: unregister attempt {}/{} failed: {}; retrying",
-                    flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, e
+                    "flow{}: unregister attempt {}/{} failed ({:?}): {}; retrying",
+                    flow_id.0, attempt, UNREGISTER_RETRY_LIMIT, reason, e
                 );
                 sleep(delay).await;
                 delay = delay.saturating_mul(2).min(max_delay);
@@ -410,6 +430,7 @@ impl Actor for BackendToClientActor {
                 let mut buf = vec![0u8; BUFFER_SIZE];
                 let mut total_read = 0u64;
                 let start_time = Instant::now();
+                let close_reason;
                 loop {
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
@@ -418,6 +439,7 @@ impl Actor for BackendToClientActor {
                                     "flow{}: backend-to-client relay stopping after idle timeout",
                                     flow_id.0
                                 );
+                                close_reason = TunnelCloseReason::IdleTimeout;
                                 break;
                             }
                         }
@@ -438,6 +460,7 @@ impl Actor for BackendToClientActor {
                                             flow_id.0, total_value, total_unit, elapsed
                                         );
                                     }
+                                    close_reason = TunnelCloseReason::BackendClosed;
                                     break;
                                 }
                                 Ok(n) => {
@@ -447,6 +470,7 @@ impl Actor for BackendToClientActor {
                                         write_result = client.write_all(&buf[..n]) => {
                                             if let Err(e) = write_result {
                                                 warn!("flow{}: client write error: {}", flow_id.0, e);
+                                                close_reason = TunnelCloseReason::ClientWriteError;
                                                 break;
                                             }
                                         }
@@ -456,6 +480,7 @@ impl Actor for BackendToClientActor {
                                                     "flow{}: backend-to-client relay stopping during client write after idle timeout",
                                                     flow_id.0
                                                 );
+                                                close_reason = TunnelCloseReason::IdleTimeout;
                                                 break;
                                             }
                                         }
@@ -464,12 +489,17 @@ impl Actor for BackendToClientActor {
                                 }
                                 Err(e) => {
                                     warn!("flow{}: backend read error: {}", flow_id.0, e);
+                                    close_reason = TunnelCloseReason::BackendReadError;
                                     break;
                                 }
                             }
                         }
                     }
                 }
+                debug!(
+                    "flow{}: backend-to-client relay finished ({:?})",
+                    flow_id.0, close_reason
+                );
             }
             .into_actor(self)
             .map(|_, _act, ctx| ctx.stop()),
