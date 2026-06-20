@@ -673,6 +673,38 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn backend_to_client_actor_honors_initial_idle_shutdown() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+
+        let (backend_read, _backend_peer) = build_live_read_half().await;
+        let (client_write, mut client_peer) = build_live_write_half().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        tunnel_lifecycle.shutdown_for_test();
+        BackendToClientActor::new(
+            TunnelContext {
+                flow_id: FlowId(9),
+                scheduler,
+                lifecycle: tunnel_lifecycle,
+                idle_timeout: None,
+            },
+            backend_read,
+            client_write,
+        )
+        .start();
+
+        let mut buf = [0_u8; 1];
+        let read_result = timeout(Duration::from_secs(1), client_peer.read(&mut buf))
+            .await
+            .expect("backend-to-client actor should stop promptly after initial idle shutdown")
+            .expect("client peer read should complete without I/O error");
+
+        assert_eq!(
+            read_result, 0,
+            "client write half should close when relay starts after idle shutdown was already requested"
+        );
+    }
+
+    #[actix_rt::test]
     async fn idle_timeout_unregisters_flow_and_stops_queue() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
 
