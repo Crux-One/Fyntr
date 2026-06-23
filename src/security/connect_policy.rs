@@ -148,6 +148,13 @@ pub(crate) struct ResolvedConnectTarget {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) addrs: Vec<SocketAddr>,
+    pub(crate) resolution_source: ResolutionSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolutionSource {
+    LiteralIp,
+    Dns,
 }
 
 #[derive(Debug)]
@@ -199,7 +206,7 @@ impl ConnectPolicy {
         &self,
         target: &ResolvedConnectTarget,
     ) -> Vec<ThreatMatch> {
-        if matches!(normalize_host(&target.host), Ok(NormalizedHost::Ip(_))) {
+        if matches!(target.resolution_source, ResolutionSource::LiteralIp) {
             return Vec::new();
         }
 
@@ -224,7 +231,9 @@ impl ConnectPolicy {
         let normalized_host = normalize_host(host).map_err(|err| {
             ConnectPolicyError::ResolveFailed(format!("invalid host {}: {}", host, err))
         })?;
-        let addrs = resolve_host(host, &normalized_host, port)
+        let resolver_target = resolver_target(host, &normalized_host);
+        let resolution_source = resolver_target.resolution_source();
+        let addrs = resolve_host(resolver_target, port)
             .await
             .map_err(|err| ConnectPolicyError::ResolveFailed(err.to_string()))?;
         if addrs.is_empty() {
@@ -277,6 +286,7 @@ impl ConnectPolicy {
             host: host.to_string(),
             port,
             addrs: authorized_addrs,
+            resolution_source,
         })
     }
 
@@ -350,12 +360,8 @@ fn default_denied_cidrs() -> Vec<ConnectCidr> {
     .collect()
 }
 
-async fn resolve_host(
-    requested_host: &str,
-    normalized_host: &NormalizedHost,
-    port: u16,
-) -> io::Result<Vec<SocketAddr>> {
-    match resolver_target(requested_host, normalized_host) {
+async fn resolve_host(target: ResolverTarget<'_>, port: u16) -> io::Result<Vec<SocketAddr>> {
+    match target {
         ResolverTarget::Ip(ip) => Ok(vec![SocketAddr::new(ip, port)]),
         ResolverTarget::Dns(query_name) => {
             let resolved = lookup_host((query_name.as_ref(), port)).await?;
@@ -372,6 +378,15 @@ async fn resolve_host(
 enum ResolverTarget<'a> {
     Ip(IpAddr),
     Dns(Cow<'a, str>),
+}
+
+impl ResolverTarget<'_> {
+    fn resolution_source(&self) -> ResolutionSource {
+        match self {
+            Self::Ip(_) => ResolutionSource::LiteralIp,
+            Self::Dns(_) => ResolutionSource::Dns,
+        }
+    }
 }
 
 /// Builds the resolver input from both representations of the host.
@@ -524,11 +539,13 @@ mod tests {
     #[test]
     fn resolver_target_preserves_absolute_domain_trailing_dot() {
         let host = normalize_host("svc.ns.").unwrap();
+        let target = resolver_target("svc.ns.", &host);
 
         assert_eq!(
-            resolver_target("svc.ns.", &host),
+            target,
             ResolverTarget::Dns(Cow::Owned("svc.ns.".to_string()))
         );
+        assert_eq!(target.resolution_source(), ResolutionSource::Dns);
     }
 
     #[test]
@@ -544,11 +561,22 @@ mod tests {
     #[test]
     fn resolver_target_does_not_short_circuit_absolute_numeric_name_as_ip() {
         let host = normalize_host("127.0.0.1.").unwrap();
+        let target = resolver_target("127.0.0.1.", &host);
 
         assert_eq!(
-            resolver_target("127.0.0.1.", &host),
+            target,
             ResolverTarget::Dns(Cow::Owned("127.0.0.1.".to_string()))
         );
+        assert_eq!(target.resolution_source(), ResolutionSource::Dns);
+    }
+
+    #[test]
+    fn resolver_target_marks_plain_ip_as_literal() {
+        let host = normalize_host("127.0.0.1").unwrap();
+        let target = resolver_target("127.0.0.1", &host);
+
+        assert_eq!(target, ResolverTarget::Ip("127.0.0.1".parse().unwrap()));
+        assert_eq!(target.resolution_source(), ResolutionSource::LiteralIp);
     }
 
     #[tokio::test]
