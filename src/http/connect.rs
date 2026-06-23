@@ -22,6 +22,7 @@ use crate::{
         queue::QueueActor,
         scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
+    connect_target::TargetAuthority,
     flow::{
         FlowId,
         connection::{
@@ -106,29 +107,10 @@ where
     }
 }
 
-struct ConnectAuthority<'a> {
-    host: &'a str,
-    port: u16,
-}
-
-impl fmt::Display for ConnectAuthority<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
-        }
-    }
-}
-
-fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
-    ConnectAuthority { host, port }
-}
-
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
-    target_authority: &ConnectAuthority<'_>,
+    target_authority: &TargetAuthority<'_>,
     client_addr: SocketAddr,
 ) {
     log_mixed_script_host_for_target(
@@ -143,7 +125,7 @@ fn log_mixed_script_host(
 
 async fn handle_resolved_threat_matches(
     session: &mut ConnectSession,
-    target_authority: &ConnectAuthority<'_>,
+    target_authority: &TargetAuthority<'_>,
     threat_matches: &[ThreatMatch],
 ) -> ConnectResult<()> {
     if threat_matches.is_empty() {
@@ -297,7 +279,7 @@ impl ConnectState {
                     .await;
             }
         };
-        let target_authority = format_connect_authority(&target_host, target_port);
+        let target_authority = TargetAuthority::new(&target_host, target_port);
         info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
         log_mixed_script_host(
             session.flow_id,
@@ -381,7 +363,7 @@ impl ConnectState {
         // `Register` is the authoritative gatekeeper for enforcing the hard limit.
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
-        let target_authority = format_connect_authority(&target.host, target.port);
+        let target_authority = TargetAuthority::new(&target.host, target.port);
         let upstream = DirectConnector;
         let upstream_connection = match upstream.dial(session.flow_id, &target).await {
             Ok(connection) => connection,
@@ -674,9 +656,10 @@ mod tests {
     use crate::test_utils::make_backend_write;
     use crate::{
         actors::scheduler::TryStartConnectionTask,
+        connect_target::{NormalizedHost, normalize_host},
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
         security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
-        threat::{NormalizedHost, ThreatAction, ThreatIndex, normalize_host},
+        threat::{ThreatAction, ThreatIndex},
     };
     use std::{
         future::Future,
@@ -851,7 +834,7 @@ mod tests {
         let NormalizedHost::Domain(expected_ascii_host) = normalize_host(raw_host).unwrap() else {
             panic!("test host should normalize as a domain");
         };
-        let target_authority = format_connect_authority(raw_host, 443);
+        let target_authority = TargetAuthority::new(raw_host, 443);
         log_mixed_script_host(
             FlowId(42),
             raw_host,

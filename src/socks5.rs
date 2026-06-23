@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -23,6 +22,7 @@ use crate::{
         queue::QueueActor,
         scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
+    connect_target::TargetAuthority,
     flow::{
         FlowId,
         connection::{
@@ -87,21 +87,6 @@ struct Socks5Target {
     port: u16,
 }
 
-struct Socks5Authority<'a> {
-    host: &'a str,
-    port: u16,
-}
-
-impl fmt::Display for Socks5Authority<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
-        }
-    }
-}
-
 struct Socks5Session {
     flow_id: FlowId,
     client_addr: SocketAddr,
@@ -142,10 +127,7 @@ pub(crate) async fn handle_socks5_proxy(
 async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     negotiate_no_auth(&mut session).await?;
     let target = read_connect_request(&mut session).await?;
-    let authority = Socks5Authority {
-        host: &target.host,
-        port: target.port,
-    };
+    let authority = TargetAuthority::new(&target.host, target.port);
     info!("flow{}: SOCKS5 CONNECT {}", session.flow_id.0, authority);
     log_mixed_script_host(
         session.flow_id,
@@ -494,7 +476,7 @@ async fn reject_if_scheduler_at_capacity(
 
 async fn handle_resolved_threat_matches(
     session: &mut Socks5Session,
-    authority: &Socks5Authority<'_>,
+    authority: &TargetAuthority<'_>,
     target: &ResolvedConnectTarget,
 ) -> Socks5Result<()> {
     let threat_matches = session.connect_policy.resolved_threat_matches(target);
@@ -524,7 +506,7 @@ async fn handle_resolved_threat_matches(
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
-    authority: &Socks5Authority<'_>,
+    authority: &TargetAuthority<'_>,
     client_addr: SocketAddr,
 ) {
     log_mixed_script_host_for_target(
