@@ -658,7 +658,7 @@ mod tests {
         actors::scheduler::TryStartConnectionTask,
         connect_target::{NormalizedHost, normalize_host},
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
-        security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
+        security::connect_policy::{ConnectCidr, ConnectPolicyConfig, ResolutionSource},
         threat::{ThreatAction, ThreatIndex},
     };
     use std::{
@@ -793,6 +793,7 @@ mod tests {
                 SocketAddr::new("5.6.7.8".parse().unwrap(), 443),
                 SocketAddr::new("9.9.9.9".parse().unwrap(), 443),
             ],
+            resolution_source: ResolutionSource::Dns,
         };
 
         let matches = policy.resolved_threat_matches(&target);
@@ -819,9 +820,30 @@ mod tests {
             host: "1.2.3.4".to_string(),
             port: 443,
             addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
+            resolution_source: ResolutionSource::LiteralIp,
         };
 
         assert!(policy.resolved_threat_matches(&target).is_empty());
+    }
+
+    #[test]
+    fn resolved_threat_matches_checks_dns_resolved_absolute_numeric_names() {
+        let policy = policy_with_blocking_threat_feed("||5.6.7.8^\n");
+        let target = ResolvedConnectTarget {
+            host: "203.0.113.10.".to_string(),
+            port: 443,
+            addrs: vec![SocketAddr::new("5.6.7.8".parse().unwrap(), 443)],
+            resolution_source: ResolutionSource::Dns,
+        };
+
+        assert_eq!(policy.threat_action(), ThreatAction::Block);
+        assert_eq!(
+            policy.resolved_threat_matches(&target),
+            vec![ThreatMatch::Ip {
+                raw_host: "203.0.113.10.".to_string(),
+                matched_ip: "5.6.7.8".parse().unwrap(),
+            }]
+        );
     }
 
     #[actix_rt::test]
@@ -1248,6 +1270,7 @@ mod tests {
             host: "example.test".to_string(),
             port: reachable_addr.port(),
             addrs: vec![reachable_addr],
+            resolution_source: ResolutionSource::Dns,
         };
 
         let accept = async move {
@@ -1277,6 +1300,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: unreachable_port,
             addrs: vec![SocketAddr::from(([127, 0, 0, 1], unreachable_port))],
+            resolution_source: ResolutionSource::LiteralIp,
         };
 
         let connect_task =
