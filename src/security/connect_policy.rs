@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -223,7 +224,7 @@ impl ConnectPolicy {
         let normalized_host = normalize_host(host).map_err(|err| {
             ConnectPolicyError::ResolveFailed(format!("invalid host {}: {}", host, err))
         })?;
-        let addrs = resolve_host(&normalized_host, port)
+        let addrs = resolve_host(host, &normalized_host, port)
             .await
             .map_err(|err| ConnectPolicyError::ResolveFailed(err.to_string()))?;
         if addrs.is_empty() {
@@ -349,12 +350,45 @@ fn default_denied_cidrs() -> Vec<ConnectCidr> {
     .collect()
 }
 
-async fn resolve_host(host: &NormalizedHost, port: u16) -> io::Result<Vec<SocketAddr>> {
-    match host {
-        NormalizedHost::Ip(ip) => Ok(vec![SocketAddr::new(*ip, port)]),
-        NormalizedHost::Domain(domain) => {
-            let resolved = lookup_host((domain.as_str(), port)).await?;
-            collect_resolved_addrs_with_limit(domain.as_str(), resolved, MAX_RESOLVED_CONNECT_ADDRS)
+async fn resolve_host(
+    requested_host: &str,
+    normalized_host: &NormalizedHost,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
+    match resolver_target(requested_host, normalized_host) {
+        ResolverTarget::Ip(ip) => Ok(vec![SocketAddr::new(ip, port)]),
+        ResolverTarget::Dns(query_name) => {
+            let resolved = lookup_host((query_name.as_ref(), port)).await?;
+            collect_resolved_addrs_with_limit(
+                query_name.as_ref(),
+                resolved,
+                MAX_RESOLVED_CONNECT_ADDRS,
+            )
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResolverTarget<'a> {
+    Ip(IpAddr),
+    Dns(Cow<'a, str>),
+}
+
+/// Builds the resolver input from both representations of the host.
+///
+/// Policy matching uses the normalized form without a trailing root dot. DNS resolution must also
+/// retain whether the client supplied an absolute name so the OS resolver does not apply search
+/// domains to a request such as `svc.ns.`.
+fn resolver_target<'a>(requested_host: &str, host: &'a NormalizedHost) -> ResolverTarget<'a> {
+    let is_absolute = requested_host.trim().ends_with('.');
+    match (host, is_absolute) {
+        (NormalizedHost::Ip(ip), false) => ResolverTarget::Ip(*ip),
+        (NormalizedHost::Ip(ip), true) => ResolverTarget::Dns(Cow::Owned(format!("{}.", ip))),
+        (NormalizedHost::Domain(domain), false) => {
+            ResolverTarget::Dns(Cow::Borrowed(domain.as_str()))
+        }
+        (NormalizedHost::Domain(domain), true) => {
+            ResolverTarget::Dns(Cow::Owned(format!("{}.", domain.as_str())))
         }
     }
 }
@@ -474,6 +508,46 @@ mod tests {
         assert_eq!(
             collected[1],
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443)
+        );
+    }
+
+    #[test]
+    fn resolver_target_keeps_relative_domain_relative() {
+        let host = normalize_host("svc.ns").unwrap();
+
+        assert_eq!(
+            resolver_target("svc.ns", &host),
+            ResolverTarget::Dns(Cow::Borrowed("svc.ns"))
+        );
+    }
+
+    #[test]
+    fn resolver_target_preserves_absolute_domain_trailing_dot() {
+        let host = normalize_host("svc.ns.").unwrap();
+
+        assert_eq!(
+            resolver_target("svc.ns.", &host),
+            ResolverTarget::Dns(Cow::Owned("svc.ns.".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolver_target_preserves_absolute_domain_after_idna_normalization() {
+        let host = normalize_host("BÜCHER.DE.").unwrap();
+
+        assert_eq!(
+            resolver_target("BÜCHER.DE.", &host),
+            ResolverTarget::Dns(Cow::Owned("xn--bcher-kva.de.".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolver_target_does_not_short_circuit_absolute_numeric_name_as_ip() {
+        let host = normalize_host("127.0.0.1.").unwrap();
+
+        assert_eq!(
+            resolver_target("127.0.0.1.", &host),
+            ResolverTarget::Dns(Cow::Owned("127.0.0.1.".to_string()))
         );
     }
 
