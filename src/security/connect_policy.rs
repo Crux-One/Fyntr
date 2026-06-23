@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -8,8 +9,11 @@ use std::{
 use anyhow::anyhow;
 use tokio::net::lookup_host;
 
-use crate::limits::MAX_RESOLVED_CONNECT_ADDRS;
-use crate::threat::{ThreatAction, ThreatIndex, ThreatMatch};
+use crate::{
+    connect_target::{NormalizedDomain, NormalizedHost, canonicalize_socket_addr, normalize_host},
+    limits::MAX_RESOLVED_CONNECT_ADDRS,
+    threat::{ThreatAction, ThreatIndex, ThreatMatch},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectCidr {
@@ -134,7 +138,7 @@ pub(crate) struct ConnectPolicy {
     allowed_ports: HashSet<u16>,
     deny_cidrs: Vec<ConnectCidr>,
     allow_cidrs: Vec<ConnectCidr>,
-    allow_domains: Vec<String>,
+    allow_domains: Vec<NormalizedDomain>,
     threat_index: Option<ThreatIndex>,
     threat_action: ThreatAction,
 }
@@ -166,8 +170,7 @@ impl ConnectPolicy {
         let allow_domains = config
             .allow_domains
             .into_iter()
-            .map(|domain| normalize_domain(&domain))
-            .filter(|domain| !domain.is_empty())
+            .filter_map(|domain| NormalizedDomain::from_suffix(&domain).ok())
             .collect();
 
         Self {
@@ -196,7 +199,7 @@ impl ConnectPolicy {
         &self,
         target: &ResolvedConnectTarget,
     ) -> Vec<ThreatMatch> {
-        if target.host.parse::<IpAddr>().is_ok() {
+        if matches!(normalize_host(&target.host), Ok(NormalizedHost::Ip(_))) {
             return Vec::new();
         }
 
@@ -218,7 +221,10 @@ impl ConnectPolicy {
             ));
         }
 
-        let addrs = resolve_host(host, port)
+        let normalized_host = normalize_host(host).map_err(|err| {
+            ConnectPolicyError::ResolveFailed(format!("invalid host {}: {}", host, err))
+        })?;
+        let addrs = resolve_host(host, &normalized_host, port)
             .await
             .map_err(|err| ConnectPolicyError::ResolveFailed(err.to_string()))?;
         if addrs.is_empty() {
@@ -228,7 +234,7 @@ impl ConnectPolicy {
             )));
         }
 
-        let domain_allowed = self.is_domain_allowed(host);
+        let domain_allowed = self.is_normalized_host_allowed(&normalized_host);
         let mut authorized_addrs = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let canonical_addr = canonicalize_socket_addr(addr);
@@ -281,17 +287,20 @@ impl ConnectPolicy {
             .any(|cidr| cidr.contains(ip))
     }
 
+    #[cfg(test)]
     fn is_domain_allowed(&self, host: &str) -> bool {
-        let host = normalize_domain(host);
-        if host.is_empty() {
+        normalize_host(host)
+            .ok()
+            .is_some_and(|host| self.is_normalized_host_allowed(&host))
+    }
+
+    fn is_normalized_host_allowed(&self, host: &NormalizedHost) -> bool {
+        let NormalizedHost::Domain(host) = host else {
             return false;
-        }
-        self.allow_domains.iter().any(|allowed| {
-            host == *allowed
-                || (host.len() > allowed.len()
-                    && host.ends_with(allowed)
-                    && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
-        })
+        };
+        self.allow_domains
+            .iter()
+            .any(|allowed| host.matches_suffix(allowed))
     }
 
     fn disallowed_port_reason(&self, port: u16) -> String {
@@ -314,25 +323,6 @@ impl ConnectPolicy {
                 .join(", ")
         )
     }
-}
-
-fn normalize_domain(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-}
-
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
-
-fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
 }
 
 fn default_denied_cidrs() -> Vec<ConnectCidr> {
@@ -360,13 +350,47 @@ fn default_denied_cidrs() -> Vec<ConnectCidr> {
     .collect()
 }
 
-async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![SocketAddr::new(ip, port)]);
+async fn resolve_host(
+    requested_host: &str,
+    normalized_host: &NormalizedHost,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
+    match resolver_target(requested_host, normalized_host) {
+        ResolverTarget::Ip(ip) => Ok(vec![SocketAddr::new(ip, port)]),
+        ResolverTarget::Dns(query_name) => {
+            let resolved = lookup_host((query_name.as_ref(), port)).await?;
+            collect_resolved_addrs_with_limit(
+                query_name.as_ref(),
+                resolved,
+                MAX_RESOLVED_CONNECT_ADDRS,
+            )
+        }
     }
+}
 
-    let resolved = lookup_host((host, port)).await?;
-    collect_resolved_addrs_with_limit(host, resolved, MAX_RESOLVED_CONNECT_ADDRS)
+#[derive(Debug, PartialEq, Eq)]
+enum ResolverTarget<'a> {
+    Ip(IpAddr),
+    Dns(Cow<'a, str>),
+}
+
+/// Builds the resolver input from both representations of the host.
+///
+/// Policy matching uses the normalized form without a trailing root dot. DNS resolution must also
+/// retain whether the client supplied an absolute name so the OS resolver does not apply search
+/// domains to a request such as `svc.ns.`.
+fn resolver_target<'a>(requested_host: &str, host: &'a NormalizedHost) -> ResolverTarget<'a> {
+    let is_absolute = requested_host.trim().ends_with('.');
+    match (host, is_absolute) {
+        (NormalizedHost::Ip(ip), false) => ResolverTarget::Ip(*ip),
+        (NormalizedHost::Ip(ip), true) => ResolverTarget::Dns(Cow::Owned(format!("{}.", ip))),
+        (NormalizedHost::Domain(domain), false) => {
+            ResolverTarget::Dns(Cow::Borrowed(domain.as_str()))
+        }
+        (NormalizedHost::Domain(domain), true) => {
+            ResolverTarget::Dns(Cow::Owned(format!("{}.", domain.as_str())))
+        }
+    }
 }
 
 fn collect_resolved_addrs_with_limit(
@@ -484,6 +508,46 @@ mod tests {
         assert_eq!(
             collected[1],
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443)
+        );
+    }
+
+    #[test]
+    fn resolver_target_keeps_relative_domain_relative() {
+        let host = normalize_host("svc.ns").unwrap();
+
+        assert_eq!(
+            resolver_target("svc.ns", &host),
+            ResolverTarget::Dns(Cow::Borrowed("svc.ns"))
+        );
+    }
+
+    #[test]
+    fn resolver_target_preserves_absolute_domain_trailing_dot() {
+        let host = normalize_host("svc.ns.").unwrap();
+
+        assert_eq!(
+            resolver_target("svc.ns.", &host),
+            ResolverTarget::Dns(Cow::Owned("svc.ns.".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolver_target_preserves_absolute_domain_after_idna_normalization() {
+        let host = normalize_host("BÜCHER.DE.").unwrap();
+
+        assert_eq!(
+            resolver_target("BÜCHER.DE.", &host),
+            ResolverTarget::Dns(Cow::Owned("xn--bcher-kva.de.".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolver_target_does_not_short_circuit_absolute_numeric_name_as_ip() {
+        let host = normalize_host("127.0.0.1.").unwrap();
+
+        assert_eq!(
+            resolver_target("127.0.0.1.", &host),
+            ResolverTarget::Dns(Cow::Owned("127.0.0.1.".to_string()))
         );
     }
 
@@ -684,5 +748,18 @@ mod tests {
         let policy = ConnectPolicy::from_config(config);
         assert!(policy.is_domain_allowed("api.example.com"));
         assert!(policy.is_domain_allowed("example.com"));
+    }
+
+    #[test]
+    fn allow_domain_uses_idna_and_trailing_dot_normalization() {
+        let config = ConnectPolicyConfig {
+            allow_domains: vec![".BÜCHER.DE.".to_string()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        assert!(policy.is_domain_allowed("api.bücher.de"));
+        assert!(policy.is_domain_allowed("XN--BCHER-KVA.DE."));
+        assert!(!policy.is_domain_allowed("notbücher.de"));
     }
 }
