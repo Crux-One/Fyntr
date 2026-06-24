@@ -22,7 +22,7 @@ use crate::{
         queue::QueueActor,
         scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
-    connect_target::TargetAuthority,
+    connect_target::{RequestedHost, TargetAuthority},
     flow::{
         FlowId,
         connection::{
@@ -83,7 +83,7 @@ enum Socks5Reply {
 }
 
 struct Socks5Target {
-    host: String,
+    host: RequestedHost,
     port: u16,
 }
 
@@ -127,11 +127,11 @@ pub(crate) async fn handle_socks5_proxy(
 async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     negotiate_no_auth(&mut session).await?;
     let target = read_connect_request(&mut session).await?;
-    let authority = TargetAuthority::new(&target.host, target.port);
+    let authority = TargetAuthority::new(target.host.raw(), target.port);
     info!("flow{}: SOCKS5 CONNECT {}", session.flow_id.0, authority);
     log_mixed_script_host(
         session.flow_id,
-        &target.host,
+        target.host.raw(),
         &authority,
         session.client_addr,
     );
@@ -368,7 +368,7 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                 "IPv4 address",
             )
             .await?;
-            IpAddr::V4(Ipv4Addr::from(octets)).to_string()
+            RequestedHost::from_ip(IpAddr::V4(Ipv4Addr::from(octets)))
         }
         SOCKS5_ATYP_DOMAINNAME => {
             let mut len = [0_u8; 1];
@@ -393,7 +393,18 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
             )
             .await?;
             match String::from_utf8(name) {
-                Ok(host) => host,
+                Ok(host) => match RequestedHost::parse_domain(&host) {
+                    Ok(host) => host,
+                    Err(err) => {
+                        warn!(
+                            "flow{}: invalid SOCKS5 domain name: {}",
+                            session.flow_id.0, err
+                        );
+                        return session
+                            .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                            .await;
+                    }
+                },
                 Err(err) => {
                     warn!(
                         "flow{}: invalid SOCKS5 domain name: {}",
@@ -414,7 +425,7 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                 "IPv6 address",
             )
             .await?;
-            IpAddr::V6(Ipv6Addr::from(octets)).to_string()
+            RequestedHost::from_ip(IpAddr::V6(Ipv6Addr::from(octets)))
         }
         _ => {
             return session
@@ -677,6 +688,15 @@ mod tests {
         }))
     }
 
+    fn blocking_threat_policy_allowing_loopback(feed: &str) -> Arc<ConnectPolicy> {
+        Arc::new(ConnectPolicy::from_config(ConnectPolicyConfig {
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
+            threat_action: ThreatAction::Block,
+            ..ConnectPolicyConfig::default()
+        }))
+    }
+
     fn ipv4_request(command: u8, addr: Ipv4Addr, port: u16) -> Vec<u8> {
         let mut request = vec![SOCKS5_VERSION, command, 0x00, SOCKS5_ATYP_IPV4];
         request.extend_from_slice(&addr.octets());
@@ -800,6 +820,60 @@ mod tests {
 
         result.unwrap();
         assert_eq!(response, expected);
+    }
+
+    #[actix_rt::test]
+    async fn rejects_absolute_idna_domain_matching_normalized_threat() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let request = domain_request("BÜCHER.DE.", 443);
+        let input = with_no_auth_greeting(&request);
+        let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
+
+        let (result, response) =
+            exchange(scheduler, blocking_threat_policy("||bücher.de^\n"), input).await;
+
+        result.unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[actix_rt::test]
+    async fn domainname_numeric_host_is_blocked_by_resolved_ip_threat() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let request = domain_request("127.0.0.1", 443);
+        let input = with_no_auth_greeting(&request);
+        let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
+
+        let (result, response) = exchange(
+            scheduler,
+            blocking_threat_policy_allowing_loopback("||127.0.0.1^\n"),
+            input,
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[actix_rt::test]
+    async fn rejects_noncanonical_domainname_syntax() {
+        let expected = expected_failure_exchange(Socks5Reply::AddressTypeNotSupported);
+
+        for host in [
+            "",
+            " example.invalid",
+            "example.invalid ",
+            "[example.invalid]",
+            "example..invalid",
+            "example.invalid..",
+        ] {
+            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let input = with_no_auth_greeting(&domain_request(host, 443));
+
+            let (result, response) = exchange(scheduler, default_policy(), input).await;
+
+            result.unwrap();
+            assert_eq!(response, expected, "unexpected response for {host:?}");
+        }
     }
 
     #[actix_rt::test]
