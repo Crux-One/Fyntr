@@ -394,9 +394,9 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
             .await?;
             match String::from_utf8(name) {
                 Ok(host) => {
-                    if is_numeric_dotted_domain_name(&host) {
+                    if is_numeric_host_name(&host) {
                         warn!(
-                            "flow{}: invalid SOCKS5 domain name: numeric-looking domain names are not accepted",
+                            "flow{}: invalid SOCKS5 domain name: numeric host names are not accepted",
                             session.flow_id.0
                         );
                         return session
@@ -460,11 +460,31 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
     })
 }
 
-fn is_numeric_dotted_domain_name(host: &str) -> bool {
+fn is_numeric_host_name(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+
+    if is_ipv4_number_component(host) {
+        return true;
+    }
+
     host.contains('.')
-        && host.chars().any(|c| c.is_ascii_digit())
-        && host.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && host
+            .split('.')
+            .all(|part| !part.is_empty() && is_ipv4_number_component(part))
+}
+
+fn is_ipv4_number_component(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return value.chars().all(|c| c.is_ascii_digit());
+    };
+
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 async fn read_with_timeout(
@@ -751,15 +771,20 @@ mod tests {
     }
 
     #[test]
-    fn numeric_dotted_domain_name_requires_digits() {
-        assert!(is_numeric_dotted_domain_name("127.0.0.1"));
-        assert!(is_numeric_dotted_domain_name("127.1"));
-        assert!(is_numeric_dotted_domain_name("8.8.8.8"));
-        assert!(is_numeric_dotted_domain_name("127.0.0.1."));
+    fn numeric_host_name_matches_legacy_ipv4_forms() {
+        assert!(is_numeric_host_name("127.0.0.1"));
+        assert!(is_numeric_host_name("127.1"));
+        assert!(is_numeric_host_name("8.8.8.8"));
+        assert!(is_numeric_host_name("127.0.0.1."));
+        assert!(is_numeric_host_name("2130706433"));
+        assert!(is_numeric_host_name("0x7f000001"));
+        assert!(is_numeric_host_name("017700000001"));
+        assert!(is_numeric_host_name("0x7f.1"));
 
-        assert!(!is_numeric_dotted_domain_name(".."));
-        assert!(!is_numeric_dotted_domain_name("..."));
-        assert!(!is_numeric_dotted_domain_name("example.invalid"));
+        assert!(!is_numeric_host_name(".."));
+        assert!(!is_numeric_host_name("..."));
+        assert!(!is_numeric_host_name("example.invalid"));
+        assert!(!is_numeric_host_name("api.127.example"));
     }
 
     #[test]
@@ -862,7 +887,15 @@ mod tests {
     async fn rejects_numeric_looking_domainnames() {
         let expected = expected_failure_exchange(Socks5Reply::AddressTypeNotSupported);
 
-        for host in ["127.0.0.1", "127.1", "8.8.8.8", "127.0.0.1."] {
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "8.8.8.8",
+            "127.0.0.1.",
+            "2130706433",
+            "0x7f000001",
+            "017700000001",
+        ] {
             let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
             let request = domain_request(host, 443);
             let input = with_no_auth_greeting(&request);
