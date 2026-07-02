@@ -405,7 +405,21 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                     }
 
                     match RequestedHost::parse_domain(&host) {
-                        Ok(host) => host,
+                        Ok(parsed_host) => {
+                            if parsed_host
+                                .dns_query_name()
+                                .is_some_and(|query_name| is_numeric_host_name(query_name.as_ref()))
+                            {
+                                warn!(
+                                    "flow{}: invalid SOCKS5 domain name: numeric host names are not accepted",
+                                    session.flow_id.0
+                                );
+                                return session
+                                    .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                                    .await;
+                            }
+                            parsed_host
+                        }
                         Err(err) => {
                             warn!(
                                 "flow{}: invalid SOCKS5 domain name: {}",
@@ -781,6 +795,7 @@ mod tests {
         assert!(is_numeric_host_name("017700000001"));
         assert!(is_numeric_host_name("0x7f.1"));
 
+        assert!(!is_numeric_host_name("１２７.０.０.１"));
         assert!(!is_numeric_host_name(".."));
         assert!(!is_numeric_host_name("..."));
         assert!(!is_numeric_host_name("example.invalid"));
@@ -895,6 +910,8 @@ mod tests {
             "2130706433",
             "0x7f000001",
             "017700000001",
+            "１２７.０.０.１",
+            "１２７．０．０．１",
         ] {
             let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
             let request = domain_request(host, 443);
