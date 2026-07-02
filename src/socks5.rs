@@ -393,18 +393,30 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
             )
             .await?;
             match String::from_utf8(name) {
-                Ok(host) => match RequestedHost::parse_domain(&host) {
-                    Ok(host) => host,
-                    Err(err) => {
+                Ok(host) => {
+                    if is_numeric_dotted_domain_name(&host) {
                         warn!(
-                            "flow{}: invalid SOCKS5 domain name: {}",
-                            session.flow_id.0, err
+                            "flow{}: invalid SOCKS5 domain name: numeric-looking domain names are not accepted",
+                            session.flow_id.0
                         );
                         return session
                             .respond_failure(Socks5Reply::AddressTypeNotSupported)
                             .await;
                     }
-                },
+
+                    match RequestedHost::parse_domain(&host) {
+                        Ok(host) => host,
+                        Err(err) => {
+                            warn!(
+                                "flow{}: invalid SOCKS5 domain name: {}",
+                                session.flow_id.0, err
+                            );
+                            return session
+                                .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                                .await;
+                        }
+                    }
+                }
                 Err(err) => {
                     warn!(
                         "flow{}: invalid SOCKS5 domain name: {}",
@@ -446,6 +458,11 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
         host,
         port: u16::from_be_bytes(port),
     })
+}
+
+fn is_numeric_dotted_domain_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.contains('.') && host.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 async fn read_with_timeout(
@@ -688,15 +705,6 @@ mod tests {
         }))
     }
 
-    fn blocking_threat_policy_allowing_loopback(feed: &str) -> Arc<ConnectPolicy> {
-        Arc::new(ConnectPolicy::from_config(ConnectPolicyConfig {
-            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
-            threat_index: Some(feed.parse::<ThreatIndex>().unwrap()),
-            threat_action: ThreatAction::Block,
-            ..ConnectPolicyConfig::default()
-        }))
-    }
-
     fn ipv4_request(command: u8, addr: Ipv4Addr, port: u16) -> Vec<u8> {
         let mut request = vec![SOCKS5_VERSION, command, 0x00, SOCKS5_ATYP_IPV4];
         request.extend_from_slice(&addr.octets());
@@ -837,21 +845,19 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn domainname_numeric_host_is_blocked_by_resolved_ip_threat() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
-        let request = domain_request("127.0.0.1", 443);
-        let input = with_no_auth_greeting(&request);
-        let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
+    async fn rejects_numeric_looking_domainnames() {
+        let expected = expected_failure_exchange(Socks5Reply::AddressTypeNotSupported);
 
-        let (result, response) = exchange(
-            scheduler,
-            blocking_threat_policy_allowing_loopback("||127.0.0.1^\n"),
-            input,
-        )
-        .await;
+        for host in ["127.0.0.1", "127.1", "8.8.8.8", "127.0.0.1."] {
+            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let request = domain_request(host, 443);
+            let input = with_no_auth_greeting(&request);
 
-        result.unwrap();
-        assert_eq!(response, expected);
+            let (result, response) = exchange(scheduler, default_policy(), input).await;
+
+            result.unwrap();
+            assert_eq!(response, expected, "unexpected response for {host:?}");
+        }
     }
 
     #[actix_rt::test]
