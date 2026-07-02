@@ -11,7 +11,7 @@ use log::{info, warn};
 use unicode_script::{Script, UnicodeScript};
 
 use crate::{
-    connect_target::{NormalizedHost, canonicalize_ip, normalize_host},
+    connect_target::{NormalizedHost, RequestedHost, canonicalize_ip, normalize_lenient_host},
     flow::FlowId,
 };
 
@@ -133,7 +133,7 @@ pub(crate) fn log_mixed_script_host_for_target(
         return;
     }
 
-    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
+    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_lenient_host(raw_host) else {
         return;
     };
 
@@ -233,17 +233,30 @@ impl ThreatIndex {
         Ok((Self { domains, ips }, stats))
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_host(&self, host: &str) -> Option<ThreatMatch> {
-        let ascii_host = match normalize_host(host).ok()? {
-            NormalizedHost::Domain(domain) => domain.into_string(),
-            NormalizedHost::Ip(ip) => return self.lookup_ip(host, ip),
-        };
+        match normalize_lenient_host(host).ok()? {
+            NormalizedHost::Domain(domain) => self.lookup_domain(host, domain.as_str()),
+            NormalizedHost::Ip(ip) => self.lookup_ip(host, ip),
+        }
+    }
+
+    pub(crate) fn lookup_requested_host(&self, host: &RequestedHost) -> Option<ThreatMatch> {
+        match (host.normalized_domain(), host.canonical_ip()) {
+            (Some(domain), None) => self.lookup_domain(host.raw(), domain.as_str()),
+            (None, Some(ip)) => self.lookup_ip(host.raw(), ip),
+            _ => None,
+        }
+    }
+
+    fn lookup_domain(&self, raw_host: &str, normalized_domain: &str) -> Option<ThreatMatch> {
+        let ascii_host = normalized_domain.to_string();
 
         let mut candidate = ascii_host.as_str();
         loop {
             if let Some(matched_domain) = self.domains.get(candidate) {
                 return Some(ThreatMatch::Domain {
-                    raw_host: host.to_string(),
+                    raw_host: raw_host.to_string(),
                     ascii_host,
                     matched_domain: matched_domain.clone(),
                 });
@@ -306,7 +319,7 @@ fn parse_feed_line(line: &str) -> FeedLine<'_> {
 }
 
 fn normalize_entry(value: &str) -> Option<NormalizedEntry> {
-    match normalize_host(value).ok()? {
+    match normalize_lenient_host(value).ok()? {
         NormalizedHost::Domain(domain) => Some(NormalizedEntry::Domain(
             domain.into_string().into_boxed_str(),
         )),
@@ -468,6 +481,31 @@ mod tests {
                 matched_domain: "xn--bcher-kva.de".into(),
             })
         );
+    }
+
+    #[test]
+    fn matches_typed_request_domains_and_literal_ips_without_reclassification() {
+        let index: ThreatIndex = "||evil.com^\n||1.2.3.4^".parse().unwrap();
+        let domain = RequestedHost::parse_domain("API.EVIL.COM.").unwrap();
+        let literal_ip = RequestedHost::from_ip("1.2.3.4".parse().unwrap());
+        let numeric_domain = RequestedHost::parse_domain("1.2.3.4").unwrap();
+
+        assert_eq!(
+            index.lookup_requested_host(&domain),
+            Some(ThreatMatch::Domain {
+                raw_host: "API.EVIL.COM.".to_string(),
+                ascii_host: "api.evil.com".to_string(),
+                matched_domain: "evil.com".into(),
+            })
+        );
+        assert_eq!(
+            index.lookup_requested_host(&literal_ip),
+            Some(ThreatMatch::Ip {
+                raw_host: "1.2.3.4".to_string(),
+                matched_ip: "1.2.3.4".parse().unwrap(),
+            })
+        );
+        assert_eq!(index.lookup_requested_host(&numeric_domain), None);
     }
 
     #[test]

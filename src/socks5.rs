@@ -22,7 +22,7 @@ use crate::{
         queue::QueueActor,
         scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
-    connect_target::TargetAuthority,
+    connect_target::{RequestedHost, TargetAuthority},
     flow::{
         FlowId,
         connection::{
@@ -83,7 +83,7 @@ enum Socks5Reply {
 }
 
 struct Socks5Target {
-    host: String,
+    host: RequestedHost,
     port: u16,
 }
 
@@ -127,11 +127,11 @@ pub(crate) async fn handle_socks5_proxy(
 async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     negotiate_no_auth(&mut session).await?;
     let target = read_connect_request(&mut session).await?;
-    let authority = TargetAuthority::new(&target.host, target.port);
+    let authority = TargetAuthority::new(target.host.raw(), target.port);
     info!("flow{}: SOCKS5 CONNECT {}", session.flow_id.0, authority);
     log_mixed_script_host(
         session.flow_id,
-        &target.host,
+        target.host.raw(),
         &authority,
         session.client_addr,
     );
@@ -368,7 +368,7 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                 "IPv4 address",
             )
             .await?;
-            IpAddr::V4(Ipv4Addr::from(octets)).to_string()
+            RequestedHost::from_ip(IpAddr::V4(Ipv4Addr::from(octets)))
         }
         SOCKS5_ATYP_DOMAINNAME => {
             let mut len = [0_u8; 1];
@@ -393,7 +393,44 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
             )
             .await?;
             match String::from_utf8(name) {
-                Ok(host) => host,
+                Ok(host) => {
+                    if is_numeric_host_name(&host) {
+                        warn!(
+                            "flow{}: invalid SOCKS5 domain name: numeric host names are not accepted",
+                            session.flow_id.0
+                        );
+                        return session
+                            .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                            .await;
+                    }
+
+                    match RequestedHost::parse_domain(&host) {
+                        Ok(parsed_host) => {
+                            if parsed_host
+                                .dns_query_name()
+                                .is_some_and(|query_name| is_numeric_host_name(query_name.as_ref()))
+                            {
+                                warn!(
+                                    "flow{}: invalid SOCKS5 domain name: numeric host names are not accepted",
+                                    session.flow_id.0
+                                );
+                                return session
+                                    .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                                    .await;
+                            }
+                            parsed_host
+                        }
+                        Err(err) => {
+                            warn!(
+                                "flow{}: invalid SOCKS5 domain name: {}",
+                                session.flow_id.0, err
+                            );
+                            return session
+                                .respond_failure(Socks5Reply::AddressTypeNotSupported)
+                                .await;
+                        }
+                    }
+                }
                 Err(err) => {
                     warn!(
                         "flow{}: invalid SOCKS5 domain name: {}",
@@ -414,7 +451,7 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
                 "IPv6 address",
             )
             .await?;
-            IpAddr::V6(Ipv6Addr::from(octets)).to_string()
+            RequestedHost::from_ip(IpAddr::V6(Ipv6Addr::from(octets)))
         }
         _ => {
             return session
@@ -435,6 +472,33 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
         host,
         port: u16::from_be_bytes(port),
     })
+}
+
+fn is_numeric_host_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+
+    if is_ipv4_number_component(host) {
+        return true;
+    }
+
+    host.contains('.')
+        && host
+            .split('.')
+            .all(|part| !part.is_empty() && is_ipv4_number_component(part))
+}
+
+fn is_ipv4_number_component(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return value.chars().all(|c| c.is_ascii_digit());
+    };
+
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 async fn read_with_timeout(
@@ -721,6 +785,24 @@ mod tests {
     }
 
     #[test]
+    fn numeric_host_name_matches_legacy_ipv4_forms() {
+        assert!(is_numeric_host_name("127.0.0.1"));
+        assert!(is_numeric_host_name("127.1"));
+        assert!(is_numeric_host_name("8.8.8.8"));
+        assert!(is_numeric_host_name("127.0.0.1."));
+        assert!(is_numeric_host_name("2130706433"));
+        assert!(is_numeric_host_name("0x7f000001"));
+        assert!(is_numeric_host_name("017700000001"));
+        assert!(is_numeric_host_name("0x7f.1"));
+
+        assert!(!is_numeric_host_name("１２７.０.０.１"));
+        assert!(!is_numeric_host_name(".."));
+        assert!(!is_numeric_host_name("..."));
+        assert!(!is_numeric_host_name("example.invalid"));
+        assert!(!is_numeric_host_name("api.127.example"));
+    }
+
+    #[test]
     fn success_reply_uses_ipv4_bound_address() {
         let bound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 54321);
 
@@ -800,6 +882,70 @@ mod tests {
 
         result.unwrap();
         assert_eq!(response, expected);
+    }
+
+    #[actix_rt::test]
+    async fn rejects_absolute_idna_domain_matching_normalized_threat() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let request = domain_request("BÜCHER.DE.", 443);
+        let input = with_no_auth_greeting(&request);
+        let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
+
+        let (result, response) =
+            exchange(scheduler, blocking_threat_policy("||bücher.de^\n"), input).await;
+
+        result.unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[actix_rt::test]
+    async fn rejects_numeric_looking_domainnames() {
+        let expected = expected_failure_exchange(Socks5Reply::AddressTypeNotSupported);
+
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "8.8.8.8",
+            "127.0.0.1.",
+            "2130706433",
+            "0x7f000001",
+            "017700000001",
+            "１２７.０.０.１",
+            "１２７．０．０．１",
+        ] {
+            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let request = domain_request(host, 443);
+            let input = with_no_auth_greeting(&request);
+
+            let (result, response) = exchange(scheduler, default_policy(), input).await;
+
+            result.unwrap();
+            assert_eq!(response, expected, "unexpected response for {host:?}");
+        }
+    }
+
+    #[actix_rt::test]
+    async fn rejects_noncanonical_domainname_syntax() {
+        let expected = expected_failure_exchange(Socks5Reply::AddressTypeNotSupported);
+
+        for host in [
+            "",
+            " example.invalid",
+            "example.invalid ",
+            "[example.invalid]",
+            "example..invalid",
+            "example.invalid..",
+            "..",
+            "...",
+        ] {
+            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let input = with_no_auth_greeting(&domain_request(host, 443));
+
+            let (result, response) = exchange(scheduler, default_policy(), input).await;
+
+            result.unwrap();
+            assert_eq!(response, expected, "unexpected response for {host:?}");
+        }
     }
 
     #[actix_rt::test]
