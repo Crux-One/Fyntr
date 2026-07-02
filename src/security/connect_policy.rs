@@ -388,9 +388,12 @@ async fn resolve_host(host: &RequestedHost, port: u16) -> io::Result<Vec<SocketA
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let query_name = host
-        .dns_query_name()
-        .expect("non-IP requested host must provide a DNS query name");
+    let query_name = host.dns_query_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host {} cannot be resolved through DNS", host),
+        )
+    })?;
     let resolved = lookup_host((query_name.as_ref(), port)).await?;
     collect_resolved_addrs_with_limit(query_name.as_ref(), resolved, MAX_RESOLVED_CONNECT_ADDRS)
 }
