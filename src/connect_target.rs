@@ -59,7 +59,9 @@ impl fmt::Display for HostNormalizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("host must not be empty"),
-            Self::Idna => f.write_str("host could not be converted to IDNA ASCII form"),
+            Self::Idna => f.write_str(
+                "host contains invalid characters or could not be converted to IDNA ASCII form",
+            ),
             Self::InvalidDomain => f.write_str("host is not a valid domain name"),
         }
     }
@@ -84,7 +86,9 @@ impl fmt::Display for RequestHostParseError {
             Self::MultipleTrailingDots => {
                 f.write_str("request host must not contain multiple trailing dots")
             }
-            Self::Idna => f.write_str("request host could not be converted to IDNA ASCII form"),
+            Self::Idna => f.write_str(
+                "request host contains invalid characters or could not be converted to IDNA ASCII form",
+            ),
             Self::InvalidDomain => f.write_str("request host is not a valid domain name"),
         }
     }
