@@ -462,7 +462,9 @@ async fn read_connect_request(session: &mut Socks5Session) -> Socks5Result<Socks
 
 fn is_numeric_dotted_domain_name(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
-    host.contains('.') && host.chars().all(|c| c.is_ascii_digit() || c == '.')
+    host.contains('.')
+        && host.chars().any(|c| c.is_ascii_digit())
+        && host.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 async fn read_with_timeout(
@@ -749,6 +751,18 @@ mod tests {
     }
 
     #[test]
+    fn numeric_dotted_domain_name_requires_digits() {
+        assert!(is_numeric_dotted_domain_name("127.0.0.1"));
+        assert!(is_numeric_dotted_domain_name("127.1"));
+        assert!(is_numeric_dotted_domain_name("8.8.8.8"));
+        assert!(is_numeric_dotted_domain_name("127.0.0.1."));
+
+        assert!(!is_numeric_dotted_domain_name(".."));
+        assert!(!is_numeric_dotted_domain_name("..."));
+        assert!(!is_numeric_dotted_domain_name("example.invalid"));
+    }
+
+    #[test]
     fn success_reply_uses_ipv4_bound_address() {
         let bound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 54321);
 
@@ -871,6 +885,8 @@ mod tests {
             "[example.invalid]",
             "example..invalid",
             "example.invalid..",
+            "..",
+            "...",
         ] {
             let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
             let input = with_no_auth_greeting(&domain_request(host, 443));
