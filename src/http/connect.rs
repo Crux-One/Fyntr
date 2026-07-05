@@ -22,6 +22,7 @@ use crate::{
         queue::QueueActor,
         scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
     },
+    connect_target::TargetAuthority,
     flow::{
         FlowId,
         connection::{
@@ -106,29 +107,10 @@ where
     }
 }
 
-struct ConnectAuthority<'a> {
-    host: &'a str,
-    port: u16,
-}
-
-impl fmt::Display for ConnectAuthority<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
-        }
-    }
-}
-
-fn format_connect_authority(host: &str, port: u16) -> ConnectAuthority<'_> {
-    ConnectAuthority { host, port }
-}
-
 fn log_mixed_script_host(
     flow_id: FlowId,
     raw_host: &str,
-    target_authority: &ConnectAuthority<'_>,
+    target_authority: &TargetAuthority<'_>,
     client_addr: SocketAddr,
 ) {
     log_mixed_script_host_for_target(
@@ -143,7 +125,7 @@ fn log_mixed_script_host(
 
 async fn handle_resolved_threat_matches(
     session: &mut ConnectSession,
-    target_authority: &ConnectAuthority<'_>,
+    target_authority: &TargetAuthority<'_>,
     threat_matches: &[ThreatMatch],
 ) -> ConnectResult<()> {
     if threat_matches.is_empty() {
@@ -297,11 +279,11 @@ impl ConnectState {
                     .await;
             }
         };
-        let target_authority = format_connect_authority(&target_host, target_port);
+        let target_authority = TargetAuthority::new(target_host.raw(), target_port);
         info!("flow{}: CONNECT {}", session.flow_id.0, target_authority);
         log_mixed_script_host(
             session.flow_id,
-            &target_host,
+            target_host.raw(),
             &target_authority,
             session.client_addr,
         );
@@ -381,7 +363,7 @@ impl ConnectState {
         // `Register` is the authoritative gatekeeper for enforcing the hard limit.
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
-        let target_authority = format_connect_authority(&target.host, target.port);
+        let target_authority = TargetAuthority::new(&target.host, target.port);
         let upstream = DirectConnector;
         let upstream_connection = match upstream.dial(session.flow_id, &target).await {
             Ok(connection) => connection,
@@ -674,9 +656,11 @@ mod tests {
     use crate::test_utils::make_backend_write;
     use crate::{
         actors::scheduler::TryStartConnectionTask,
+        connect_target::{NormalizedHost, normalize_lenient_host},
+        http::request::RequestLine,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
-        security::connect_policy::{ConnectCidr, ConnectPolicyConfig},
-        threat::{NormalizedHost, ThreatAction, ThreatIndex, normalize_host},
+        security::connect_policy::{ConnectCidr, ConnectPolicyConfig, ResolutionSource},
+        threat::{ThreatAction, ThreatIndex},
     };
     use std::{
         future::Future,
@@ -810,6 +794,7 @@ mod tests {
                 SocketAddr::new("5.6.7.8".parse().unwrap(), 443),
                 SocketAddr::new("9.9.9.9".parse().unwrap(), 443),
             ],
+            resolution_source: ResolutionSource::Dns,
         };
 
         let matches = policy.resolved_threat_matches(&target);
@@ -836,9 +821,34 @@ mod tests {
             host: "1.2.3.4".to_string(),
             port: 443,
             addrs: vec![SocketAddr::new("1.2.3.4".parse().unwrap(), 443)],
+            resolution_source: ResolutionSource::LiteralIp,
         };
 
         assert!(policy.resolved_threat_matches(&target).is_empty());
+    }
+
+    #[test]
+    fn parsed_absolute_numeric_host_checks_resolved_ip_threats() {
+        let policy = policy_with_blocking_threat_feed("||5.6.7.8^\n");
+        let request = RequestLine::parse("CONNECT 203.0.113.10.:443 HTTP/1.1").unwrap();
+        let (host, port) = request.parse_connect_target().unwrap();
+
+        assert!(policy.lookup_threat_host(&host).is_none());
+        let target = ResolvedConnectTarget::from_authorized_addrs(
+            &host,
+            port,
+            vec![SocketAddr::new("5.6.7.8".parse().unwrap(), port)],
+        );
+
+        assert_eq!(policy.threat_action(), ThreatAction::Block);
+        assert_eq!(target.resolution_source, ResolutionSource::Dns);
+        assert_eq!(
+            policy.resolved_threat_matches(&target),
+            vec![ThreatMatch::Ip {
+                raw_host: "203.0.113.10.".to_string(),
+                matched_ip: "5.6.7.8".parse().unwrap(),
+            }]
+        );
     }
 
     #[actix_rt::test]
@@ -848,10 +858,11 @@ mod tests {
         CAPTURED_LOGS.lock().unwrap().clear();
 
         let raw_host = "fаke.invalid";
-        let NormalizedHost::Domain(expected_ascii_host) = normalize_host(raw_host).unwrap() else {
+        let NormalizedHost::Domain(expected_ascii_host) = normalize_lenient_host(raw_host).unwrap()
+        else {
             panic!("test host should normalize as a domain");
         };
-        let target_authority = format_connect_authority(raw_host, 443);
+        let target_authority = TargetAuthority::new(raw_host, 443);
         log_mixed_script_host(
             FlowId(42),
             raw_host,
@@ -1004,6 +1015,51 @@ mod tests {
         .await;
 
         assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_403_when_absolute_idna_target_matches_threat() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(
+            listener,
+            scheduler,
+            policy_with_blocking_threat_feed("||bücher.de^\n"),
+            async move {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                client
+                    .write_all(
+                        "CONNECT BÜCHER.DE.:443 HTTP/1.1\r\nHost: example\r\n\r\n".as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                read_response(client).await
+            },
+        )
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    }
+
+    #[actix_rt::test]
+    async fn returns_400_for_noncanonical_target_host() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let response = drive_proxy(listener, scheduler, default_policy(), async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"CONNECT example.invalid..:443 HTTP/1.1\r\nHost: example\r\n\r\n")
+                .await
+                .unwrap();
+            read_response(client).await
+        })
+        .await;
+
+        assert_eq!(response, b"HTTP/1.1 400 Bad Request\r\n\r\n");
     }
 
     #[actix_rt::test]
@@ -1265,6 +1321,7 @@ mod tests {
             host: "example.test".to_string(),
             port: reachable_addr.port(),
             addrs: vec![reachable_addr],
+            resolution_source: ResolutionSource::Dns,
         };
 
         let accept = async move {
@@ -1294,6 +1351,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: unreachable_port,
             addrs: vec![SocketAddr::from(([127, 0, 0, 1], unreachable_port))],
+            resolution_source: ResolutionSource::LiteralIp,
         };
 
         let connect_task =

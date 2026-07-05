@@ -8,8 +8,14 @@ use std::{
 use anyhow::anyhow;
 use tokio::net::lookup_host;
 
-use crate::limits::MAX_RESOLVED_CONNECT_ADDRS;
-use crate::threat::{ThreatAction, ThreatIndex, ThreatMatch};
+use crate::{
+    connect_target::{NormalizedDomain, RequestedHost, canonicalize_socket_addr},
+    limits::MAX_RESOLVED_CONNECT_ADDRS,
+    threat::{ThreatAction, ThreatIndex, ThreatMatch},
+};
+
+#[cfg(test)]
+use crate::connect_target::{NormalizedHost, normalize_lenient_host};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectCidr {
@@ -134,7 +140,7 @@ pub(crate) struct ConnectPolicy {
     allowed_ports: HashSet<u16>,
     deny_cidrs: Vec<ConnectCidr>,
     allow_cidrs: Vec<ConnectCidr>,
-    allow_domains: Vec<String>,
+    allow_domains: Vec<NormalizedDomain>,
     threat_index: Option<ThreatIndex>,
     threat_action: ThreatAction,
 }
@@ -144,6 +150,33 @@ pub(crate) struct ResolvedConnectTarget {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) addrs: Vec<SocketAddr>,
+    pub(crate) resolution_source: ResolutionSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolutionSource {
+    LiteralIp,
+    Dns,
+}
+
+impl ResolvedConnectTarget {
+    pub(crate) fn from_authorized_addrs(
+        host: &RequestedHost,
+        port: u16,
+        addrs: Vec<SocketAddr>,
+    ) -> Self {
+        let resolution_source = if host.canonical_ip().is_some() {
+            ResolutionSource::LiteralIp
+        } else {
+            ResolutionSource::Dns
+        };
+        Self {
+            host: host.raw().to_string(),
+            port,
+            addrs,
+            resolution_source,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -166,8 +199,7 @@ impl ConnectPolicy {
         let allow_domains = config
             .allow_domains
             .into_iter()
-            .map(|domain| normalize_domain(&domain))
-            .filter(|domain| !domain.is_empty())
+            .filter_map(|domain| NormalizedDomain::from_suffix(&domain).ok())
             .collect();
 
         Self {
@@ -184,8 +216,8 @@ impl ConnectPolicy {
         self.threat_action
     }
 
-    pub(crate) fn lookup_threat_host(&self, host: &str) -> Option<ThreatMatch> {
-        self.threat_index.as_ref()?.lookup_host(host)
+    pub(crate) fn lookup_threat_host(&self, host: &RequestedHost) -> Option<ThreatMatch> {
+        self.threat_index.as_ref()?.lookup_requested_host(host)
     }
 
     pub(crate) fn lookup_threat_ip(&self, host: &str, ip: IpAddr) -> Option<ThreatMatch> {
@@ -196,7 +228,7 @@ impl ConnectPolicy {
         &self,
         target: &ResolvedConnectTarget,
     ) -> Vec<ThreatMatch> {
-        if target.host.parse::<IpAddr>().is_ok() {
+        if matches!(target.resolution_source, ResolutionSource::LiteralIp) {
             return Vec::new();
         }
 
@@ -209,7 +241,7 @@ impl ConnectPolicy {
 
     pub(crate) async fn resolve_and_authorize(
         &self,
-        host: &str,
+        host: &RequestedHost,
         port: u16,
     ) -> Result<ResolvedConnectTarget, ConnectPolicyError> {
         if !self.allowed_ports.contains(&port) {
@@ -228,7 +260,9 @@ impl ConnectPolicy {
             )));
         }
 
-        let domain_allowed = self.is_domain_allowed(host);
+        let domain_allowed = host
+            .normalized_domain()
+            .is_some_and(|domain| self.is_normalized_domain_allowed(domain));
         let mut authorized_addrs = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let canonical_addr = canonicalize_socket_addr(addr);
@@ -267,11 +301,11 @@ impl ConnectPolicy {
             )));
         }
 
-        Ok(ResolvedConnectTarget {
-            host: host.to_string(),
+        Ok(ResolvedConnectTarget::from_authorized_addrs(
+            host,
             port,
-            addrs: authorized_addrs,
-        })
+            authorized_addrs,
+        ))
     }
 
     fn is_ip_allowed(&self, ip: IpAddr) -> bool {
@@ -281,17 +315,25 @@ impl ConnectPolicy {
             .any(|cidr| cidr.contains(ip))
     }
 
+    #[cfg(test)]
     fn is_domain_allowed(&self, host: &str) -> bool {
-        let host = normalize_domain(host);
-        if host.is_empty() {
+        normalize_lenient_host(host)
+            .ok()
+            .is_some_and(|host| self.is_normalized_host_allowed(&host))
+    }
+
+    #[cfg(test)]
+    fn is_normalized_host_allowed(&self, host: &NormalizedHost) -> bool {
+        let NormalizedHost::Domain(host) = host else {
             return false;
-        }
-        self.allow_domains.iter().any(|allowed| {
-            host == *allowed
-                || (host.len() > allowed.len()
-                    && host.ends_with(allowed)
-                    && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
-        })
+        };
+        self.is_normalized_domain_allowed(host)
+    }
+
+    fn is_normalized_domain_allowed(&self, host: &NormalizedDomain) -> bool {
+        self.allow_domains
+            .iter()
+            .any(|allowed| host.matches_suffix(allowed))
     }
 
     fn disallowed_port_reason(&self, port: u16) -> String {
@@ -314,25 +356,6 @@ impl ConnectPolicy {
                 .join(", ")
         )
     }
-}
-
-fn normalize_domain(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-}
-
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
-
-fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
 }
 
 fn default_denied_cidrs() -> Vec<ConnectCidr> {
@@ -360,13 +383,19 @@ fn default_denied_cidrs() -> Vec<ConnectCidr> {
     .collect()
 }
 
-async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+async fn resolve_host(host: &RequestedHost, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if let Some(ip) = host.canonical_ip() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let resolved = lookup_host((host, port)).await?;
-    collect_resolved_addrs_with_limit(host, resolved, MAX_RESOLVED_CONNECT_ADDRS)
+    let query_name = host.dns_query_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host {} cannot be resolved through DNS", host),
+        )
+    })?;
+    let resolved = lookup_host((query_name.as_ref(), port)).await?;
+    collect_resolved_addrs_with_limit(query_name.as_ref(), resolved, MAX_RESOLVED_CONNECT_ADDRS)
 }
 
 fn collect_resolved_addrs_with_limit(
@@ -428,6 +457,10 @@ impl From<ConnectPolicyError> for io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_host(value: &str) -> RequestedHost {
+        RequestedHost::parse_inferred(value).unwrap()
+    }
 
     #[test]
     fn cidr_contains_ipv4() {
@@ -491,7 +524,7 @@ mod tests {
     async fn blocks_private_ipv4_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("127.0.0.1", 443)
+            .resolve_and_authorize(&request_host("127.0.0.1"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -501,7 +534,7 @@ mod tests {
     async fn blocks_ipv4_mapped_ipv6_loopback_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .resolve_and_authorize(&request_host("::ffff:127.0.0.1"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -517,7 +550,7 @@ mod tests {
         let policy = ConnectPolicy::from_config(config);
 
         let result = policy
-            .resolve_and_authorize("::ffff:127.0.0.1", 443)
+            .resolve_and_authorize(&request_host("::ffff:127.0.0.1"), 443)
             .await
             .unwrap();
 
@@ -529,10 +562,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_numeric_domain_uses_dns_and_checks_resolved_ip_threats() {
+        let config = ConnectPolicyConfig {
+            allow_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            threat_index: Some("||127.0.0.1^".parse::<ThreatIndex>().unwrap()),
+            threat_action: ThreatAction::Block,
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+        let host = RequestedHost::parse_domain("127.0.0.1").unwrap();
+
+        let target = policy.resolve_and_authorize(&host, 443).await.unwrap();
+
+        assert_eq!(target.resolution_source, ResolutionSource::Dns);
+        assert_eq!(
+            policy.resolved_threat_matches(&target),
+            vec![ThreatMatch::Ip {
+                raw_host: "127.0.0.1".to_string(),
+                matched_ip: "127.0.0.1".parse().unwrap(),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn blocks_ipv4_multicast_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("224.0.0.1", 443)
+            .resolve_and_authorize(&request_host("224.0.0.1"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -542,7 +598,7 @@ mod tests {
     async fn blocks_ipv4_reserved_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("240.0.0.1", 443)
+            .resolve_and_authorize(&request_host("240.0.0.1"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -552,7 +608,7 @@ mod tests {
     async fn blocks_ipv6_multicast_by_default() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("ff02::1", 443)
+            .resolve_and_authorize(&request_host("ff02::1"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -566,7 +622,9 @@ mod tests {
         };
         config.allow_cidrs.push("127.0.0.0/8".parse().unwrap());
         let policy = ConnectPolicy::from_config(config);
-        let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        let result = policy
+            .resolve_and_authorize(&request_host("127.0.0.1"), 443)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -574,7 +632,7 @@ mod tests {
     async fn blocks_disallowed_port() {
         let policy = ConnectPolicy::from_config(ConnectPolicyConfig::default());
         let err = policy
-            .resolve_and_authorize("example.com", 22)
+            .resolve_and_authorize(&request_host("example.com"), 22)
             .await
             .unwrap_err();
         let ConnectPolicyError::Denied(reason) = err else {
@@ -592,7 +650,7 @@ mod tests {
         };
         let policy = ConnectPolicy::from_config(config);
         let err = policy
-            .resolve_and_authorize("example.com", 443)
+            .resolve_and_authorize(&request_host("example.com"), 443)
             .await
             .unwrap_err();
         assert!(matches!(err, ConnectPolicyError::Denied(_)));
@@ -607,7 +665,7 @@ mod tests {
         let policy = ConnectPolicy::from_config(config);
 
         let err = policy
-            .resolve_and_authorize("example.com", 443)
+            .resolve_and_authorize(&request_host("example.com"), 443)
             .await
             .unwrap_err();
 
@@ -628,7 +686,9 @@ mod tests {
             ..ConnectPolicyConfig::default()
         };
         let policy = ConnectPolicy::from_config(config);
-        let result = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        let result = policy
+            .resolve_and_authorize(&request_host("127.0.0.1"), 443)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -642,10 +702,14 @@ mod tests {
         };
         let policy = ConnectPolicy::from_config(config);
 
-        let allowed = policy.resolve_and_authorize("127.0.0.1", 443).await;
+        let allowed = policy
+            .resolve_and_authorize(&request_host("127.0.0.1"), 443)
+            .await;
         assert!(allowed.is_ok());
 
-        let denied = policy.resolve_and_authorize("127.0.0.1", 0).await;
+        let denied = policy
+            .resolve_and_authorize(&request_host("127.0.0.1"), 0)
+            .await;
         assert!(matches!(denied, Err(ConnectPolicyError::Denied(_))));
     }
 
@@ -671,7 +735,9 @@ mod tests {
         };
         config.allow_domains.push("localhost".to_string());
         let policy = ConnectPolicy::from_config(config);
-        let result = policy.resolve_and_authorize("localhost", 443).await;
+        let result = policy
+            .resolve_and_authorize(&request_host("localhost"), 443)
+            .await;
         assert!(matches!(result, Err(ConnectPolicyError::Denied(_))));
     }
 
@@ -684,5 +750,18 @@ mod tests {
         let policy = ConnectPolicy::from_config(config);
         assert!(policy.is_domain_allowed("api.example.com"));
         assert!(policy.is_domain_allowed("example.com"));
+    }
+
+    #[test]
+    fn allow_domain_uses_idna_and_trailing_dot_normalization() {
+        let config = ConnectPolicyConfig {
+            allow_domains: vec![".BÜCHER.DE.".to_string()],
+            ..ConnectPolicyConfig::default()
+        };
+        let policy = ConnectPolicy::from_config(config);
+
+        assert!(policy.is_domain_allowed("api.bücher.de"));
+        assert!(policy.is_domain_allowed("XN--BCHER-KVA.DE."));
+        assert!(!policy.is_domain_allowed("notbücher.de"));
     }
 }

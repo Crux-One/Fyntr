@@ -7,11 +7,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use idna::AsciiDenyList;
 use log::{info, warn};
 use unicode_script::{Script, UnicodeScript};
 
-use crate::flow::FlowId;
+use crate::{
+    connect_target::{NormalizedHost, RequestedHost, canonicalize_ip, normalize_lenient_host},
+    flow::FlowId,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThreatIndex {
@@ -131,7 +133,7 @@ pub(crate) fn log_mixed_script_host_for_target(
         return;
     }
 
-    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_host(raw_host) else {
+    let Ok(NormalizedHost::Domain(ascii_host)) = normalize_lenient_host(raw_host) else {
         return;
     };
 
@@ -231,17 +233,30 @@ impl ThreatIndex {
         Ok((Self { domains, ips }, stats))
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_host(&self, host: &str) -> Option<ThreatMatch> {
-        let ascii_host = match normalize_host(host).ok()? {
-            NormalizedHost::Domain(domain) => domain,
-            NormalizedHost::Ip(ip) => return self.lookup_ip(host, ip),
-        };
+        match normalize_lenient_host(host).ok()? {
+            NormalizedHost::Domain(domain) => self.lookup_domain(host, domain.as_str()),
+            NormalizedHost::Ip(ip) => self.lookup_ip(host, ip),
+        }
+    }
+
+    pub(crate) fn lookup_requested_host(&self, host: &RequestedHost) -> Option<ThreatMatch> {
+        match (host.normalized_domain(), host.canonical_ip()) {
+            (Some(domain), None) => self.lookup_domain(host.raw(), domain.as_str()),
+            (None, Some(ip)) => self.lookup_ip(host.raw(), ip),
+            _ => None,
+        }
+    }
+
+    fn lookup_domain(&self, raw_host: &str, normalized_domain: &str) -> Option<ThreatMatch> {
+        let ascii_host = normalized_domain.to_string();
 
         let mut candidate = ascii_host.as_str();
         loop {
             if let Some(matched_domain) = self.domains.get(candidate) {
                 return Some(ThreatMatch::Domain {
-                    raw_host: host.to_string(),
+                    raw_host: raw_host.to_string(),
                     ascii_host,
                     matched_domain: matched_domain.clone(),
                 });
@@ -276,19 +291,6 @@ enum NormalizedEntry {
     Ip(IpAddr),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NormalizedHost {
-    Domain(String),
-    Ip(IpAddr),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum HostNormalizeError {
-    Empty,
-    Idna,
-    InvalidDomain,
-}
-
 fn parse_feed_line(line: &str) -> FeedLine<'_> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('#') {
@@ -317,42 +319,12 @@ fn parse_feed_line(line: &str) -> FeedLine<'_> {
 }
 
 fn normalize_entry(value: &str) -> Option<NormalizedEntry> {
-    match normalize_host(value).ok()? {
-        NormalizedHost::Domain(domain) => Some(NormalizedEntry::Domain(domain.into_boxed_str())),
+    match normalize_lenient_host(value).ok()? {
+        NormalizedHost::Domain(domain) => Some(NormalizedEntry::Domain(
+            domain.into_string().into_boxed_str(),
+        )),
         NormalizedHost::Ip(ip) => Some(NormalizedEntry::Ip(ip)),
     }
-}
-
-pub(crate) fn normalize_host(
-    value: &str,
-) -> std::result::Result<NormalizedHost, HostNormalizeError> {
-    let mut host = value.trim();
-    if host.is_empty() {
-        return Err(HostNormalizeError::Empty);
-    }
-
-    if let Some(stripped) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        host = stripped;
-    }
-
-    let host = host.trim_end_matches('.');
-    if host.is_empty() {
-        return Err(HostNormalizeError::Empty);
-    }
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(NormalizedHost::Ip(canonicalize_ip(ip)));
-    }
-
-    let ascii_host = idna::domain_to_ascii_cow(host.as_bytes(), AsciiDenyList::URL)
-        .map_err(|_| HostNormalizeError::Idna)?
-        .into_owned();
-
-    if !is_valid_domain(&ascii_host) {
-        return Err(HostNormalizeError::InvalidDomain);
-    }
-
-    Ok(NormalizedHost::Domain(ascii_host))
 }
 
 pub(crate) fn has_mixed_scripts(host: &str) -> bool {
@@ -380,27 +352,6 @@ fn label_has_mixed_strong_scripts(label: &str) -> bool {
     }
 
     false
-}
-
-fn is_valid_domain(value: &str) -> bool {
-    if value.len() > 253 || value.starts_with('.') || value.ends_with('.') {
-        return false;
-    }
-
-    value.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
-}
-
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(addr) => addr.to_ipv4().map_or(IpAddr::V6(addr), IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
 }
 
 impl FromStr for ThreatIndex {
@@ -510,22 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_ascii_domains() {
-        assert_eq!(
-            normalize_host(" EVIL.COM. ").unwrap(),
-            NormalizedHost::Domain("evil.com".to_string())
-        );
-    }
-
-    #[test]
-    fn converts_idna_domains_to_ascii() {
-        assert_eq!(
-            normalize_host("bücher.de").unwrap(),
-            NormalizedHost::Domain("xn--bcher-kva.de".to_string())
-        );
-    }
-
-    #[test]
     fn normalizes_idna_feed_entries_before_insertion() {
         let (index, stats) = ThreatIndex::from_feed_content("||bücher.de^\n").unwrap();
 
@@ -546,6 +481,31 @@ mod tests {
                 matched_domain: "xn--bcher-kva.de".into(),
             })
         );
+    }
+
+    #[test]
+    fn matches_typed_request_domains_and_literal_ips_without_reclassification() {
+        let index: ThreatIndex = "||evil.com^\n||1.2.3.4^".parse().unwrap();
+        let domain = RequestedHost::parse_domain("API.EVIL.COM.").unwrap();
+        let literal_ip = RequestedHost::from_ip("1.2.3.4".parse().unwrap());
+        let numeric_domain = RequestedHost::parse_domain("1.2.3.4").unwrap();
+
+        assert_eq!(
+            index.lookup_requested_host(&domain),
+            Some(ThreatMatch::Domain {
+                raw_host: "API.EVIL.COM.".to_string(),
+                ascii_host: "api.evil.com".to_string(),
+                matched_domain: "evil.com".into(),
+            })
+        );
+        assert_eq!(
+            index.lookup_requested_host(&literal_ip),
+            Some(ThreatMatch::Ip {
+                raw_host: "1.2.3.4".to_string(),
+                matched_ip: "1.2.3.4".parse().unwrap(),
+            })
+        );
+        assert_eq!(index.lookup_requested_host(&numeric_domain), None);
     }
 
     #[test]
@@ -623,14 +583,6 @@ mod tests {
                 raw_host: "::ffff:1.2.3.4".to_string(),
                 matched_ip: "1.2.3.4".parse().unwrap()
             })
-        );
-    }
-
-    #[test]
-    fn excludes_ip_literals_from_idna_normalization() {
-        assert_eq!(
-            normalize_host("::ffff:1.2.3.4").unwrap(),
-            NormalizedHost::Ip("1.2.3.4".parse().unwrap())
         );
     }
 

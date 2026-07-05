@@ -6,8 +6,9 @@ use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 
-use crate::limits::{
-    MAX_HEADER_BYTES, MAX_HEADER_LINE_BYTES, MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES,
+use crate::{
+    connect_target::RequestedHost,
+    limits::{MAX_HEADER_BYTES, MAX_HEADER_LINE_BYTES, MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +117,7 @@ impl RequestLine {
     /// Examples:
     /// "api.aws.amazon.com:443" -> ("api.aws.amazon.com", 443)
     /// "[2001:db8::1]:443" -> ("2001:db8::1", 443)
-    pub(crate) fn parse_connect_target(&self) -> Result<(String, u16)> {
+    pub(crate) fn parse_connect_target(&self) -> Result<(RequestedHost, u16)> {
         if !self.is_connect_method() {
             return Err(anyhow!("Not a CONNECT request"));
         }
@@ -125,19 +126,19 @@ impl RequestLine {
     }
 }
 
-fn parse_connect_authority(target: &str) -> Result<(String, u16)> {
+fn parse_connect_authority(target: &str) -> Result<(RequestedHost, u16)> {
     if let Some(target) = target.strip_prefix('[') {
         let (host, remainder) = target
             .split_once(']')
             .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
-        if host.is_empty() || host.parse::<Ipv6Addr>().is_err() {
-            return Err(anyhow!("Invalid CONNECT target"));
-        }
+        let ip = host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| anyhow!("Invalid CONNECT target"))?;
         let port = remainder
             .strip_prefix(':')
             .ok_or_else(|| anyhow!("Invalid CONNECT target"))?;
         let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
-        return Ok((host.to_string(), port));
+        return Ok((RequestedHost::from_ip_with_raw(host, ip.into()), port));
     }
 
     let (host, port) = target
@@ -148,7 +149,10 @@ fn parse_connect_authority(target: &str) -> Result<(String, u16)> {
     }
     let port = port.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?;
 
-    Ok((host.to_string(), port))
+    let host = RequestedHost::parse_inferred(host)
+        .map_err(|err| anyhow!("Invalid CONNECT target: {}", err))?;
+
+    Ok((host, port))
 }
 
 /// Reads the first line (request line) of an HTTP request from the given BufReader.
@@ -260,16 +264,33 @@ mod tests {
         let line = "CONNECT api.aws.amazon.com:443 HTTP/1.1";
         let req = RequestLine::parse(line).unwrap();
         let (host, port) = req.parse_connect_target().unwrap();
-        assert_eq!(host, "api.aws.amazon.com");
+        assert_eq!(host.raw(), "api.aws.amazon.com");
+        assert!(host.normalized_domain().is_some());
         assert_eq!(port, 443);
     }
 
     #[test]
     fn test_parse_connect_target_bracketed_ipv6() {
-        let line = "CONNECT [2001:db8::1]:443 HTTP/1.1";
+        let line = "CONNECT [2001:0db8:0:0:0:0:0:1]:443 HTTP/1.1";
         let req = RequestLine::parse(line).unwrap();
         let (host, port) = req.parse_connect_target().unwrap();
-        assert_eq!(host, "2001:db8::1");
+        assert_eq!(host.raw(), "2001:0db8:0:0:0:0:0:1");
+        assert_eq!(host.canonical_ip(), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_connect_target_preserves_absolute_idna_domain() {
+        let req = RequestLine::parse("CONNECT BÜCHER.DE.:443 HTTP/1.1").unwrap();
+
+        let (host, port) = req.parse_connect_target().unwrap();
+
+        assert_eq!(host.raw(), "BÜCHER.DE.");
+        assert_eq!(
+            host.normalized_domain().unwrap().as_str(),
+            "xn--bcher-kva.de"
+        );
+        assert_eq!(host.dns_query_name().as_deref(), Some("xn--bcher-kva.de."));
         assert_eq!(port, 443);
     }
 
@@ -323,6 +344,15 @@ mod tests {
         let req = RequestLine::parse("CONNECT [example.invalid]:443 HTTP/1.1").unwrap();
         let err = req.parse_connect_target().unwrap_err();
         assert!(err.to_string().contains("Invalid CONNECT target"));
+    }
+
+    #[test]
+    fn test_parse_connect_target_rejects_multiple_trailing_dots() {
+        let req = RequestLine::parse("CONNECT example.invalid..:443 HTTP/1.1").unwrap();
+
+        let err = req.parse_connect_target().unwrap_err();
+
+        assert!(err.to_string().contains("multiple trailing dots"));
     }
 
     #[test]
