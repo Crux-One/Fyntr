@@ -23,9 +23,8 @@
 
 ## About
 
-Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy for constrained networks that keeps them responsive under bursty outbound TLS traffic.
-It runs as an HTTP CONNECT proxy with Deficit Round-Robin traffic shaping and optional threat-feed blocking.
-No server-side configuration, no inspection, and low baseline memory use.
+Fyntr *(/ˈfɪn.tər/)* is a minimal forward proxy for constrained networks. It helps keep networks responsive under bursty outbound TLS traffic with Deficit Round-Robin traffic shaping.
+It acts as an HTTP CONNECT proxy, can block destination hosts using external threat intelligence sources, and requires no server-side changes or traffic inspection.
 
 ## Quick Start
 
@@ -49,9 +48,8 @@ Verify the proxy:
   ```
 
 ## Documentation
-[Fyntr Docs][10]
 
-[10]:https://defrag-0am.blog/projects/fyntr/
+See [Fyntr Docs][10] for configuration details and usage notes.
 
 ## Examples
 
@@ -94,3 +92,5 @@ fyntr --socks5-port 1080
 1. In certain environments, DRR scheduling can reduce upload throughput, especially on low-spec hardware, as a trade-off for more stable responsiveness.
 2. Fyntr supports HTTP CONNECT tunneling and optional SOCKS5 CONNECT tunneling, but does not support plain HTTP proxying, SOCKS5 UDP ASSOCIATE, or SOCKS5 BIND.
 3. Fyntr has no built-in authentication. Exposing a public bind address can allow unauthorized proxy use.
+
+[10]:https://defrag-0am.blog/projects/fyntr/
