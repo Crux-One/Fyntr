@@ -17,10 +17,10 @@ path = "src/main.rs"
 [dependencies]
 actix = "0.13"
 actix-rt = "2.11.0"
-tokio = { version = "1.52.3", features = ["full"] }
-anyhow = "1.0.103"
-bytes = "1.12.0"
-clap = { version = "4.6.1", features = ["derive", "env"] }
+tokio = { version = "1.53.1", features = ["full"] }
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.3", features = ["derive", "env"] }
 env_logger = "0.11.11"
 log = "0.4.33"
 idna = "1.1.0"
