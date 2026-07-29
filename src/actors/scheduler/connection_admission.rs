@@ -10,7 +10,6 @@ use crate::{
 
 pub(super) struct ConnectionAdmission {
     limiter: ConnectionLimiter,
-    pending_connection_tasks: usize,
     pending_connection_task_ids: HashSet<FlowId>,
 }
 
@@ -18,7 +17,6 @@ impl ConnectionAdmission {
     pub(super) fn new() -> Self {
         Self {
             limiter: ConnectionLimiter::new(),
-            pending_connection_tasks: 0,
             pending_connection_task_ids: HashSet::new(),
         }
     }
@@ -36,17 +34,17 @@ impl ConnectionAdmission {
     }
 
     pub(super) fn pending_connection_tasks(&self) -> usize {
-        self.pending_connection_tasks
+        self.pending_connection_task_ids.len()
     }
 
-    pub(super) fn try_start_connection_task(
+    pub(super) fn try_reserve_connection_task(
         &mut self,
         flow_id: FlowId,
     ) -> Result<(), RegisterError> {
         if let Some(limit) = self.max_connections() {
             let in_flight = self
                 .current_connection_count()
-                .saturating_add(self.pending_connection_tasks);
+                .saturating_add(self.pending_connection_tasks());
             if in_flight >= limit.get() {
                 return Err(RegisterError::MaxConnectionsReached { max: limit.get() });
             }
@@ -60,33 +58,28 @@ impl ConnectionAdmission {
             return Err(RegisterError::DuplicateConnectionTask { flow_id });
         }
 
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_add(1);
         self.log_pending_connection_task_diagnostics("started");
         Ok(())
     }
 
-    pub(super) fn finish_pending_connection_task(&mut self, flow_id: FlowId) -> bool {
+    pub(super) fn release_connection_task_reservation(&mut self, flow_id: FlowId) -> bool {
         if !self.pending_connection_task_ids.remove(&flow_id) {
             return false;
         }
 
-        if self.pending_connection_tasks == 0 {
-            warn!("connection task finished but pending counter is already zero");
-        }
-        self.pending_connection_tasks = self.pending_connection_tasks.saturating_sub(1);
         self.log_pending_connection_task_diagnostics("finished");
         true
     }
 
-    pub(super) fn try_acquire_registered(&self) -> Result<(), RegisterError> {
+    pub(super) fn try_acquire_registered_connection(&self) -> Result<(), RegisterError> {
         self.limiter.try_acquire()
     }
 
-    pub(super) fn release_registered(&self) {
+    pub(super) fn release_registered_connection(&self) {
         self.limiter.release();
     }
 
-    pub(super) fn can_accept_connection(&self) -> bool {
+    pub(super) fn has_registered_capacity(&self) -> bool {
         match self.max_connections() {
             Some(limit) => self.current_connection_count() < limit.get(),
             None => true,
@@ -94,7 +87,7 @@ impl ConnectionAdmission {
     }
 
     fn log_pending_connection_task_diagnostics(&self, action: &str) {
-        let pending = self.pending_connection_tasks;
+        let pending = self.pending_connection_tasks();
         if !should_log_pending_connection_task_diagnostics(pending) {
             return;
         }

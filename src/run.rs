@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     actors::scheduler::{
         PendingConnectionReservation, Scheduler, Shutdown as SchedulerShutdown,
-        TryStartConnectionTask,
+        TryReserveConnectionTask,
     },
     flow::FlowId,
     http::connect::handle_connect_proxy,
@@ -626,7 +626,7 @@ async fn run_server(
         );
 
         let scheduler = scheduler.clone();
-        let pending_reservation = match scheduler.send(TryStartConnectionTask { flow_id }).await {
+        let pending_reservation = match scheduler.send(TryReserveConnectionTask { flow_id }).await {
             Ok(Ok(())) => PendingConnectionReservation::new(scheduler.clone(), flow_id),
             Ok(Err(err)) => {
                 warn!(
