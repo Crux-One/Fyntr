@@ -655,7 +655,7 @@ mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
-        actors::scheduler::TryStartConnectionTask,
+        actors::scheduler::TryReserveConnectionTask,
         connect_target::{NormalizedHost, normalize_lenient_host},
         http::request::RequestLine,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
@@ -726,7 +726,7 @@ mod tests {
             let (stream, peer) = listener.accept().await.unwrap();
             let flow_id = FlowId(1);
             let pending_reservation = scheduler
-                .send(TryStartConnectionTask { flow_id })
+                .send(TryReserveConnectionTask { flow_id })
                 .await
                 .unwrap()
                 .map_or_else(

@@ -676,7 +676,7 @@ impl Socks5Session {
 mod tests {
     use super::*;
     use crate::{
-        actors::scheduler::TryStartConnectionTask, limits::max_connections_from_raw,
+        actors::scheduler::TryReserveConnectionTask, limits::max_connections_from_raw,
         security::connect_policy::ConnectPolicyConfig, test_utils::make_backend_write,
         threat::ThreatIndex,
     };
@@ -701,7 +701,7 @@ mod tests {
             let (stream, peer) = listener.accept().await.unwrap();
             let flow_id = FlowId(1);
             let pending_reservation = scheduler
-                .send(TryStartConnectionTask { flow_id })
+                .send(TryReserveConnectionTask { flow_id })
                 .await
                 .unwrap()
                 .map_or_else(

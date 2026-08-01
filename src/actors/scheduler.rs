@@ -43,7 +43,7 @@ pub(crate) struct CanAcceptConnection;
 
 #[derive(Message)]
 #[rtype(result = "Result<(), RegisterError>")]
-pub(crate) struct TryStartConnectionTask {
+pub(crate) struct TryReserveConnectionTask {
     pub flow_id: FlowId,
 }
 
@@ -215,11 +215,11 @@ impl Handler<Shutdown> for Scheduler {
     }
 }
 
-impl Handler<TryStartConnectionTask> for Scheduler {
+impl Handler<TryReserveConnectionTask> for Scheduler {
     type Result = Result<(), RegisterError>;
 
-    fn handle(&mut self, msg: TryStartConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
-        self.admission.try_start_connection_task(msg.flow_id)
+    fn handle(&mut self, msg: TryReserveConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
+        self.admission.try_reserve_connection_task(msg.flow_id)
     }
 }
 
@@ -227,7 +227,7 @@ impl Handler<ConnectionTaskFinished> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
-        self.finish_pending_connection_task(msg.flow_id);
+        self.release_connection_task_reservation(msg.flow_id);
 
         if self.should_stop() {
             ctx.stop();
@@ -270,19 +270,19 @@ impl Scheduler {
     }
 
     fn try_increment_connection_count(&self) -> Result<(), RegisterError> {
-        self.admission.try_acquire_registered()
+        self.admission.try_acquire_registered_connection()
     }
 
     fn decrement_connection_count(&self) {
-        self.admission.release_registered();
+        self.admission.release_registered_connection();
     }
 
     fn current_connection_count(&self) -> usize {
         self.admission.current_connection_count()
     }
 
-    fn finish_pending_connection_task(&mut self, flow_id: FlowId) -> bool {
-        self.admission.finish_pending_connection_task(flow_id)
+    fn release_connection_task_reservation(&mut self, flow_id: FlowId) -> bool {
+        self.admission.release_connection_task_reservation(flow_id)
     }
 
     fn max_connections(&self) -> MaxConnections {
@@ -323,7 +323,7 @@ impl Scheduler {
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
         tunnel_lifecycle: TunnelLifecycle,
     ) {
-        self.finish_pending_connection_task(id);
+        self.release_connection_task_reservation(id);
         self.flows.insert(
             id,
             FlowEntry::new(queue_addr, backend_write, tunnel_lifecycle),
@@ -383,7 +383,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
     type Result = bool;
 
     fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
-        self.admission.can_accept_connection()
+        self.admission.has_registered_capacity()
     }
 }
 
@@ -1058,13 +1058,13 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn try_start_connection_task_respects_active_and_pending_limit() {
+    async fn try_reserve_connection_task_respects_registered_and_pending_limit() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(max_connections_from_raw(2))
             .start();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap()
             .unwrap();
@@ -1083,7 +1083,7 @@ mod tests {
             .unwrap();
 
         let result = scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(2) })
             .await
             .unwrap();
         assert!(
@@ -1093,13 +1093,13 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn try_start_connection_task_allows_new_task_after_pending_finishes() {
+    async fn try_reserve_connection_task_allows_new_task_after_release() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(max_connections_from_raw(1))
             .start();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap()
             .unwrap();
@@ -1109,26 +1109,26 @@ mod tests {
             .unwrap();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(2) })
             .await
             .unwrap()
             .unwrap();
     }
 
     #[actix_rt::test]
-    async fn try_start_connection_task_rejects_duplicate_flow_id() {
+    async fn try_reserve_connection_task_rejects_duplicate_flow_id() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
             .with_max_connections(max_connections_from_raw(2))
             .start();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap()
             .unwrap();
 
         let result = scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap();
         assert!(
@@ -1142,7 +1142,7 @@ mod tests {
         let reply = scheduler.send(super::InspectState).await.unwrap();
         assert_eq!(
             reply.pending_connection_tasks, 1,
-            "duplicate reservations should not increment the pending counter"
+            "duplicate reservations should not add another pending flow ID"
         );
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
             .start();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap()
             .unwrap();
@@ -1179,7 +1179,7 @@ mod tests {
         );
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(2) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(2) })
             .await
             .unwrap()
             .unwrap();
@@ -1277,7 +1277,7 @@ mod tests {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
 
         scheduler
-            .send(TryStartConnectionTask { flow_id: FlowId(1) })
+            .send(TryReserveConnectionTask { flow_id: FlowId(1) })
             .await
             .unwrap()
             .unwrap();

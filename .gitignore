@@ -1,1 +1,7 @@
+/.agents
 /target
+
+*.html
+*.txt
+
+AGENTS.md
