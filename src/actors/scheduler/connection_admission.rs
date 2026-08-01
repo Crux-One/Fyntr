@@ -64,6 +64,10 @@ impl ConnectionAdmission {
 
     pub(super) fn release_connection_task_reservation(&mut self, flow_id: FlowId) -> bool {
         if !self.pending_connection_task_ids.remove(&flow_id) {
+            warn!(
+                "flow{}: connection task reservation was not pending when released",
+                flow_id.0
+            );
             return false;
         }
 
