@@ -1118,7 +1118,7 @@ mod tests {
     #[actix_rt::test]
     async fn try_reserve_connection_task_rejects_duplicate_flow_id() {
         let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
-            .with_max_connections(max_connections_from_raw(2))
+            .with_max_connections(max_connections_from_raw(1))
             .start();
 
         scheduler

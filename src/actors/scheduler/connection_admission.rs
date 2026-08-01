@@ -41,6 +41,14 @@ impl ConnectionAdmission {
         &mut self,
         flow_id: FlowId,
     ) -> Result<(), RegisterError> {
+        if self.pending_connection_task_ids.contains(&flow_id) {
+            warn!(
+                "flow{}: duplicate pending connection task reservation",
+                flow_id.0
+            );
+            return Err(RegisterError::DuplicateConnectionTask { flow_id });
+        }
+
         if let Some(limit) = self.max_connections() {
             let in_flight = self
                 .current_connection_count()
@@ -50,13 +58,7 @@ impl ConnectionAdmission {
             }
         }
 
-        if !self.pending_connection_task_ids.insert(flow_id) {
-            warn!(
-                "flow{}: duplicate pending connection task reservation",
-                flow_id.0
-            );
-            return Err(RegisterError::DuplicateConnectionTask { flow_id });
-        }
+        self.pending_connection_task_ids.insert(flow_id);
 
         self.log_pending_connection_task_diagnostics("reserved");
         Ok(())
