@@ -266,6 +266,15 @@ pub struct ServerBuilder {
     socks5_port: Option<u16>,
 }
 
+/// Server values that have been resolved and validated for startup.
+struct ValidatedServerConfig {
+    bind_addrs: Vec<SocketAddr>,
+    socks5_bind_addrs: Option<Vec<SocketAddr>>,
+    max_connections: MaxConnections,
+    idle_timeout: Option<Duration>,
+    connect_policy: Arc<ConnectPolicy>,
+}
+
 impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
@@ -421,35 +430,15 @@ impl ServerBuilder {
     /// Runs the server in the background and returns a handle for shutdown.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn background(mut self) -> Result<ServerHandle> {
-        let bind_addrs = self.bind.clone().resolve(self.port).await?;
-        let socks5_bind_addrs = self.resolve_socks5_bind_addrs().await?;
-        let connect_policy = Arc::new(self.build_connect_policy()?);
-        start_with_addrs(
-            bind_addrs,
-            socks5_bind_addrs,
-            self.max_connections,
-            self.idle_timeout,
-            connect_policy,
-        )
-        .await
+    pub async fn background(self) -> Result<ServerHandle> {
+        start_with_config(self.validate().await?).await
     }
 
     /// Runs the server in the foreground to completion without returning a handle.
     ///
     /// Returns an error if address resolution or binding fails.
-    pub async fn foreground(mut self) -> Result<()> {
-        let bind_addrs = self.bind.clone().resolve(self.port).await?;
-        let socks5_bind_addrs = self.resolve_socks5_bind_addrs().await?;
-        let connect_policy = Arc::new(self.build_connect_policy()?);
-        server_with_addrs(
-            bind_addrs,
-            socks5_bind_addrs,
-            self.max_connections,
-            self.idle_timeout,
-            connect_policy,
-        )
-        .await
+    pub async fn foreground(self) -> Result<()> {
+        server_with_config(self.validate().await?).await
     }
 
     #[deprecated(note = "use background() instead")]
@@ -473,6 +462,20 @@ impl ServerBuilder {
             .unwrap_or_else(|| self.bind.clone());
         Ok(Some(bind.resolve(port).await?))
     }
+
+    async fn validate(mut self) -> Result<ValidatedServerConfig> {
+        let bind_addrs = self.bind.clone().resolve(self.port).await?;
+        let socks5_bind_addrs = self.resolve_socks5_bind_addrs().await?;
+        let connect_policy = Arc::new(self.build_connect_policy()?);
+
+        Ok(ValidatedServerConfig {
+            bind_addrs,
+            socks5_bind_addrs,
+            max_connections: cap_max_connections(self.max_connections),
+            idle_timeout: self.idle_timeout,
+            connect_policy,
+        })
+    }
 }
 
 /// Creates a new `ServerBuilder` with default settings.
@@ -480,38 +483,26 @@ pub fn server() -> ServerBuilder {
     ServerBuilder::new()
 }
 
-async fn server_with_addrs(
-    bind_addrs: Vec<SocketAddr>,
-    socks5_bind_addrs: Option<Vec<SocketAddr>>,
-    max_connections: MaxConnections,
-    idle_timeout: Option<Duration>,
-    connect_policy: Arc<ConnectPolicy>,
-) -> Result<()> {
-    let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
-    let socks5_listener = prepare_optional_listener(socks5_bind_addrs).await?;
+async fn server_with_config(config: ValidatedServerConfig) -> Result<()> {
+    let listener = prepare_listener(config.bind_addrs, config.max_connections).await?;
+    let socks5_listener = prepare_optional_listener(config.socks5_bind_addrs).await?;
     run_server(
         listener,
         socks5_listener,
-        max_connections,
-        idle_timeout,
-        connect_policy,
+        config.max_connections,
+        config.idle_timeout,
+        config.connect_policy,
         None,
     )
     .await
 }
 
-async fn start_with_addrs(
-    bind_addrs: Vec<SocketAddr>,
-    socks5_bind_addrs: Option<Vec<SocketAddr>>,
-    max_connections: MaxConnections,
-    idle_timeout: Option<Duration>,
-    connect_policy: Arc<ConnectPolicy>,
-) -> Result<ServerHandle> {
-    let (listener, max_connections) = prepare_listener(bind_addrs, max_connections).await?;
+async fn start_with_config(config: ValidatedServerConfig) -> Result<ServerHandle> {
+    let listener = prepare_listener(config.bind_addrs, config.max_connections).await?;
     let listen_addr = listener
         .local_addr()
         .context("failed to resolve listen address")?;
-    let socks5_listener = prepare_optional_listener(socks5_bind_addrs).await?;
+    let socks5_listener = prepare_optional_listener(config.socks5_bind_addrs).await?;
     let socks5_listen_addr = socks5_listener
         .as_ref()
         .map(TcpListener::local_addr)
@@ -521,9 +512,9 @@ async fn start_with_addrs(
     let join_handle = actix::spawn(run_server(
         listener,
         socks5_listener,
-        max_connections,
-        idle_timeout,
-        connect_policy,
+        config.max_connections,
+        config.idle_timeout,
+        config.connect_policy,
         Some(shutdown_rx),
     ));
 
@@ -547,14 +538,13 @@ async fn prepare_optional_listener(
 async fn prepare_listener(
     bind_addrs: Vec<SocketAddr>,
     max_connections: MaxConnections,
-) -> Result<(TcpListener, MaxConnections)> {
+) -> Result<TcpListener> {
     if bind_addrs.is_empty() {
         return Err(anyhow!("no bind addresses resolved"));
     }
-    let max_connections = cap_max_connections(max_connections);
     ensure_nofile_limits(max_connections);
 
-    Ok((bind_listener(bind_addrs).await?, max_connections))
+    bind_listener(bind_addrs).await
 }
 
 async fn bind_listener(bind_addrs: Vec<SocketAddr>) -> Result<TcpListener> {
@@ -976,6 +966,26 @@ mod tests {
 
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--threat-feed-file"));
+    }
+
+    #[actix_rt::test]
+    async fn validate_resolves_startup_values_before_running_server() {
+        let config = ServerBuilder::new()
+            .bind("127.0.0.1")
+            .port(8123)
+            .max_connections(7)
+            .idle_timeout(Duration::from_secs(42))
+            .validate()
+            .await
+            .expect("valid startup configuration");
+
+        assert_eq!(
+            config.bind_addrs,
+            vec!["127.0.0.1:8123".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(config.socks5_bind_addrs, None);
+        assert_eq!(config.max_connections, max_connections_from_raw(7));
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(42)));
     }
 
     #[test]
