@@ -58,7 +58,7 @@ impl ConnectionAdmission {
             return Err(RegisterError::DuplicateConnectionTask { flow_id });
         }
 
-        self.log_pending_connection_task_diagnostics("started");
+        self.log_pending_connection_task_diagnostics("reserved");
         Ok(())
     }
 
@@ -67,7 +67,7 @@ impl ConnectionAdmission {
             return false;
         }
 
-        self.log_pending_connection_task_diagnostics("finished");
+        self.log_pending_connection_task_diagnostics("released");
         true
     }
 
