@@ -13,23 +13,19 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::Mutex,
     time::timeout,
 };
 
 use crate::{
-    actors::{
-        queue::QueueActor,
-        scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
-    },
+    actors::scheduler::{PendingConnectionReservation, Scheduler},
     connect_target::{RequestedHost, TargetAuthority},
     flow::{
         FlowId,
         connection::{
-            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, TunnelContext, TunnelIo,
-            ensure_scheduler_capacity, start_bidirectional_tunnel,
+            BidirectionalTunnel, FlowCleanup, RegisterTunnelError, SchedulerCapacityError,
+            TunnelContext, TunnelIo, configure_upstream_stream, ensure_scheduler_capacity,
+            register_tunnel, start_bidirectional_tunnel,
         },
-        idle_timeout::TunnelLifecycle,
     },
     http::connect::upstream::{DirectConnector, UpstreamDialer},
     security::connect_policy::{ConnectPolicy, ConnectPolicyError, ResolvedConnectTarget},
@@ -201,61 +197,47 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
 
     let backend_stream = upstream_connection.stream;
     let connected_addr = upstream_connection.connected_addr;
-    backend_stream
-        .set_nodelay(true)
+    configure_upstream_stream(&backend_stream)
         .map_err(|err| anyhow!("Failed to set TCP_NODELAY: {}", err))?;
     let bound_addr = backend_stream
         .local_addr()
         .map_err(|err| anyhow!("Failed to resolve upstream local address: {}", err))?;
-
     info!(
         "flow{}: SOCKS5 connected to {} via {}",
         session.flow_id.0, authority, connected_addr
     );
 
-    let (backend_read, backend_write) = backend_stream.into_split();
-    let queue_tx = QueueActor::new().start();
-    let backend_write = Arc::new(Mutex::new(backend_write));
-    let tunnel_lifecycle = TunnelLifecycle::new();
     let mut cleanup = FlowCleanup::new(session.flow_id, session.scheduler.clone());
-    cleanup.watch_queue(queue_tx.clone());
-
-    match session
-        .scheduler
-        .send(Register {
-            flow_id: session.flow_id,
-            queue_addr: queue_tx.clone(),
-            backend_write: backend_write.clone(),
-            tunnel_lifecycle: tunnel_lifecycle.clone(),
-        })
-        .await
+    let registered = match register_tunnel(
+        session.flow_id,
+        &session.scheduler,
+        backend_stream,
+        &mut session.pending_reservation,
+        &mut cleanup,
+    )
+    .await
     {
-        Ok(Ok(())) => {
-            if let Some(reservation) = session.pending_reservation.take() {
-                reservation.consumed_by_register();
-            }
-            cleanup.mark_registered();
-        }
-        Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
+        Ok(registered) => registered,
+        Err(RegisterTunnelError::AtCapacity { max }) => {
             warn!(
                 "flow{}: SOCKS5 registration rejected - max connections ({}) reached",
                 session.flow_id.0, max
             );
             return session.respond_failure(Socks5Reply::GeneralFailure).await;
         }
-        Ok(Err(err)) => {
+        Err(RegisterTunnelError::Rejected(err)) => {
             return Err(Socks5FlowError::Fatal(anyhow!(
                 "Scheduler registration rejected: {}",
                 err
             )));
         }
-        Err(err) => {
+        Err(RegisterTunnelError::Unavailable(err)) => {
             return Err(Socks5FlowError::Fatal(anyhow!(
                 "Scheduler registration failed: {}",
                 err
             )));
         }
-    }
+    };
 
     send_success_reply(&mut session.client_write, bound_addr).await?;
 
@@ -272,13 +254,13 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
         context: TunnelContext {
             flow_id,
             scheduler,
-            lifecycle: tunnel_lifecycle,
+            lifecycle: registered.lifecycle,
             idle_timeout,
         },
         io: TunnelIo {
             client_read,
-            queue_tx,
-            backend_read,
+            queue_tx: registered.queue_tx,
+            backend_read: registered.backend_read,
             client_write,
         },
     });
@@ -676,8 +658,14 @@ impl Socks5Session {
 mod tests {
     use super::*;
     use crate::{
-        actors::scheduler::TryReserveConnectionTask, limits::max_connections_from_raw,
-        security::connect_policy::ConnectPolicyConfig, test_utils::make_backend_write,
+        actors::{
+            queue::QueueActor,
+            scheduler::{Register, TryReserveConnectionTask},
+        },
+        flow::idle_timeout::TunnelLifecycle,
+        limits::max_connections_from_raw,
+        security::connect_policy::ConnectPolicyConfig,
+        test_utils::make_backend_write,
         threat::ThreatIndex,
     };
     use tokio::{net::TcpListener, task, time};

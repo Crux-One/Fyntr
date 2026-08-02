@@ -3,16 +3,24 @@ use super::FlowId;
 use actix::prelude::*;
 use bytes::Bytes;
 use log::{debug, info, warn};
+use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::Mutex,
     time::{Duration, Instant, sleep},
 };
 
 use crate::{
     actors::{
         queue::{Close, Enqueue, EnqueueError, QueueActor},
-        scheduler::{CanAcceptConnection, RecordDownstreamBytes, Scheduler, Unregister},
+        scheduler::{
+            CanAcceptConnection, PendingConnectionReservation, RecordDownstreamBytes, Register,
+            RegisterError, Scheduler, Unregister,
+        },
     },
     util::{format_bytes, format_rate},
 };
@@ -72,6 +80,67 @@ pub(crate) async fn ensure_scheduler_capacity(
         Ok(true) => Ok(()),
         Ok(false) => Err(SchedulerCapacityError::AtCapacity { phase }),
         Err(source) => Err(SchedulerCapacityError::Unavailable { phase, source }),
+    }
+}
+
+/// The relay resources created once an upstream connection is accepted by the scheduler.
+pub(crate) struct RegisteredTunnel {
+    pub(crate) queue_tx: Addr<QueueActor>,
+    pub(crate) backend_read: OwnedReadHalf,
+    pub(crate) lifecycle: TunnelLifecycle,
+}
+
+#[derive(Debug)]
+pub(crate) enum RegisterTunnelError {
+    AtCapacity { max: usize },
+    Rejected(RegisterError),
+    Unavailable(MailboxError),
+}
+
+pub(crate) fn configure_upstream_stream(backend_stream: &TcpStream) -> std::io::Result<()> {
+    backend_stream.set_nodelay(true)
+}
+
+/// Turns a configured upstream stream into a scheduler-owned relay resource.
+///
+/// `cleanup` remains armed until the protocol has sent its success reply and started the relays.
+pub(crate) async fn register_tunnel(
+    flow_id: FlowId,
+    scheduler: &Addr<Scheduler>,
+    backend_stream: TcpStream,
+    pending_reservation: &mut Option<PendingConnectionReservation>,
+    cleanup: &mut FlowCleanup,
+) -> Result<RegisteredTunnel, RegisterTunnelError> {
+    let (backend_read, backend_write) = backend_stream.into_split();
+    let queue_tx = QueueActor::new().start();
+    let lifecycle = TunnelLifecycle::new();
+    cleanup.watch_queue(queue_tx.clone());
+
+    match scheduler
+        .send(Register {
+            flow_id,
+            queue_addr: queue_tx.clone(),
+            backend_write: Arc::new(Mutex::new(backend_write)),
+            tunnel_lifecycle: lifecycle.clone(),
+        })
+        .await
+    {
+        Ok(Ok(())) => {
+            if let Some(reservation) = pending_reservation.take() {
+                reservation.consumed_by_register();
+            }
+            cleanup.mark_registered();
+            Ok(RegisteredTunnel {
+                queue_tx,
+                backend_read,
+                lifecycle,
+            })
+        }
+        Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
+            Err(RegisterTunnelError::AtCapacity { max })
+        }
+        Ok(Err(err)) => Err(RegisterTunnelError::Rejected(err)),
+        Err(err) => Err(RegisterTunnelError::Unavailable(err)),
     }
 }
 
@@ -517,7 +586,7 @@ mod tests {
         queue::{AddQuantum, Dequeue, Enqueue, EnqueueError, QueueActor},
         scheduler::{Register, Scheduler},
     };
-    use crate::limits::{MAX_DEQUEUE_BYTES, MAX_QUEUE_PACKET_BYTES};
+    use crate::limits::{MAX_DEQUEUE_BYTES, MAX_QUEUE_PACKET_BYTES, max_connections_from_raw};
     use crate::test_utils::make_backend_write;
     use tokio::{
         net::{TcpListener, TcpStream},
@@ -569,6 +638,92 @@ mod tests {
         let server = accept_handle.await.unwrap();
         let (_read_half, write_half) = server.into_split();
         (write_half, client)
+    }
+
+    async fn build_backend_stream() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_handle = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        (accept_handle.await.unwrap(), client)
+    }
+
+    async fn wait_for_scheduler_capacity(scheduler: &Addr<Scheduler>) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if scheduler.send(CanAcceptConnection).await.unwrap() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler did not process cleanup unregister");
+    }
+
+    #[actix_rt::test]
+    async fn registered_tunnel_cleanup_unregisters_if_relay_does_not_start() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .start();
+        let (backend_stream, _peer) = build_backend_stream().await;
+        let mut cleanup = FlowCleanup::new(FlowId(91), scheduler.clone());
+        let mut reservation = None;
+
+        let registered = register_tunnel(
+            FlowId(91),
+            &scheduler,
+            backend_stream,
+            &mut reservation,
+            &mut cleanup,
+        )
+        .await
+        .unwrap();
+        assert!(!scheduler.send(CanAcceptConnection).await.unwrap());
+
+        drop(registered);
+        drop(cleanup);
+        wait_for_scheduler_capacity(&scheduler).await;
+    }
+
+    #[actix_rt::test]
+    async fn registration_capacity_failure_leaves_existing_flow_registered() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .start();
+        let (first_backend, _first_peer) = build_backend_stream().await;
+        let mut first_cleanup = FlowCleanup::new(FlowId(92), scheduler.clone());
+        let mut first_reservation = None;
+        let first = register_tunnel(
+            FlowId(92),
+            &scheduler,
+            first_backend,
+            &mut first_reservation,
+            &mut first_cleanup,
+        )
+        .await
+        .unwrap();
+
+        let (second_backend, _second_peer) = build_backend_stream().await;
+        let mut second_cleanup = FlowCleanup::new(FlowId(93), scheduler.clone());
+        let mut second_reservation = None;
+        assert!(matches!(
+            register_tunnel(
+                FlowId(93),
+                &scheduler,
+                second_backend,
+                &mut second_reservation,
+                &mut second_cleanup,
+            )
+            .await,
+            Err(RegisterTunnelError::AtCapacity { max: 1 })
+        ));
+        drop(second_cleanup);
+        assert!(!scheduler.send(CanAcceptConnection).await.unwrap());
+
+        drop(first);
+        drop(first_cleanup);
+        wait_for_scheduler_capacity(&scheduler).await;
     }
 
     async fn fill_queue_until_buffer_exceeded(queue: &Addr<QueueActor>) {

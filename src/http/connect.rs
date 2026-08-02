@@ -13,21 +13,21 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::Mutex,
     time::timeout,
 };
 
 use crate::{
     actors::{
         queue::QueueActor,
-        scheduler::{PendingConnectionReservation, Register, RegisterError, Scheduler},
+        scheduler::{PendingConnectionReservation, Scheduler},
     },
     connect_target::TargetAuthority,
     flow::{
         FlowId,
         connection::{
-            BidirectionalTunnel, FlowCleanup, SchedulerCapacityError, TunnelContext, TunnelIo,
-            ensure_scheduler_capacity, start_bidirectional_tunnel,
+            BidirectionalTunnel, FlowCleanup, RegisterTunnelError, RegisteredTunnel,
+            SchedulerCapacityError, TunnelContext, TunnelIo, configure_upstream_stream,
+            ensure_scheduler_capacity, register_tunnel, start_bidirectional_tunnel,
         },
         idle_timeout::TunnelLifecycle,
     },
@@ -174,10 +174,7 @@ enum ConnectState {
     },
     Registering {
         session: ConnectSession,
-        queue_tx: Addr<QueueActor>,
-        backend_read: OwnedReadHalf,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
+        backend_stream: TcpStream,
     },
     Established {
         session: ConnectSession,
@@ -355,7 +352,6 @@ impl ConnectState {
     async fn advance_dialing(
         mut session: ConnectSession,
         target: ResolvedConnectTarget,
-        cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
         // Best-effort early admission check to avoid spinning up outbound sockets when at capacity.
         // This is not atomic with the subsequent `Register` call; between here and registration
@@ -380,8 +376,7 @@ impl ConnectState {
         let backend_stream = upstream_connection.stream;
         let connected_addr = upstream_connection.connected_addr;
 
-        backend_stream
-            .set_nodelay(true)
+        configure_upstream_stream(&backend_stream)
             .map_err(|e| anyhow!("Failed to set TCP_NODELAY: {}", e))?;
 
         info!(
@@ -389,51 +384,38 @@ impl ConnectState {
             session.flow_id.0, target_authority, connected_addr
         );
 
-        let (backend_read, backend_write) = backend_stream.into_split();
-        let queue_tx = QueueActor::new().start();
-        let tunnel_lifecycle = TunnelLifecycle::new();
-        cleanup.watch_queue(queue_tx.clone());
-
         Ok(ConnectState::Registering {
             session,
-            queue_tx,
-            backend_read,
-            backend_write: Arc::new(Mutex::new(backend_write)),
-            tunnel_lifecycle,
+            backend_stream,
         })
     }
 
     async fn advance_registering(
         mut session: ConnectSession,
-        queue_tx: Addr<QueueActor>,
-        backend_read: OwnedReadHalf,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
+        backend_stream: TcpStream,
         cleanup: &mut FlowCleanup,
     ) -> ConnectResult<ConnectState> {
-        match session
-            .scheduler
-            .send(Register {
-                flow_id: session.flow_id,
-                queue_addr: queue_tx.clone(),
-                backend_write: backend_write.clone(),
-                tunnel_lifecycle: tunnel_lifecycle.clone(),
-            })
-            .await
+        match register_tunnel(
+            session.flow_id,
+            &session.scheduler,
+            backend_stream,
+            &mut session.pending_reservation,
+            cleanup,
+        )
+        .await
         {
-            Ok(Ok(())) => {
-                if let Some(reservation) = session.pending_reservation.take() {
-                    reservation.consumed_by_register();
-                }
-                cleanup.mark_registered();
-                Ok(ConnectState::Established {
-                    session,
-                    queue_tx,
-                    backend_read,
-                    tunnel_lifecycle,
-                })
-            }
-            Ok(Err(RegisterError::MaxConnectionsReached { max })) => {
+            Ok(RegisteredTunnel {
+                queue_tx,
+                backend_read,
+                lifecycle,
+                ..
+            }) => Ok(ConnectState::Established {
+                session,
+                queue_tx,
+                backend_read,
+                tunnel_lifecycle: lifecycle,
+            }),
+            Err(RegisterTunnelError::AtCapacity { max }) => {
                 let detail = format!("registration rejected - max connections ({}) reached", max);
                 session
                     .respond(
@@ -443,7 +425,7 @@ impl ConnectState {
                     )
                     .await
             }
-            Ok(Err(err)) => {
+            Err(RegisterTunnelError::Rejected(err)) => {
                 error!(
                     "flow{}: scheduler rejected registration: {}",
                     session.flow_id.0, err
@@ -453,7 +435,7 @@ impl ConnectState {
                     err
                 )))
             }
-            Err(e) => {
+            Err(RegisterTunnelError::Unavailable(e)) => {
                 error!(
                     "flow{}: failed to register with scheduler: {}",
                     session.flow_id.0, e
@@ -509,25 +491,12 @@ impl ConnectState {
         match self {
             ConnectState::Validating(session) => Self::advance_validating(session).await,
             ConnectState::Dialing { session, target } => {
-                Self::advance_dialing(session, target, cleanup).await
+                Self::advance_dialing(session, target).await
             }
             ConnectState::Registering {
                 session,
-                queue_tx,
-                backend_read,
-                backend_write,
-                tunnel_lifecycle,
-            } => {
-                Self::advance_registering(
-                    session,
-                    queue_tx,
-                    backend_read,
-                    backend_write,
-                    tunnel_lifecycle,
-                    cleanup,
-                )
-                .await
-            }
+                backend_stream,
+            } => Self::advance_registering(session, backend_stream, cleanup).await,
             ConnectState::Established {
                 session,
                 queue_tx,
@@ -655,7 +624,7 @@ mod tests {
     use super::*;
     use crate::test_utils::make_backend_write;
     use crate::{
-        actors::scheduler::TryReserveConnectionTask,
+        actors::scheduler::{Register, TryReserveConnectionTask},
         connect_target::{NormalizedHost, normalize_lenient_host},
         http::request::RequestLine,
         limits::{MAX_HEADER_LINES, MAX_REQUEST_LINE_BYTES, max_connections_from_raw},
