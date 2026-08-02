@@ -1,4 +1,5 @@
 /.agents
+/.codex
 /target
 
 *.html
