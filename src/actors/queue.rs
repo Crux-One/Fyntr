@@ -285,6 +285,30 @@ impl Handler<StopNow> for QueueActor {
 }
 
 #[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BufferedState {
+    pub packet_count: usize,
+    pub buffered_bytes: usize,
+}
+
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "BufferedState")]
+pub(crate) struct InspectBufferedState;
+
+#[cfg(test)]
+impl Handler<InspectBufferedState> for QueueActor {
+    type Result = MessageResult<InspectBufferedState>;
+
+    fn handle(&mut self, _msg: InspectBufferedState, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(BufferedState {
+            packet_count: self.state.buf.len(),
+            buffered_bytes: self.state.buffered_bytes,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use actix::MailboxError;

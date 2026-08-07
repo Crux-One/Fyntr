@@ -4,12 +4,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 mod connection_admission;
 mod flow_stats;
 mod quantum_strategy;
 
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
@@ -125,6 +130,80 @@ pub(crate) struct Scheduler {
     total_ticks: u64,
     admission: ConnectionAdmission,
     shutdown_requested: bool,
+    #[cfg(test)]
+    backend_write_observer: Option<Arc<BackendWriteObserver>>,
+}
+
+/// Test-only synchronization for observing write tasks after queue dequeue.
+///
+/// This deliberately observes work outside `QueueActor`; it is not a production
+/// accounting mechanism or a scheduler limit.
+#[cfg(test)]
+struct BackendWriteObserver {
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    started_notify: Notify,
+    finished_notify: Notify,
+}
+
+#[cfg(test)]
+impl BackendWriteObserver {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            started_notify: Notify::new(),
+            finished_notify: Notify::new(),
+        }
+    }
+
+    fn mark_started(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+    }
+
+    fn mark_finished(&self) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        self.finished_notify.notify_waiters();
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    fn finished(&self) -> usize {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_started(&self, expected: usize) {
+        loop {
+            let notified = self.started_notify.notified();
+            if self.started() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_finished(&self, expected: usize) {
+        loop {
+            let notified = self.finished_notify.notified();
+            if self.finished() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+struct BackendWriteTaskCompletion(Arc<BackendWriteObserver>);
+
+#[cfg(test)]
+impl Drop for BackendWriteTaskCompletion {
+    fn drop(&mut self) {
+        self.0.mark_finished();
+    }
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -258,7 +337,15 @@ impl Scheduler {
             total_ticks: 0,
             admission: ConnectionAdmission::new(),
             shutdown_requested: false,
+            #[cfg(test)]
+            backend_write_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_backend_write_observer(mut self, observer: Arc<BackendWriteObserver>) -> Self {
+        self.backend_write_observer = Some(observer);
+        self
     }
 
     /// Configure the scheduler with a maximum concurrent connection limit.
@@ -554,7 +641,16 @@ impl Scheduler {
         data: bytes::Bytes,
         tunnel_lifecycle: TunnelLifecycle,
     ) {
+        #[cfg(test)]
+        let observer = self.backend_write_observer.clone();
+
         actix::spawn(async move {
+            #[cfg(test)]
+            let _completion = observer.as_ref().map(|observer| {
+                observer.mark_started();
+                BackendWriteTaskCompletion(observer.clone())
+            });
+
             let mut shutdown_rx = tunnel_lifecycle.subscribe_shutdown();
 
             if *shutdown_rx.borrow() {
@@ -873,6 +969,104 @@ mod tests {
         assert!(
             read_result.is_err(),
             "backend write task should exit while waiting for the write lock after idle shutdown"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn dequeued_packets_become_out_of_queue_pending_writes_while_backend_is_blocked() {
+        let observer = Arc::new(BackendWriteObserver::new());
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_backend_write_observer(observer.clone())
+            .start();
+        let queue = QueueActor::new().start();
+        let (backend_write, mut backend_peer) = make_live_backend_write().await;
+        let write_guard = backend_write.lock().await;
+        let tunnel_lifecycle = TunnelLifecycle::new();
+        let flow = FlowId(14);
+        let packets: [&[u8]; 3] = [b"first-", b"second-", b"third"];
+
+        scheduler
+            .send(Register {
+                flow_id: flow,
+                queue_addr: queue.clone(),
+                backend_write: backend_write.clone(),
+                tunnel_lifecycle,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        for packet in packets {
+            queue
+                .send(crate::actors::queue::Enqueue(
+                    bytes::Bytes::copy_from_slice(packet),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        scheduler.send(FlowReady { flow_id: flow }).await.unwrap();
+        for expected_started in 1..=packets.len() {
+            scheduler.send(QuantumTick).await.unwrap();
+            timeout(
+                Duration::from_secs(1),
+                observer.wait_for_started(expected_started),
+            )
+            .await
+            .expect(
+                "each scheduler tick should dequeue one packet and start its backend write task",
+            );
+        }
+
+        let buffered = queue
+            .send(crate::actors::queue::InspectBufferedState)
+            .await
+            .unwrap();
+        assert_eq!(
+            buffered.packet_count, 0,
+            "QueueActor buffered packets should be drained after dequeue"
+        );
+        assert_eq!(
+            buffered.buffered_bytes, 0,
+            "QueueActor buffered bytes should be zero; they do not include pending backend writes"
+        );
+        assert_eq!(
+            observer.started(),
+            packets.len(),
+            "one out-of-queue backend write task should start for every dequeued packet"
+        );
+        assert_eq!(
+            observer.finished(),
+            0,
+            "held backend write mutex keeps all out-of-queue write operations unfinished"
+        );
+
+        drop(write_guard);
+
+        let mut received = vec![0; packets.iter().map(|packet| packet.len()).sum()];
+        timeout(
+            Duration::from_secs(1),
+            backend_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("releasing the writer should deliver every pending packet")
+        .expect("live backend peer should receive the pending packets");
+        assert_eq!(
+            received,
+            packets.concat(),
+            "mutex-serialized pending writes should reach the backend in dequeue order"
+        );
+        timeout(
+            Duration::from_secs(1),
+            observer.wait_for_finished(packets.len()),
+        )
+        .await
+        .expect("all pending backend write tasks should finish after the writer is released");
+        assert_eq!(
+            observer.finished(),
+            packets.len(),
+            "no out-of-queue backend write task should remain unfinished"
         );
     }
 
