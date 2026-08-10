@@ -4,12 +4,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 mod connection_admission;
 mod flow_stats;
 mod quantum_strategy;
 
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
 use crate::{
@@ -65,14 +70,13 @@ pub(crate) struct RecordDownstreamBytes {
     pub bytes: usize,
 }
 
-struct FlowEntry {
+struct FlowResources {
     queue_addr: Addr<QueueActor>,
     backend_write: Arc<Mutex<OwnedWriteHalf>>,
     tunnel_lifecycle: TunnelLifecycle,
-    stats: FlowStats,
 }
 
-impl FlowEntry {
+impl FlowResources {
     fn new(
         queue_addr: Addr<QueueActor>,
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
@@ -82,7 +86,6 @@ impl FlowEntry {
             queue_addr,
             backend_write,
             tunnel_lifecycle,
-            stats: FlowStats::new(),
         }
     }
 
@@ -96,6 +99,18 @@ impl FlowEntry {
 
     fn tunnel_lifecycle(&self) -> TunnelLifecycle {
         self.tunnel_lifecycle.clone()
+    }
+}
+
+struct FlowEntry {
+    stats: FlowStats,
+}
+
+impl FlowEntry {
+    fn new() -> Self {
+        Self {
+            stats: FlowStats::new(),
+        }
     }
 
     fn update_stats(&mut self, bytes: usize) {
@@ -113,18 +128,245 @@ impl FlowEntry {
     }
 }
 
-pub(crate) struct Scheduler {
+struct SchedulerState {
     flows: HashMap<FlowId, FlowEntry>,
     ready_queue: VecDeque<FlowId>,
     ready_set: HashSet<FlowId>,
     default_quantum: usize,
-    tick: Duration,
     total_client_to_backend_bytes: u64,
     total_backend_to_client_bytes: u64,
     global_start_time: Option<Instant>,
     total_ticks: u64,
     admission: ConnectionAdmission,
     shutdown_requested: bool,
+}
+
+/// Test-only synchronization for observing write tasks after queue dequeue.
+///
+/// This deliberately observes work outside `QueueActor`; it is not a production
+/// accounting mechanism or a scheduler limit.
+#[cfg(test)]
+struct BackendWriteObserver {
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    started_notify: Notify,
+    finished_notify: Notify,
+}
+
+#[cfg(test)]
+impl BackendWriteObserver {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            started_notify: Notify::new(),
+            finished_notify: Notify::new(),
+        }
+    }
+
+    fn mark_started(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+    }
+
+    fn mark_finished(&self) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        self.finished_notify.notify_waiters();
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    fn finished(&self) -> usize {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_started(&self, expected: usize) {
+        loop {
+            let notified = self.started_notify.notified();
+            if self.started() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_finished(&self, expected: usize) {
+        loop {
+            let notified = self.finished_notify.notified();
+            if self.finished() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+struct BackendWriteTaskCompletion(Arc<BackendWriteObserver>);
+
+#[cfg(test)]
+impl Drop for BackendWriteTaskCompletion {
+    fn drop(&mut self) {
+        self.0.mark_finished();
+    }
+}
+
+enum SchedulerEffect {
+    AddQuantum {
+        flow_id: FlowId,
+        quantum: usize,
+    },
+    RequestDequeue {
+        flow_id: FlowId,
+    },
+    Write {
+        flow_id: FlowId,
+        packet: bytes::Bytes,
+    },
+    Unregister {
+        flow_id: FlowId,
+    },
+}
+
+enum DequeueEvent {
+    Packet(DequeueResult),
+    Empty,
+    Failed,
+}
+
+impl SchedulerState {
+    fn new(default_quantum: usize) -> Self {
+        Self {
+            flows: HashMap::new(),
+            ready_queue: VecDeque::new(),
+            ready_set: HashSet::new(),
+            default_quantum,
+            total_client_to_backend_bytes: 0,
+            total_backend_to_client_bytes: 0,
+            global_start_time: None,
+            total_ticks: 0,
+            admission: ConnectionAdmission::new(),
+            shutdown_requested: false,
+        }
+    }
+
+    fn register(&mut self, flow_id: FlowId) -> Result<(), RegisterError> {
+        self.admission.try_acquire_registered_connection()?;
+        self.admission.release_connection_task_reservation(flow_id);
+        self.flows.insert(flow_id, FlowEntry::new());
+        Ok(())
+    }
+
+    fn unregister(&mut self, flow_id: FlowId) -> bool {
+        if self.flows.remove(&flow_id).is_none() {
+            return false;
+        }
+
+        self.admission.release_registered_connection();
+        self.remove_flow_from_ready(flow_id);
+        true
+    }
+
+    fn mark_flow_ready(&mut self, flow_id: FlowId) {
+        if self.flows.contains_key(&flow_id) && self.ready_set.insert(flow_id) {
+            self.ready_queue.push_back(flow_id);
+        }
+    }
+
+    fn remove_flow_from_ready(&mut self, flow_id: FlowId) {
+        if self.ready_set.remove(&flow_id) {
+            self.ready_queue
+                .retain(|queued_flow_id| *queued_flow_id != flow_id);
+        }
+    }
+
+    fn on_tick(&mut self) -> (Vec<SchedulerEffect>, bool) {
+        self.total_ticks += 1;
+        let mut effects = self
+            .flows
+            .iter()
+            .map(|(&flow_id, flow)| SchedulerEffect::AddQuantum {
+                flow_id,
+                quantum: flow.recommended_quantum(self.default_quantum),
+            })
+            .collect::<Vec<_>>();
+
+        let ready_count = self.ready_queue.len();
+        for _ in 0..ready_count {
+            let Some(flow_id) = self.ready_queue.pop_front() else {
+                break;
+            };
+            self.ready_set.remove(&flow_id);
+            if self.flows.contains_key(&flow_id) {
+                effects.push(SchedulerEffect::RequestDequeue { flow_id });
+            }
+        }
+
+        (effects, self.total_ticks.is_multiple_of(500))
+    }
+
+    fn on_dequeue_result(
+        &mut self,
+        flow_id: FlowId,
+        event: DequeueEvent,
+    ) -> Option<SchedulerEffect> {
+        match event {
+            DequeueEvent::Packet(result) => self.on_dequeue_success(flow_id, result),
+            DequeueEvent::Empty => {
+                self.remove_flow_from_ready(flow_id);
+                None
+            }
+            DequeueEvent::Failed => {
+                self.remove_flow_from_ready(flow_id);
+                Some(SchedulerEffect::Unregister { flow_id })
+            }
+        }
+    }
+
+    fn on_dequeue_success(
+        &mut self,
+        flow_id: FlowId,
+        result: DequeueResult,
+    ) -> Option<SchedulerEffect> {
+        let flow = self.flows.get_mut(&flow_id)?;
+        flow.update_stats(result.packet.len());
+        self.total_client_to_backend_bytes += result.packet.len() as u64;
+        self.ensure_global_start_time();
+        if result.ready_for_more {
+            self.mark_flow_ready(flow_id);
+        }
+        Some(SchedulerEffect::Write {
+            flow_id,
+            packet: result.packet,
+        })
+    }
+
+    fn record_downstream_bytes(&mut self, bytes: usize) {
+        self.total_backend_to_client_bytes += bytes as u64;
+        self.ensure_global_start_time();
+    }
+
+    fn ensure_global_start_time(&mut self) {
+        if self.global_start_time.is_none() {
+            self.global_start_time = Some(Instant::now());
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.shutdown_requested
+            && self.flows.is_empty()
+            && self.admission.pending_connection_tasks() == 0
+    }
+}
+
+pub(crate) struct Scheduler {
+    state: SchedulerState,
+    flow_resources: HashMap<FlowId, FlowResources>,
+    tick: Duration,
+    #[cfg(test)]
+    backend_write_observer: Option<Arc<BackendWriteObserver>>,
 }
 impl Actor for Scheduler {
     type Context = Context<Self>;
@@ -195,10 +437,9 @@ impl Handler<QuantumTick> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, _msg: QuantumTick, ctx: &mut Self::Context) -> Self::Result {
-        self.total_ticks += 1;
-        self.distribute_quantum(ctx);
-        self.round_robin_once(ctx);
-        if self.total_ticks.is_multiple_of(500) {
+        let (effects, should_log) = self.state.on_tick();
+        self.execute_effects(effects, ctx);
+        if should_log {
             self.log_stats();
         }
     }
@@ -208,8 +449,8 @@ impl Handler<Shutdown> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, _msg: Shutdown, ctx: &mut Self::Context) -> Self::Result {
-        self.shutdown_requested = true;
-        if self.should_stop() {
+        self.state.shutdown_requested = true;
+        if self.state.should_stop() {
             ctx.stop();
         }
     }
@@ -219,7 +460,9 @@ impl Handler<TryReserveConnectionTask> for Scheduler {
     type Result = Result<(), RegisterError>;
 
     fn handle(&mut self, msg: TryReserveConnectionTask, _ctx: &mut Self::Context) -> Self::Result {
-        self.admission.try_reserve_connection_task(msg.flow_id)
+        self.state
+            .admission
+            .try_reserve_connection_task(msg.flow_id)
     }
 }
 
@@ -227,9 +470,11 @@ impl Handler<ConnectionTaskFinished> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: ConnectionTaskFinished, ctx: &mut Self::Context) -> Self::Result {
-        self.release_connection_task_reservation(msg.flow_id);
+        self.state
+            .admission
+            .release_connection_task_reservation(msg.flow_id);
 
-        if self.should_stop() {
+        if self.state.should_stop() {
             ctx.stop();
         }
     }
@@ -239,64 +484,45 @@ impl Handler<RecordDownstreamBytes> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: RecordDownstreamBytes, _ctx: &mut Self::Context) -> Self::Result {
-        self.total_backend_to_client_bytes += msg.bytes as u64;
-        self.ensure_global_start_time();
+        self.state.record_downstream_bytes(msg.bytes);
     }
 }
 
 impl Scheduler {
     pub(crate) fn new(quantum: usize, tick: Duration) -> Self {
         Self {
-            flows: HashMap::new(),
-            ready_queue: VecDeque::new(),
-            ready_set: HashSet::new(),
-            default_quantum: quantum,
+            state: SchedulerState::new(quantum),
+            flow_resources: HashMap::new(),
             tick,
-            total_client_to_backend_bytes: 0,
-            total_backend_to_client_bytes: 0,
-            global_start_time: None,
-            total_ticks: 0,
-            admission: ConnectionAdmission::new(),
-            shutdown_requested: false,
+            #[cfg(test)]
+            backend_write_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_backend_write_observer(mut self, observer: Arc<BackendWriteObserver>) -> Self {
+        self.backend_write_observer = Some(observer);
+        self
     }
 
     /// Configure the scheduler with a maximum concurrent connection limit.
     ///
     /// Use `None` to allow unlimited connections.
     pub(crate) fn with_max_connections(mut self, max_connections: MaxConnections) -> Self {
-        self.admission.set_max_connections(max_connections);
+        self.state.admission.set_max_connections(max_connections);
         self
     }
 
-    fn try_increment_connection_count(&self) -> Result<(), RegisterError> {
-        self.admission.try_acquire_registered_connection()
-    }
-
-    fn decrement_connection_count(&self) {
-        self.admission.release_registered_connection();
-    }
-
     fn current_connection_count(&self) -> usize {
-        self.admission.current_connection_count()
-    }
-
-    fn release_connection_task_reservation(&mut self, flow_id: FlowId) -> bool {
-        self.admission.release_connection_task_reservation(flow_id)
+        self.state.admission.current_connection_count()
     }
 
     fn max_connections(&self) -> MaxConnections {
-        self.admission.max_connections()
-    }
-
-    fn should_stop(&self) -> bool {
-        self.shutdown_requested
-            && self.flows.is_empty()
-            && self.admission.pending_connection_tasks() == 0
+        self.state.admission.max_connections()
     }
 
     fn log_connection_count(&self, flow_id: FlowId, action: &str) {
-        let pending = self.admission.pending_connection_tasks();
+        let pending = self.state.admission.pending_connection_tasks();
         match self.max_connections() {
             Some(limit) => info!(
                 "flow{}: {} (connections: {}/{}, pending_connect_tasks: {})",
@@ -315,46 +541,6 @@ impl Scheduler {
             ),
         };
     }
-
-    fn register(
-        &mut self,
-        id: FlowId,
-        queue_addr: Addr<QueueActor>,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
-    ) {
-        self.release_connection_task_reservation(id);
-        self.flows.insert(
-            id,
-            FlowEntry::new(queue_addr, backend_write, tunnel_lifecycle),
-        );
-    }
-
-    fn unregister(&mut self, id: FlowId) -> bool {
-        self.remove_flows(&[id]) > 0
-    }
-
-    fn flow_mut(&mut self, id: FlowId) -> Option<&mut FlowEntry> {
-        self.flows.get_mut(&id)
-    }
-
-    fn flow(&self, id: FlowId) -> Option<&FlowEntry> {
-        self.flows.get(&id)
-    }
-
-    fn mark_flow_ready(&mut self, id: FlowId) {
-        if self.flow(id).is_some() && self.ready_set.insert(id) {
-            self.ready_queue.push_back(id);
-        }
-    }
-
-    fn remove_flow_from_ready(&mut self, id: FlowId) {
-        if self.ready_set.remove(&id) {
-            // retain walks the whole queue, so this removal stays O(n) just like
-            // a manual position+remove scan would.
-            self.ready_queue.retain(|flow_id| *flow_id != id);
-        }
-    }
 }
 
 // Handler for Register
@@ -362,14 +548,17 @@ impl Handler<Register> for Scheduler {
     type Result = Result<(), RegisterError>;
 
     fn handle(&mut self, msg: Register, ctx: &mut Self::Context) -> Self::Result {
-        self.try_increment_connection_count()?;
+        self.state.register(msg.flow_id)?;
         let flow_id = msg.flow_id;
-        let queue_addr = msg.queue_addr;
-        let backend_write = msg.backend_write;
-        let tunnel_lifecycle = msg.tunnel_lifecycle;
-
-        self.register(flow_id, queue_addr.clone(), backend_write, tunnel_lifecycle);
-        queue_addr.do_send(BindScheduler {
+        self.flow_resources.insert(
+            flow_id,
+            FlowResources::new(
+                msg.queue_addr.clone(),
+                msg.backend_write,
+                msg.tunnel_lifecycle,
+            ),
+        );
+        msg.queue_addr.do_send(BindScheduler {
             flow_id,
             scheduler: ctx.address(),
         });
@@ -383,7 +572,7 @@ impl Handler<CanAcceptConnection> for Scheduler {
     type Result = bool;
 
     fn handle(&mut self, _msg: CanAcceptConnection, _ctx: &mut Self::Context) -> Self::Result {
-        self.admission.has_registered_capacity()
+        self.state.admission.has_registered_capacity()
     }
 }
 
@@ -392,8 +581,11 @@ impl Handler<Unregister> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: Unregister, ctx: &mut Self::Context) -> Self::Result {
-        if self.unregister(msg.flow_id) {
-            self.decrement_connection_count();
+        if self.state.unregister(msg.flow_id) {
+            if let Some(resources) = self.flow_resources.remove(&msg.flow_id) {
+                debug!("flow{}: stopping queue on unregister", msg.flow_id.0);
+                resources.queue_addr().do_send(StopNow);
+            }
             self.log_connection_count(msg.flow_id, "unregistered from scheduler");
         } else {
             debug!(
@@ -402,7 +594,7 @@ impl Handler<Unregister> for Scheduler {
             );
         }
 
-        if self.should_stop() {
+        if self.state.should_stop() {
             ctx.stop();
         }
     }
@@ -414,137 +606,73 @@ impl Handler<FlowReady> for Scheduler {
     fn handle(&mut self, msg: FlowReady, _ctx: &mut Self::Context) -> Self::Result {
         // FlowReady notifications can race; mark_flow_ready handles the existence check
         // and ready_set.insert filters duplicates.
-        self.mark_flow_ready(msg.flow_id);
+        self.state.mark_flow_ready(msg.flow_id);
     }
 }
 
 impl Scheduler {
-    fn distribute_quantum(&mut self, _ctx: &mut <Self as Actor>::Context) {
-        for (&flow_id, flow) in &self.flows {
-            let quantum = flow.recommended_quantum(self.default_quantum);
-            trace!("flow{}: assigned quantum {}", flow_id.0, quantum);
-            flow.queue_addr().do_send(AddQuantum(quantum));
-        }
-    }
-
-    fn round_robin_once(&mut self, ctx: &mut <Self as Actor>::Context) {
-        let ready_count = self.ready_queue.len();
-        for _ in 0..ready_count {
-            let Some(flow) = self.ready_queue.pop_front() else {
-                break;
-            };
-
-            let maybe_target = self.flow(flow).map(|entry| {
-                (
-                    entry.queue_addr(),
-                    entry.backend_write(),
-                    entry.tunnel_lifecycle(),
-                )
-            });
-
-            if let Some((queue_addr, backend_write, tunnel_lifecycle)) = maybe_target {
-                self.request_dequeue(flow, queue_addr, backend_write, tunnel_lifecycle, ctx);
+    fn execute_effects(&mut self, effects: Vec<SchedulerEffect>, ctx: &mut Context<Self>) {
+        for effect in effects {
+            match effect {
+                SchedulerEffect::AddQuantum { flow_id, quantum } => {
+                    trace!("flow{}: assigned quantum {}", flow_id.0, quantum);
+                    if let Some(resources) = self.flow_resources.get(&flow_id) {
+                        resources.queue_addr().do_send(AddQuantum(quantum));
+                    }
+                }
+                SchedulerEffect::RequestDequeue { flow_id } => self.request_dequeue(flow_id, ctx),
+                SchedulerEffect::Write { flow_id, packet } => self.write(flow_id, packet),
+                SchedulerEffect::Unregister { flow_id } => {
+                    ctx.address().do_send(Unregister { flow_id });
+                }
             }
-            self.ready_set.remove(&flow);
         }
     }
 
-    fn request_dequeue(
-        &self,
-        flow: FlowId,
-        queue_addr: Addr<QueueActor>,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
-        ctx: &mut <Self as Actor>::Context,
-    ) {
+    fn request_dequeue(&self, flow: FlowId, ctx: &mut Context<Self>) {
+        let Some(resources) = self.flow_resources.get(&flow) else {
+            return;
+        };
+        let queue_addr = resources.queue_addr();
         queue_addr
             .send(Dequeue {
                 max_bytes: MAX_DEQUEUE_BYTES,
             })
             .into_actor(self)
             .map(move |res, act, ctx| {
-                act.handle_dequeue_response(flow, backend_write, tunnel_lifecycle, res, ctx);
+                if let Ok(Some(result)) = &res {
+                    debug!(
+                        "flow{}: dequeue granted (remaining_queue={})",
+                        flow.0, result.remaining
+                    );
+                }
+                if let Err(error) = &res {
+                    warn!("flow{}: dequeue response error: {}", flow.0, error);
+                }
+                let event = match res {
+                    Ok(Some(result)) => DequeueEvent::Packet(result),
+                    Ok(None) => DequeueEvent::Empty,
+                    Err(_) => DequeueEvent::Failed,
+                };
+                if let Some(effect) = act.state.on_dequeue_result(flow, event) {
+                    act.execute_effects(vec![effect], ctx);
+                }
             })
             .spawn(ctx);
     }
 
-    fn handle_dequeue_response(
-        &mut self,
-        flow: FlowId,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
-        res: Result<Option<DequeueResult>, MailboxError>,
-        ctx: &mut <Self as Actor>::Context,
-    ) {
-        match res {
-            Ok(Some(result)) => {
-                self.handle_dequeue_success(flow, backend_write, tunnel_lifecycle, result)
-            }
-            Ok(None) => self.handle_empty_dequeue(flow),
-            Err(e) => self.handle_dequeue_error(flow, e, ctx),
-        }
-    }
-
-    fn handle_dequeue_success(
-        &mut self,
-        flow: FlowId,
-        backend_write: Arc<Mutex<OwnedWriteHalf>>,
-        tunnel_lifecycle: TunnelLifecycle,
-        result: DequeueResult,
-    ) {
-        if self.flow(flow).is_none() {
+    fn write(&self, flow: FlowId, packet: bytes::Bytes) {
+        let Some(resources) = self.flow_resources.get(&flow) else {
             debug!(
                 "flow{}: skipping dequeued backend write because flow is no longer registered",
                 flow.0
             );
             return;
-        }
-
-        debug!(
-            "flow{}: dequeue granted (remaining_queue={})",
-            flow.0, result.remaining
-        );
-
-        let packet_len = result.packet.len();
-        self.update_flow_stats(flow, packet_len);
-        self.record_client_to_backend_bytes(packet_len);
-        if result.ready_for_more {
-            self.mark_flow_ready(flow);
-        }
+        };
+        let backend_write = resources.backend_write();
+        let tunnel_lifecycle = resources.tunnel_lifecycle();
         tunnel_lifecycle.record_activity(TunnelActivity::QueueDequeued);
-        self.spawn_backend_write(flow, backend_write, result.packet, tunnel_lifecycle);
-    }
-
-    fn handle_empty_dequeue(&mut self, flow: FlowId) {
-        self.remove_flow_from_ready(flow);
-    }
-
-    fn handle_dequeue_error(
-        &mut self,
-        flow: FlowId,
-        error: MailboxError,
-        ctx: &mut <Self as Actor>::Context,
-    ) {
-        warn!("flow{}: dequeue response error: {}", flow.0, error);
-        self.remove_flow_from_ready(flow);
-        ctx.address().do_send(Unregister { flow_id: flow });
-    }
-
-    fn update_flow_stats(&mut self, flow: FlowId, bytes: usize) {
-        if let Some(entry) = self.flow_mut(flow) {
-            entry.update_stats(bytes);
-        }
-    }
-
-    fn record_client_to_backend_bytes(&mut self, bytes: usize) {
-        self.total_client_to_backend_bytes += bytes as u64;
-        self.ensure_global_start_time();
-    }
-
-    fn ensure_global_start_time(&mut self) {
-        if self.global_start_time.is_none() {
-            self.global_start_time = Some(Instant::now());
-        }
+        self.spawn_backend_write(flow, backend_write, packet, tunnel_lifecycle);
     }
 
     fn spawn_backend_write(
@@ -554,7 +682,16 @@ impl Scheduler {
         data: bytes::Bytes,
         tunnel_lifecycle: TunnelLifecycle,
     ) {
+        #[cfg(test)]
+        let observer = self.backend_write_observer.clone();
+
         actix::spawn(async move {
+            #[cfg(test)]
+            let _completion = observer.as_ref().map(|observer| {
+                observer.mark_started();
+                BackendWriteTaskCompletion(observer.clone())
+            });
+
             let mut shutdown_rx = tunnel_lifecycle.subscribe_shutdown();
 
             if *shutdown_rx.borrow() {
@@ -599,56 +736,28 @@ impl Scheduler {
         });
     }
 
-    fn remove_flows(&mut self, ids: &[FlowId]) -> usize {
-        if ids.is_empty() {
-            return 0;
-        }
-
-        let mut removed_count = 0;
-        let mut queue_needs_cleanup = false;
-
-        for &id in ids {
-            if let Some(entry) = self.flows.remove(&id) {
-                debug!("flow{}: stopping queue on unregister", id.0);
-                entry.queue_addr().do_send(StopNow);
-                removed_count += 1;
-                // Also clean up ready state
-                if self.ready_set.remove(&id) {
-                    queue_needs_cleanup = true;
-                }
-            }
-        }
-
-        if queue_needs_cleanup {
-            self.ready_queue
-                .retain(|flow_id| self.ready_set.contains(flow_id));
-        }
-
-        removed_count
-    }
-
     fn log_stats(&self) {
-        let flow_count = self.flows.len();
-        let (tx_value, tx_unit) = format_bytes(self.total_client_to_backend_bytes);
-        let (rx_value, rx_unit) = format_bytes(self.total_backend_to_client_bytes);
+        let flow_count = self.state.flows.len();
+        let (tx_value, tx_unit) = format_bytes(self.state.total_client_to_backend_bytes);
+        let (rx_value, rx_unit) = format_bytes(self.state.total_backend_to_client_bytes);
         let max_display = max_connections_display(self.max_connections());
         debug!(
             "⏱ scheduler: ticks={}, active connections={}/{}, total_tx={:.2} {}, total_rx={:.2} {}",
-            self.total_ticks, flow_count, max_display, tx_value, tx_unit, rx_value, rx_unit
+            self.state.total_ticks, flow_count, max_display, tx_value, tx_unit, rx_value, rx_unit
         );
-        if let Some(global_start) = self.global_start_time {
+        if let Some(global_start) = self.state.global_start_time {
             let elapsed = global_start.elapsed().as_secs_f64();
             if elapsed > 0.0 {
                 let mut segments = Vec::new();
-                if self.total_client_to_backend_bytes > 0
+                if self.state.total_client_to_backend_bytes > 0
                     && let Some((avg_value, avg_unit)) =
-                        format_rate(self.total_client_to_backend_bytes, elapsed)
+                        format_rate(self.state.total_client_to_backend_bytes, elapsed)
                 {
                     segments.push(format!("tx={:.2} {}", avg_value, avg_unit));
                 }
-                if self.total_backend_to_client_bytes > 0
+                if self.state.total_backend_to_client_bytes > 0
                     && let Some((avg_value, avg_unit)) =
-                        format_rate(self.total_backend_to_client_bytes, elapsed)
+                        format_rate(self.state.total_backend_to_client_bytes, elapsed)
                 {
                     segments.push(format!("rx={:.2} {}", avg_value, avg_unit));
                 }
@@ -694,11 +803,11 @@ impl Handler<InspectState> for Scheduler {
     fn handle(&mut self, _msg: InspectState, _ctx: &mut Context<Self>) -> Self::Result {
         MessageResult(InspectReply {
             connections: self.current_connection_count(),
-            ready_queue_len: self.ready_queue.len(),
-            flow_ids: self.flows.keys().copied().collect(),
-            total_client_to_backend_bytes: self.total_client_to_backend_bytes,
-            total_backend_to_client_bytes: self.total_backend_to_client_bytes,
-            pending_connection_tasks: self.admission.pending_connection_tasks(),
+            ready_queue_len: self.state.ready_queue.len(),
+            flow_ids: self.state.flows.keys().copied().collect(),
+            total_client_to_backend_bytes: self.state.total_client_to_backend_bytes,
+            total_backend_to_client_bytes: self.state.total_backend_to_client_bytes,
+            pending_connection_tasks: self.state.admission.pending_connection_tasks(),
         })
     }
 }
@@ -708,7 +817,8 @@ impl Handler<RecordUpstreamBytesTest> for Scheduler {
     type Result = ();
 
     fn handle(&mut self, msg: RecordUpstreamBytesTest, _ctx: &mut Context<Self>) -> Self::Result {
-        self.record_client_to_backend_bytes(msg.bytes);
+        self.state.total_client_to_backend_bytes += msg.bytes as u64;
+        self.state.ensure_global_start_time();
     }
 }
 
@@ -877,36 +987,120 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn stale_dequeue_response_after_unregister_does_not_write_to_backend() {
-        let mut scheduler = Scheduler::new(1024, Duration::from_secs(3600));
+    async fn dequeued_packets_become_out_of_queue_pending_writes_while_backend_is_blocked() {
+        let observer = Arc::new(BackendWriteObserver::new());
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_backend_write_observer(observer.clone())
+            .start();
         let queue = QueueActor::new().start();
         let (backend_write, mut backend_peer) = make_live_backend_write().await;
+        let write_guard = backend_write.lock().await;
         let tunnel_lifecycle = TunnelLifecycle::new();
+        let flow = FlowId(14);
+        let packets: [&[u8]; 3] = [b"first-", b"second-", b"third"];
+
+        scheduler
+            .send(Register {
+                flow_id: flow,
+                queue_addr: queue.clone(),
+                backend_write: backend_write.clone(),
+                tunnel_lifecycle,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        for packet in packets {
+            queue
+                .send(crate::actors::queue::Enqueue(
+                    bytes::Bytes::copy_from_slice(packet),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        scheduler.send(FlowReady { flow_id: flow }).await.unwrap();
+        for expected_started in 1..=packets.len() {
+            scheduler.send(QuantumTick).await.unwrap();
+            timeout(
+                Duration::from_secs(1),
+                observer.wait_for_started(expected_started),
+            )
+            .await
+            .expect(
+                "each scheduler tick should dequeue one packet and start its backend write task",
+            );
+        }
+
+        let buffered = queue
+            .send(crate::actors::queue::InspectBufferedState)
+            .await
+            .unwrap();
+        assert_eq!(
+            buffered.packet_count, 0,
+            "QueueActor buffered packets should be drained after dequeue"
+        );
+        assert_eq!(
+            buffered.buffered_bytes, 0,
+            "QueueActor buffered bytes should be zero; they do not include pending backend writes"
+        );
+        assert_eq!(
+            observer.started(),
+            packets.len(),
+            "one out-of-queue backend write task should start for every dequeued packet"
+        );
+        assert_eq!(
+            observer.finished(),
+            0,
+            "held backend write mutex keeps all out-of-queue write operations unfinished"
+        );
+
+        drop(write_guard);
+
+        let mut received = vec![0; packets.iter().map(|packet| packet.len()).sum()];
+        timeout(
+            Duration::from_secs(1),
+            backend_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("releasing the writer should deliver every pending packet")
+        .expect("live backend peer should receive the pending packets");
+        assert_eq!(
+            received,
+            packets.concat(),
+            "mutex-serialized pending writes should reach the backend in dequeue order"
+        );
+        timeout(
+            Duration::from_secs(1),
+            observer.wait_for_finished(packets.len()),
+        )
+        .await
+        .expect("all pending backend write tasks should finish after the writer is released");
+        assert_eq!(
+            observer.finished(),
+            packets.len(),
+            "no out-of-queue backend write task should remain unfinished"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn stale_dequeue_response_after_unregister_does_not_write_to_backend() {
+        let mut state = SchedulerState::new(1024);
         let flow = FlowId(13);
 
-        scheduler.register(flow, queue, backend_write.clone(), tunnel_lifecycle.clone());
-        assert!(scheduler.unregister(flow));
+        state.register(flow).unwrap();
+        assert!(state.unregister(flow));
 
-        scheduler.handle_dequeue_success(
+        let effect = state.on_dequeue_result(
             flow,
-            backend_write,
-            tunnel_lifecycle,
-            DequeueResult {
+            DequeueEvent::Packet(DequeueResult {
                 packet: bytes::Bytes::from_static(b"stale dequeue response"),
                 remaining: 0,
                 ready_for_more: false,
-            },
+            }),
         );
-
-        let mut buf = [0u8; 64];
-        let read_result = timeout(Duration::from_millis(50), backend_peer.read(&mut buf)).await;
-        match read_result {
-            Err(_) | Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!(
-                "stale dequeue responses after unregister must not write to the backend, read {n} bytes"
-            ),
-            Ok(Err(e)) => panic!("backend peer read failed unexpectedly: {e}"),
-        }
+        assert!(effect.is_none(), "stale dequeues must not produce writes");
     }
 
     #[actix_rt::test]
@@ -1351,16 +1545,10 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_recommended_quantum_selection() {
-        let queue = QueueActor::new().start();
-        let backend_write = make_backend_write().await;
         let default_quantum = 8192;
 
         // Case 1: No stats -> default_quantum
-        let flow = FlowEntry::new(
-            queue.clone(),
-            backend_write.clone(),
-            test_tunnel_lifecycle(),
-        );
+        let flow = FlowEntry::new();
         assert_eq!(
             flow.recommended_quantum(default_quantum),
             default_quantum,
@@ -1368,11 +1556,7 @@ mod tests {
         );
 
         // Case 2: Small packets (< 200 bytes) -> MIN_QUANTUM (1500)
-        let mut flow = FlowEntry::new(
-            queue.clone(),
-            backend_write.clone(),
-            test_tunnel_lifecycle(),
-        );
+        let mut flow = FlowEntry::new();
         flow.update_stats(100); // Set avg to 100
         assert_eq!(
             flow.recommended_quantum(default_quantum),
@@ -1381,11 +1565,7 @@ mod tests {
         );
 
         // Case 3: Normal packets -> Scaled (avg * 10)
-        let mut flow = FlowEntry::new(
-            queue.clone(),
-            backend_write.clone(),
-            test_tunnel_lifecycle(),
-        );
+        let mut flow = FlowEntry::new();
         flow.update_stats(500); // Set avg to 500
         // Target = 500 * 10 = 5000
         assert_eq!(
@@ -1395,11 +1575,7 @@ mod tests {
         );
 
         // Case 4: Large packets -> MAX_QUANTUM (16384)
-        let mut flow = FlowEntry::new(
-            queue.clone(),
-            backend_write.clone(),
-            test_tunnel_lifecycle(),
-        );
+        let mut flow = FlowEntry::new();
         flow.update_stats(2000); // Set avg to 2000
         // Target = 2000 * 10 = 20000 -> Clamped to 16384
         assert_eq!(
@@ -1411,11 +1587,9 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_quantum_adapts_with_filtered_average() {
-        let queue = QueueActor::new().start();
-        let backend_write = make_backend_write().await;
         let default_quantum = 4096;
 
-        let mut flow = FlowEntry::new(queue, backend_write, test_tunnel_lifecycle());
+        let mut flow = FlowEntry::new();
 
         // Initial tiny packets force the minimum quantum.
         flow.update_stats(100);
