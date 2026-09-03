@@ -253,6 +253,10 @@ impl SchedulerState {
     }
 
     fn register(&mut self, flow_id: FlowId) -> Result<(), RegisterError> {
+        if self.flows.contains_key(&flow_id) {
+            return Err(RegisterError::DuplicateRegisteredConnection { flow_id });
+        }
+
         self.admission.try_acquire_registered_connection()?;
         self.admission.release_connection_task_reservation(flow_id);
         self.flows.insert(flow_id, FlowEntry::new());
@@ -1137,6 +1141,57 @@ mod tests {
             matches!(result2, Err(RegisterError::MaxConnectionsReached { .. })),
             "second registration should be rejected when at limit"
         );
+    }
+
+    #[actix_rt::test]
+    async fn register_rejects_duplicate_flow_id_without_consuming_capacity() {
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(2))
+            .start();
+        let flow_id = FlowId(1);
+
+        scheduler
+            .send(Register {
+                flow_id,
+                queue_addr: QueueActor::new().start(),
+                backend_write: make_backend_write().await,
+                tunnel_lifecycle: test_tunnel_lifecycle(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let duplicate = scheduler
+            .send(Register {
+                flow_id,
+                queue_addr: QueueActor::new().start(),
+                backend_write: make_backend_write().await,
+                tunnel_lifecycle: test_tunnel_lifecycle(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            duplicate,
+            Err(RegisterError::DuplicateRegisteredConnection { flow_id: FlowId(1) })
+        ));
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.connections, 1,
+            "duplicate registration must not use capacity"
+        );
+
+        scheduler.send(Unregister { flow_id }).await.unwrap();
+        scheduler
+            .send(Register {
+                flow_id: FlowId(2),
+                queue_addr: QueueActor::new().start(),
+                backend_write: make_backend_write().await,
+                tunnel_lifecycle: test_tunnel_lifecycle(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[actix_rt::test]

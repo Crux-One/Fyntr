@@ -9,6 +9,7 @@ use crate::limits::MaxConnections;
 pub(crate) enum RegisterError {
     MaxConnectionsReached { max: usize },
     DuplicateConnectionTask { flow_id: FlowId },
+    DuplicateRegisteredConnection { flow_id: FlowId },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -23,6 +24,9 @@ impl std::fmt::Display for RegisterError {
                     "duplicate pending connection task reservation for flow{}",
                     flow_id.0
                 )
+            }
+            Self::DuplicateRegisteredConnection { flow_id } => {
+                write!(f, "duplicate registered connection for flow{}", flow_id.0)
             }
         }
     }
