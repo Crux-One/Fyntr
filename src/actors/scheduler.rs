@@ -14,6 +14,8 @@ mod quantum_strategy;
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
 #[cfg(test)]
+use tokio::net::tcp::OwnedReadHalf;
+#[cfg(test)]
 use tokio::sync::Notify;
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex, time::Instant};
 
@@ -149,8 +151,10 @@ struct SchedulerState {
 struct BackendWriteObserver {
     started: AtomicUsize,
     finished: AtomicUsize,
+    errors: AtomicUsize,
     started_notify: Notify,
     finished_notify: Notify,
+    errors_notify: Notify,
 }
 
 #[cfg(test)]
@@ -159,8 +163,10 @@ impl BackendWriteObserver {
         Self {
             started: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
             started_notify: Notify::new(),
             finished_notify: Notify::new(),
+            errors_notify: Notify::new(),
         }
     }
 
@@ -172,6 +178,11 @@ impl BackendWriteObserver {
     fn mark_finished(&self) {
         self.finished.fetch_add(1, Ordering::SeqCst);
         self.finished_notify.notify_waiters();
+    }
+
+    fn mark_error(&self) {
+        self.errors.fetch_add(1, Ordering::SeqCst);
+        self.errors_notify.notify_waiters();
     }
 
     fn started(&self) -> usize {
@@ -196,6 +207,16 @@ impl BackendWriteObserver {
         loop {
             let notified = self.finished_notify.notified();
             if self.finished() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_error(&self, expected: usize) {
+        loop {
+            let notified = self.errors_notify.notified();
+            if self.errors.load(Ordering::SeqCst) >= expected {
                 return;
             }
             notified.await;
@@ -625,7 +646,9 @@ impl Scheduler {
                     }
                 }
                 SchedulerEffect::RequestDequeue { flow_id } => self.request_dequeue(flow_id, ctx),
-                SchedulerEffect::Write { flow_id, packet } => self.write(flow_id, packet),
+                SchedulerEffect::Write { flow_id, packet } => {
+                    self.write(flow_id, packet, ctx.address())
+                }
                 SchedulerEffect::Unregister { flow_id } => {
                     ctx.address().do_send(Unregister { flow_id });
                 }
@@ -665,7 +688,7 @@ impl Scheduler {
             .spawn(ctx);
     }
 
-    fn write(&self, flow: FlowId, packet: bytes::Bytes) {
+    fn write(&self, flow: FlowId, packet: bytes::Bytes, scheduler: Addr<Self>) {
         let Some(resources) = self.flow_resources.get(&flow) else {
             debug!(
                 "flow{}: skipping dequeued backend write because flow is no longer registered",
@@ -676,7 +699,7 @@ impl Scheduler {
         let backend_write = resources.backend_write();
         let tunnel_lifecycle = resources.tunnel_lifecycle();
         tunnel_lifecycle.record_activity(TunnelActivity::QueueDequeued);
-        self.spawn_backend_write(flow, backend_write, packet, tunnel_lifecycle);
+        self.spawn_backend_write(flow, backend_write, packet, tunnel_lifecycle, scheduler);
     }
 
     fn spawn_backend_write(
@@ -685,6 +708,7 @@ impl Scheduler {
         backend_write: Arc<Mutex<OwnedWriteHalf>>,
         data: bytes::Bytes,
         tunnel_lifecycle: TunnelLifecycle,
+        scheduler: Addr<Self>,
     ) {
         #[cfg(test)]
         let observer = self.backend_write_observer.clone();
@@ -724,6 +748,11 @@ impl Scheduler {
                 write_result = bw.write_all(&data) => {
                     if let Err(e) = write_result {
                         warn!("flow{}: backend write error: {}", flow.0, e);
+                        scheduler.do_send(Unregister { flow_id: flow });
+                        #[cfg(test)]
+                        if let Some(observer) = &observer {
+                            observer.mark_error();
+                        }
                     } else {
                         tunnel_lifecycle.record_activity(TunnelActivity::BackendWrite);
                     }
@@ -841,7 +870,7 @@ mod tests {
         TunnelLifecycle::new()
     }
 
-    async fn make_live_backend_write() -> (Arc<Mutex<OwnedWriteHalf>>, TcpStream) {
+    async fn make_live_backend_halves() -> (Arc<Mutex<OwnedWriteHalf>>, OwnedReadHalf, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -852,8 +881,13 @@ mod tests {
 
         let peer = TcpStream::connect(addr).await.unwrap();
         let server_stream = accept_handle.await.unwrap();
-        let (_read_half, write_half) = server_stream.into_split();
-        (Arc::new(Mutex::new(write_half)), peer)
+        let (read_half, write_half) = server_stream.into_split();
+        (Arc::new(Mutex::new(write_half)), read_half, peer)
+    }
+
+    async fn make_live_backend_write() -> (Arc<Mutex<OwnedWriteHalf>>, TcpStream) {
+        let (write_half, _read_half, peer) = make_live_backend_halves().await;
+        (write_half, peer)
     }
 
     #[actix_rt::test]
@@ -987,6 +1021,69 @@ mod tests {
         assert!(
             read_result.is_err(),
             "backend write task should exit while waiting for the write lock after idle shutdown"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn backend_write_error_unregisters_flow_and_releases_capacity() {
+        let observer = Arc::new(BackendWriteObserver::new());
+        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+            .with_max_connections(max_connections_from_raw(1))
+            .with_backend_write_observer(observer.clone())
+            .start();
+        let queue = QueueActor::new().start();
+        let (backend_write, mut backend_read, backend_peer) = make_live_backend_halves().await;
+        let flow_id = FlowId(15);
+
+        scheduler
+            .send(Register {
+                flow_id,
+                queue_addr: queue.clone(),
+                backend_write,
+                tunnel_lifecycle: test_tunnel_lifecycle(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        #[allow(deprecated)]
+        backend_peer.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(backend_peer);
+
+        let mut reset_probe = [0; 1];
+        let reset_result = timeout(Duration::from_secs(1), backend_read.read(&mut reset_probe))
+            .await
+            .expect("server should observe the peer reset before attempting a backend write");
+        assert!(
+            reset_result.is_err(),
+            "server read half should observe the backend peer reset"
+        );
+
+        queue
+            .send(crate::actors::queue::Enqueue(bytes::Bytes::from_static(
+                b"write after backend reset",
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.send(FlowReady { flow_id }).await.unwrap();
+        scheduler.send(QuantumTick).await.unwrap();
+        timeout(Duration::from_secs(1), observer.wait_for_error(1))
+            .await
+            .expect("backend reset should cause a write error");
+
+        let reply = scheduler.send(super::InspectState).await.unwrap();
+        assert_eq!(
+            reply.connections, 0,
+            "a backend write error should promptly unregister the flow"
+        );
+        assert!(
+            reply.flow_ids.is_empty(),
+            "unregistered flow should be removed"
+        );
+        assert!(
+            scheduler.send(CanAcceptConnection).await.unwrap(),
+            "unregistering after a backend write error should release admission capacity"
         );
     }
 
