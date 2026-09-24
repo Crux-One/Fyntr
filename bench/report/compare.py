@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare medians from old/new fyntr-bench JSON trials."""
+"""Compare aggregate results from old/new fyntr-bench JSON trials."""
 
 import argparse
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 FIELDS = (
-    ("completed_without_protocol_error", "integrity success rate"),
+    ("completed_without_protocol_error", "successful trial rate"),
     ("protocol_failures", "protocol failures"),
     ("throughput_bytes_per_second", "throughput B/s"),
     ("transaction_rate_per_second", "transactions/s"),
@@ -19,6 +19,13 @@ FIELDS = (
     ("fyntr_cpu_ns_per_transferred_byte", "Fyntr CPU ns/B"),
     ("fyntr_peak_rss_bytes", "Fyntr peak RSS bytes"),
 )
+
+RATE_FIELDS = {
+    "completed_without_protocol_error",
+    "recovered",
+    "client_backpressure_observed",
+}
+SUM_FIELDS = {"protocol_failures"}
 S7_FIELDS = (
     ("recovered", "S7 recovery rate"),
     ("recovery_time_ms", "S7 recovery time ms"),
@@ -64,13 +71,19 @@ def groups(rows):
     return result
 
 
-def median(rows, key, nested=None):
+def aggregate(rows, key, nested=None):
     values = []
     for row in rows:
         value = row.get(nested, {}).get(key) if nested else row.get(key)
         if value is not None:
             values.append(float(value))
-    return statistics.median(values) if values else None
+    if not values:
+        return None
+    if key in RATE_FIELDS:
+        return sum(values) / len(values)
+    if key in SUM_FIELDS:
+        return sum(values)
+    return statistics.median(values)
 
 
 def display(value):
@@ -103,8 +116,8 @@ def main():
             fields.extend(S7_FIELDS)
         for field, label in fields:
             nested = "s7" if (field, label) in S7_FIELDS else None
-            old = median(old_groups[key], field, nested)
-            new = median(new_groups[key], field, nested)
+            old = aggregate(old_groups[key], field, nested)
+            new = aggregate(new_groups[key], field, nested)
             if old is None and new is None:
                 continue
             print(f"{label:30} {display(old):>16} {display(new):>16} {delta(old, new):>12}")
