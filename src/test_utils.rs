@@ -1,12 +1,7 @@
-use std::sync::Arc;
-
-use tokio::{
-    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::Mutex,
-};
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
 
 /// Helper to obtain an `OwnedWriteHalf` backed by a live TCP connection for tests.
-pub(crate) async fn make_backend_write() -> Arc<Mutex<OwnedWriteHalf>> {
+pub(crate) async fn make_backend_write() -> OwnedWriteHalf {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -20,5 +15,5 @@ pub(crate) async fn make_backend_write() -> Arc<Mutex<OwnedWriteHalf>> {
     drop(client_stream);
 
     let (_read_half, write_half) = server_stream.into_split();
-    Arc::new(Mutex::new(write_half))
+    write_half
 }
