@@ -89,6 +89,36 @@ p99 latency ms                           18.200            8.700      -52.20%
 Fyntr peak RSS bytes              440401920.000     78643200.000      -82.14%
 ```
 
+## Charts
+
+`plot.py` reads the same trial JSON without changing it and writes both SVG and
+PNG. Matplotlib is only needed while rendering, so use `uv` to provide it
+without adding a normal project dependency. Pair matching old/new result
+directories for each scenario; the final 10-trial run can be rendered as
+follows:
+
+```sh
+uv run --with matplotlib python bench/report/plot.py \
+  --old-label v0.4.7 --new-label v0.4.8 \
+  --pair bench/results/s1-rerun-old bench/results/s1-rerun-new \
+  --pair bench/results/s2-100-rerun-old bench/results/s2-100-rerun-new \
+  --pair bench/results/s2-1000-rerun-old bench/results/s2-1000-rerun-new \
+  --pair bench/results/s3-rerun-old bench/results/s3-rerun-new \
+  --pair bench/results/s7-rerun-old bench/results/s7-rerun-new \
+  --output-dir bench/results/charts
+```
+
+This creates `normal-load.svg`/`.png` and `s7.svg`/`.png`. The normal-load
+chart shows each trial as a point and its median as a short line. Each metric
+is separately normalized to the matching old median (100), so it compares
+change within a metric, not the units of throughput, CPU, RSS, and latency to
+one another. Panels omit scenarios where that metric was not measured. The S7
+chart uses absolute values for RSS, shows generated and acknowledged record
+counts together, and labels recovery as successful trials over all trials in a
+separate panel. Its write-duration view is supporting backpressure evidence;
+`recovery_time_ms` is intentionally not a headline chart because it only
+measures the first ACK after resume.
+
 ## Smoke tests
 
 The unit tests are short and do not launch a benchmark:
