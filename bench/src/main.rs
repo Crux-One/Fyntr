@@ -5,13 +5,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tokio::{
@@ -19,7 +19,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
     task::{JoinHandle, JoinSet},
-    time::{sleep, sleep_until, timeout, timeout_at, MissedTickBehavior},
+    time::{MissedTickBehavior, sleep, sleep_until, timeout, timeout_at},
 };
 
 const MAGIC: [u8; 4] = *b"FYB1";
@@ -579,7 +579,7 @@ async fn run_bulk_flow(
     let writer_acknowledged = acknowledged.clone();
     let writer_phase = phase.clone();
     let writer_payload = payload.clone();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut sequence = 0_u64;
         'sending: while writer_phase.load(Ordering::Acquire) < 2 {
             while sequence.saturating_sub(writer_acknowledged.load(Ordering::Acquire))
@@ -599,13 +599,44 @@ async fn run_bulk_flow(
     });
 
     let mut expected = 1_u64;
-    while phase.load(Ordering::Acquire) < 2 || expected <= sent.load(Ordering::Acquire) {
+    let mut writer_finished = false;
+    loop {
+        if phase.load(Ordering::Acquire) >= 2 && expected > sent.load(Ordering::Acquire) {
+            if !writer_finished {
+                (&mut writer_task).await??;
+                writer_finished = true;
+                continue;
+            }
+            break;
+        }
+
         let sequence = match read_ack(&mut reader).await {
             Ok(sequence) => sequence,
-            Err(_error) if phase.load(Ordering::Acquire) >= 2 => break,
-            Err(error) => return Err(error),
+            Err(error)
+                if phase.load(Ordering::Acquire) >= 2
+                    && expected > sent.load(Ordering::Acquire) =>
+            {
+                if !writer_finished {
+                    (&mut writer_task).await??;
+                }
+                if expected > sent.load(Ordering::Acquire) {
+                    break;
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                if !writer_finished {
+                    writer_task.abort();
+                    let _ = (&mut writer_task).await;
+                }
+                return Err(error);
+            }
         };
         if sequence != expected {
+            if !writer_finished {
+                writer_task.abort();
+                let _ = (&mut writer_task).await;
+            }
             bail!("ACK order mismatch: expected {expected}, received {sequence}")
         }
         acknowledged.store(sequence, Ordering::Release);
@@ -621,7 +652,6 @@ async fn run_bulk_flow(
             }
         }
     }
-    writer_task.abort();
     Ok(())
 }
 
@@ -1037,5 +1067,73 @@ mod tests {
         reader.read_exact(&mut received).await.unwrap();
         assert_eq!(received.to_vec(), payload(128));
         send.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_flow_reports_missing_ack_after_measurement() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut backend, _) = listener.accept().await.unwrap();
+        let phase = Arc::new(AtomicU8::new(1));
+        let flow = tokio::spawn(run_bulk_flow(
+            client,
+            1,
+            false,
+            phase.clone(),
+            Arc::new(Stats::default()),
+        ));
+
+        let mut record = [0_u8; RECORD_HEADER_BYTES + 1];
+        backend.read_exact(&mut record).await.unwrap();
+        backend.read_exact(&mut record).await.unwrap();
+        phase.store(2, Ordering::Release);
+        drop(backend);
+
+        let result = timeout(Duration::from_secs(2), flow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "missing ACKs must fail the bulk flow");
+    }
+
+    #[tokio::test]
+    async fn bulk_flow_finishes_after_all_acks() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut backend, _) = listener.accept().await.unwrap();
+        let phase = Arc::new(AtomicU8::new(1));
+        let flow = tokio::spawn(run_bulk_flow(
+            client,
+            1,
+            false,
+            phase.clone(),
+            Arc::new(Stats::default()),
+        ));
+
+        let mut header = [0_u8; RECORD_HEADER_BYTES];
+        let mut body = [0_u8; 1];
+        for _ in 0..2 {
+            backend.read_exact(&mut header).await.unwrap();
+            backend.read_exact(&mut body).await.unwrap();
+            backend.write_all(&header[4..12]).await.unwrap();
+        }
+        phase.store(2, Ordering::Release);
+
+        while backend.read(&mut header[..1]).await.unwrap() != 0 {
+            backend.read_exact(&mut header[1..]).await.unwrap();
+            backend.read_exact(&mut body).await.unwrap();
+            backend.write_all(&header[4..12]).await.unwrap();
+        }
+        drop(backend);
+
+        let result = timeout(Duration::from_secs(2), flow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok(), "all ACKed records should drain cleanly");
     }
 }
