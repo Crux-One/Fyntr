@@ -42,7 +42,7 @@ impl fmt::Display for EnqueueError {
                 max_buffered_bytes,
             } => write!(
                 f,
-                "queue buffered bytes {} exceeds limit {}",
+                "queued and writer-pending bytes {} exceeds limit {}",
                 attempted_total, max_buffered_bytes
             ),
         }
@@ -60,6 +60,12 @@ pub(crate) struct AddQuantum(pub usize);
 pub(crate) struct Dequeue {
     pub max_bytes: usize,
 }
+
+/// Releases bytes that a dequeue reserved atomically after the corresponding
+/// writer operation finishes.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub(crate) struct ReleasePendingBytes(pub usize);
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -85,6 +91,7 @@ pub(crate) struct DequeueResult {
 pub(crate) struct QueueState {
     buf: VecDeque<Bytes>,
     buffered_bytes: usize,
+    writer_pending_bytes: usize,
     deficit: usize,
     closing: bool,
 }
@@ -99,7 +106,10 @@ impl QueueState {
             });
         }
 
-        let attempted_total = self.buffered_bytes.saturating_add(packet_len);
+        let attempted_total = self
+            .buffered_bytes
+            .saturating_add(self.writer_pending_bytes)
+            .saturating_add(packet_len);
         if attempted_total > MAX_QUEUE_BUFFERED_BYTES {
             return Err(EnqueueError::QueueBufferExceeded {
                 attempted_total,
@@ -108,7 +118,7 @@ impl QueueState {
         }
 
         self.buf.push_back(data);
-        self.buffered_bytes = attempted_total;
+        self.buffered_bytes = self.buffered_bytes.saturating_add(packet_len);
         Ok(())
     }
 
@@ -122,6 +132,7 @@ impl QueueState {
                 let pkt = self.buf.pop_front().unwrap();
                 self.deficit -= pkt.len();
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(pkt.len());
+                self.writer_pending_bytes = self.writer_pending_bytes.saturating_add(pkt.len());
                 let ready_for_more = self
                     .buf
                     .front()
@@ -156,6 +167,13 @@ impl QueueState {
     pub(crate) fn stop_now(&mut self) {
         self.buf.clear();
         self.buffered_bytes = 0;
+    }
+
+    pub(crate) fn release_pending_bytes(&mut self, completed_bytes: usize) {
+        self.writer_pending_bytes = self
+            .writer_pending_bytes
+            .checked_sub(completed_bytes)
+            .expect("completed writer bytes exceed the queue's pending reservation");
     }
 }
 
@@ -256,6 +274,14 @@ impl Handler<Dequeue> for QueueActor {
     }
 }
 
+impl Handler<ReleasePendingBytes> for QueueActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: ReleasePendingBytes, _ctx: &mut Self::Context) {
+        self.state.release_pending_bytes(msg.0);
+    }
+}
+
 impl Handler<BindScheduler> for QueueActor {
     type Result = ();
 
@@ -289,6 +315,7 @@ impl Handler<StopNow> for QueueActor {
 pub(crate) struct BufferedState {
     pub packet_count: usize,
     pub buffered_bytes: usize,
+    pub writer_pending_bytes: usize,
 }
 
 #[cfg(test)]
@@ -304,6 +331,7 @@ impl Handler<InspectBufferedState> for QueueActor {
         MessageResult(BufferedState {
             packet_count: self.state.buf.len(),
             buffered_bytes: self.state.buffered_bytes,
+            writer_pending_bytes: self.state.writer_pending_bytes,
         })
     }
 }
@@ -489,6 +517,70 @@ mod tests {
                 attempted_total: MAX_QUEUE_BUFFERED_BYTES + 1,
                 max_buffered_bytes: MAX_QUEUE_BUFFERED_BYTES,
             })
+        );
+    }
+
+    #[test]
+    fn dequeue_reserves_bytes_before_another_enqueue_can_refill_capacity() {
+        let mut state = QueueState::default();
+        let chunk = Bytes::from(vec![0u8; MAX_QUEUE_PACKET_BYTES]);
+        for _ in 0..(MAX_QUEUE_BUFFERED_BYTES / MAX_QUEUE_PACKET_BYTES) {
+            state.enqueue(chunk.clone()).unwrap();
+        }
+        state.add_quantum(usize::MAX);
+        state.dequeue(MAX_QUEUE_PACKET_BYTES).0.unwrap();
+
+        assert_eq!(
+            state.buffered_bytes + state.writer_pending_bytes,
+            MAX_QUEUE_BUFFERED_BYTES
+        );
+        assert!(matches!(
+            state.enqueue(Bytes::from_static(b"x")),
+            Err(EnqueueError::QueueBufferExceeded { .. })
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn completion_does_not_erase_a_newer_dequeue_reservation() {
+        let queue = QueueActor::new().start();
+        let chunk = Bytes::from(vec![0_u8; MAX_QUEUE_PACKET_BYTES]);
+        for _ in 0..(MAX_QUEUE_BUFFERED_BYTES / MAX_QUEUE_PACKET_BYTES) {
+            queue.send(Enqueue(chunk.clone())).await.unwrap().unwrap();
+        }
+        queue
+            .send(AddQuantum(MAX_QUEUE_PACKET_BYTES * 2))
+            .await
+            .unwrap();
+
+        queue
+            .send(Dequeue {
+                max_bytes: MAX_QUEUE_PACKET_BYTES,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .send(Dequeue {
+                max_bytes: MAX_QUEUE_PACKET_BYTES,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .send(ReleasePendingBytes(MAX_QUEUE_PACKET_BYTES))
+            .await
+            .unwrap();
+
+        queue.send(Enqueue(chunk.clone())).await.unwrap().unwrap();
+        assert!(matches!(
+            queue.send(Enqueue(chunk)).await.unwrap(),
+            Err(EnqueueError::QueueBufferExceeded { .. })
+        ));
+        let state = queue.send(InspectBufferedState).await.unwrap();
+        assert_eq!(state.writer_pending_bytes, MAX_QUEUE_PACKET_BYTES);
+        assert_eq!(
+            state.buffered_bytes + state.writer_pending_bytes,
+            MAX_QUEUE_BUFFERED_BYTES
         );
     }
 
