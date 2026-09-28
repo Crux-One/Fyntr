@@ -3,14 +3,12 @@ use super::FlowId;
 use actix::prelude::*;
 use bytes::Bytes;
 use log::{debug, info, warn};
-use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::Mutex,
     time::{Duration, Instant, sleep},
 };
 
@@ -120,7 +118,7 @@ pub(crate) async fn register_tunnel(
         .send(Register {
             flow_id,
             queue_addr: queue_tx.clone(),
-            backend_write: Arc::new(Mutex::new(backend_write)),
+            backend_write,
             tunnel_lifecycle: lifecycle.clone(),
         })
         .await
@@ -311,7 +309,7 @@ impl ClientToBackendActor {
                     retries = retries.saturating_add(1);
                     if retries == 1 || retries.is_multiple_of(ENQUEUE_BACKPRESSURE_LOG_EVERY) {
                         warn!(
-                            "flow{}: queue buffered bytes {} exceeds limit {}; pausing upstream reads",
+                            "flow{}: queued and writer-pending bytes {} exceeds limit {}; pausing upstream reads",
                             flow_id.0, attempted_total, max_buffered_bytes
                         );
                     }
@@ -965,12 +963,18 @@ mod tests {
         let drain_handle = tokio::spawn(async move {
             sleep(Duration::from_millis(20)).await;
             queue_for_drain.do_send(AddQuantum(MAX_QUEUE_PACKET_BYTES));
-            queue_for_drain
+            let result = queue_for_drain
                 .send(Dequeue {
                     max_bytes: MAX_DEQUEUE_BYTES,
                 })
                 .await
-                .expect("dequeue request should succeed")
+                .expect("dequeue request should succeed");
+            if let Some(result) = &result {
+                queue_for_drain.do_send(crate::actors::queue::ReleasePendingBytes(
+                    result.packet.len(),
+                ));
+            }
+            result
         });
 
         let enqueue_result = timeout(
