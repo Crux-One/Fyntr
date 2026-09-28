@@ -624,9 +624,19 @@ async fn run_bulk_flow(
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !writer_finished {
+                    writer_task.abort();
+                    let _ = (&mut writer_task).await;
+                }
+                return Err(error);
+            }
         };
         if sequence != expected {
+            if !writer_finished {
+                writer_task.abort();
+                let _ = (&mut writer_task).await;
+            }
             bail!("ACK order mismatch: expected {expected}, received {sequence}")
         }
         acknowledged.store(sequence, Ordering::Release);
