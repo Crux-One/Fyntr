@@ -309,7 +309,7 @@ impl ClientToBackendActor {
                     retries = retries.saturating_add(1);
                     if retries == 1 || retries.is_multiple_of(ENQUEUE_BACKPRESSURE_LOG_EVERY) {
                         warn!(
-                            "flow{}: queued and writer-pending bytes {} exceeds limit {}; pausing upstream reads",
+                            "flow{}: client-to-backend enqueue would exceed per-flow byte limit (attempted: {} bytes, limit: {} bytes); waiting for capacity",
                             flow_id.0, attempted_total, max_buffered_bytes
                         );
                     }
