@@ -39,7 +39,6 @@ pub const DEFAULT_CONNECT_START_INTERVAL_MS: u64 = 5;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_QUANTUM: usize = 16 * 1024; // 16 KB
-const DEFAULT_TICK_MS: u64 = 1; // 1 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
@@ -601,8 +600,7 @@ async fn run_server(
 
     // Start the scheduler
     let quantum = DEFAULT_QUANTUM;
-    let tick = Duration::from_millis(DEFAULT_TICK_MS);
-    let scheduler = Scheduler::new(quantum, tick)
+    let scheduler = Scheduler::new(quantum)
         .with_max_connections(max_connections)
         .start();
 

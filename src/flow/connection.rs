@@ -581,7 +581,7 @@ impl Actor for BackendToClientActor {
 mod tests {
     use super::*;
     use crate::actors::{
-        queue::{AddQuantum, Dequeue, Enqueue, EnqueueError, QueueActor},
+        queue::{Enqueue, EnqueueError, InspectBufferedState, QueueActor, ServiceTurn},
         scheduler::{Register, Scheduler},
     };
     use crate::limits::{MAX_DEQUEUE_BYTES, MAX_QUEUE_PACKET_BYTES, max_connections_from_raw};
@@ -661,7 +661,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn registered_tunnel_cleanup_unregisters_if_relay_does_not_start() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+        let scheduler = Scheduler::new(1024)
             .with_max_connections(max_connections_from_raw(1))
             .start();
         let (backend_stream, _peer) = build_backend_stream().await;
@@ -686,7 +686,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn registration_capacity_failure_leaves_existing_flow_registered() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+        let scheduler = Scheduler::new(1024)
             .with_max_connections(max_connections_from_raw(1))
             .start();
         let (first_backend, _first_peer) = build_backend_stream().await;
@@ -737,7 +737,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn client_disconnect_triggers_unregister_and_queue_stop() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
 
         let queue = QueueActor::new().start();
         let backend_write = make_backend_write().await;
@@ -768,7 +768,7 @@ mod tests {
 
         let mut stopped = false;
         for _ in 0..20 {
-            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+            if queue.send(InspectBufferedState).await.is_err() {
                 stopped = true;
                 break;
             }
@@ -783,7 +783,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn client_to_backend_actor_honors_initial_idle_shutdown() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
 
         let queue = QueueActor::new().start();
         let backend_write = make_backend_write().await;
@@ -815,7 +815,7 @@ mod tests {
 
         let mut stopped = false;
         for _ in 0..20 {
-            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+            if queue.send(InspectBufferedState).await.is_err() {
                 stopped = true;
                 break;
             }
@@ -830,7 +830,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn backend_to_client_actor_honors_initial_idle_shutdown() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
 
         let (backend_read, _backend_peer) = build_live_read_half().await;
         let (client_write, mut client_peer) = build_live_write_half().await;
@@ -862,7 +862,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn idle_timeout_unregisters_flow_and_stops_queue() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
 
         let queue = QueueActor::new().start();
         let backend_write = make_backend_write().await;
@@ -898,7 +898,7 @@ mod tests {
 
         let mut stopped = false;
         for _ in 0..20 {
-            if queue.send(Dequeue { max_bytes: 1024 }).await.is_err() {
+            if queue.send(InspectBufferedState).await.is_err() {
                 stopped = true;
                 break;
             }
@@ -910,7 +910,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn idle_timeout_starts_when_tunnel_starts() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
 
         let queue = QueueActor::new().start();
         let backend_write = make_backend_write().await;
@@ -949,7 +949,7 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
 
         assert!(
-            queue.send(Dequeue { max_bytes: 1024 }).await.is_ok(),
+            queue.send(InspectBufferedState).await.is_ok(),
             "idle timeout should start from tunnel start, not signal creation"
         );
     }
@@ -962,17 +962,15 @@ mod tests {
         let queue_for_drain = queue.clone();
         let drain_handle = tokio::spawn(async move {
             sleep(Duration::from_millis(20)).await;
-            queue_for_drain.do_send(AddQuantum(MAX_QUEUE_PACKET_BYTES));
             let result = queue_for_drain
-                .send(Dequeue {
-                    max_bytes: MAX_DEQUEUE_BYTES,
+                .send(ServiceTurn {
+                    quantum: MAX_QUEUE_PACKET_BYTES,
+                    writer_capacity: MAX_DEQUEUE_BYTES,
                 })
                 .await
                 .expect("dequeue request should succeed");
-            if let Some(result) = &result {
-                queue_for_drain.do_send(crate::actors::queue::ReleasePendingBytes(
-                    result.packet.len(),
-                ));
+            for packet in &result.packets {
+                queue_for_drain.do_send(crate::actors::queue::ReleasePendingBytes(packet.len()));
             }
             result
         });
@@ -992,8 +990,8 @@ mod tests {
             .await
             .expect("drain task should complete without panic");
         assert!(
-            dequeue_result.is_some(),
-            "drain dequeue should return Some once quantum is added"
+            !dequeue_result.packets.is_empty(),
+            "service turn should drain packets once quantum is added"
         );
 
         assert!(

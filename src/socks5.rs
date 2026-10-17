@@ -823,7 +823,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_when_no_supported_authentication_method_is_offered() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let input = vec![SOCKS5_VERSION, 0x01, 0x02];
 
         let (result, response) = exchange(scheduler, default_policy(), input).await;
@@ -834,7 +834,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_unsupported_command_with_command_not_supported_reply() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let request = ipv4_request(0x02, Ipv4Addr::LOCALHOST, 443);
         let input = with_no_auth_greeting(&request);
         let expected = expected_failure_exchange(Socks5Reply::CommandNotSupported);
@@ -847,7 +847,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_target_denied_by_connect_policy() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let request = ipv4_request(SOCKS5_CMD_CONNECT, Ipv4Addr::LOCALHOST, 443);
         let input = with_no_auth_greeting(&request);
         let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
@@ -860,7 +860,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_target_blocked_by_threat_feed() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let request = domain_request("api.example.invalid", 443);
         let input = with_no_auth_greeting(&request);
         let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
@@ -878,7 +878,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_absolute_idna_domain_matching_normalized_threat() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let request = domain_request("BÜCHER.DE.", 443);
         let input = with_no_auth_greeting(&request);
         let expected = expected_failure_exchange(Socks5Reply::ConnectionNotAllowed);
@@ -905,7 +905,7 @@ mod tests {
             "１２７.０.０.１",
             "１２７．０．０．１",
         ] {
-            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let scheduler = Scheduler::new(1024).start();
             let request = domain_request(host, 443);
             let input = with_no_auth_greeting(&request);
 
@@ -930,7 +930,7 @@ mod tests {
             "..",
             "...",
         ] {
-            let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+            let scheduler = Scheduler::new(1024).start();
             let input = with_no_auth_greeting(&domain_request(host, 443));
 
             let (result, response) = exchange(scheduler, default_policy(), input).await;
@@ -942,7 +942,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn rejects_before_policy_resolution_when_scheduler_is_at_capacity() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+        let scheduler = Scheduler::new(1024)
             .with_max_connections(max_connections_from_raw(1))
             .start();
         let queue = QueueActor::new().start();
@@ -970,7 +970,7 @@ mod tests {
     #[actix_rt::test]
     async fn times_out_waiting_for_greeting() {
         time::pause();
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let response_task = tokio::spawn(exchange(scheduler, default_policy(), Vec::new()));
 
         task::yield_now().await;
