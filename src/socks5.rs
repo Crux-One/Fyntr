@@ -20,7 +20,7 @@ use crate::{
     actors::scheduler::{PendingConnectionReservation, Scheduler},
     connect_target::{RequestedHost, TargetAuthority},
     flow::{
-        FlowId,
+        FlowId, ProxyContext,
         connection::{
             BidirectionalTunnel, FlowCleanup, RegisterTunnelError, SchedulerCapacityError,
             TunnelContext, TunnelIo, configure_upstream_stream, ensure_scheduler_capacity,
@@ -88,6 +88,7 @@ struct Socks5Session {
     client_addr: SocketAddr,
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
+    connector: DirectConnector,
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
@@ -99,19 +100,15 @@ pub(crate) async fn handle_socks5_proxy(
     client_stream: TcpStream,
     client_addr: SocketAddr,
     flow_id: FlowId,
-    scheduler: Addr<Scheduler>,
-    connect_policy: Arc<ConnectPolicy>,
+    context: ProxyContext,
     pending_reservation: PendingConnectionReservation,
-    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let session = Socks5Session::new(
         client_stream,
         flow_id,
         client_addr,
-        scheduler,
-        connect_policy,
+        context,
         pending_reservation,
-        idle_timeout,
     );
 
     match run_socks5_flow(session).await {
@@ -183,8 +180,7 @@ async fn run_socks5_flow(mut session: Socks5Session) -> Socks5Result<()> {
     handle_resolved_threat_matches(&mut session, &authority, &resolved).await?;
     reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
-    let connector = DirectConnector;
-    let upstream_connection = match connector.dial(session.flow_id, &resolved).await {
+    let upstream_connection = match session.connector.dial(session.flow_id, &resolved).await {
         Ok(connection) => connection,
         Err(err) => {
             warn!(
@@ -630,11 +626,15 @@ impl Socks5Session {
         client_stream: TcpStream,
         flow_id: FlowId,
         client_addr: SocketAddr,
-        scheduler: Addr<Scheduler>,
-        connect_policy: Arc<ConnectPolicy>,
+        context: ProxyContext,
         pending_reservation: PendingConnectionReservation,
-        idle_timeout: Option<Duration>,
     ) -> Self {
+        let ProxyContext {
+            scheduler,
+            connect_policy,
+            idle_timeout,
+            connector,
+        } = context;
         let (client_read, client_write) = client_stream.into_split();
         Self {
             flow_id,
@@ -645,6 +645,7 @@ impl Socks5Session {
             client_write,
             pending_reservation: Some(pending_reservation),
             idle_timeout,
+            connector,
         }
     }
 
@@ -701,10 +702,13 @@ mod tests {
                 stream,
                 peer,
                 flow_id,
-                scheduler,
-                connect_policy,
+                ProxyContext {
+                    scheduler,
+                    connect_policy,
+                    idle_timeout: None,
+                    connector: DirectConnector::default(),
+                },
                 pending_reservation,
-                None,
             )
             .await
         };
