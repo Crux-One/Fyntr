@@ -93,7 +93,7 @@ impl ConnectionLimiter {
     pub(crate) fn release(&self) {
         let result =
             self.current_connections
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current > 0).then_some(current - 1)
                 });
         if result.is_err() {
