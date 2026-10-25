@@ -859,7 +859,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_405_for_non_connect_method() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -878,7 +878,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_505_for_unsupported_http_version() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -897,7 +897,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_502_when_backend_connection_fails() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Choose an ephemeral port to ensure the outbound CONNECT attempt fails quickly.
@@ -930,7 +930,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_403_when_target_is_denied_by_policy() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -949,7 +949,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_403_when_target_port_is_not_allowed_by_policy() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -968,7 +968,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_403_when_threat_action_blocks_target() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -992,7 +992,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_403_when_absolute_idna_target_matches_threat() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_400_for_noncanonical_target_host() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_503_when_scheduler_is_at_capacity() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+        let scheduler = Scheduler::new(1024)
             .with_max_connections(max_connections_from_raw(1))
             .start();
 
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_503_before_policy_evaluation_when_scheduler_is_at_capacity() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600))
+        let scheduler = Scheduler::new(1024)
             .with_max_connections(max_connections_from_raw(1))
             .start();
 
@@ -1118,7 +1118,7 @@ mod tests {
     #[actix_rt::test]
     async fn returns_408_when_request_line_times_out() {
         time::pause();
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1143,7 +1143,7 @@ mod tests {
     #[actix_rt::test]
     async fn returns_408_when_connect_headers_time_out() {
         time::pause();
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1171,7 +1171,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_414_for_overlong_request_line() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn returns_431_for_too_many_headers() {
-        let scheduler = Scheduler::new(1024, Duration::from_secs(3600)).start();
+        let scheduler = Scheduler::new(1024).start();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
