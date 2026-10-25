@@ -25,8 +25,8 @@ use crate::{
         PendingConnectionReservation, Scheduler, Shutdown as SchedulerShutdown,
         TryReserveConnectionTask,
     },
-    flow::FlowId,
-    http::connect::handle_connect_proxy,
+    flow::{FlowId, ProxyContext},
+    http::connect::{handle_connect_proxy, upstream::DirectConnector},
     limits::{MaxConnections, max_connections_from_raw, max_connections_value},
     security::connect_policy::{ConnectCidr, ConnectPolicy, ConnectPolicyConfig},
     socks5::handle_socks5_proxy,
@@ -35,10 +35,11 @@ use crate::{
 
 pub const DEFAULT_PORT: u16 = 9999;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+pub const DEFAULT_CONNECT_START_INTERVAL_MS: u64 = 5;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const DEFAULT_QUANTUM: usize = 8 * 1024; // 8 KB
-const DEFAULT_TICK_MS: u64 = 5; // 5 ms
+const DEFAULT_QUANTUM: usize = 16 * 1024; // 16 KB
+const DEFAULT_TICK_MS: u64 = 1; // 1 ms
 const FD_PER_CONNECTION: u64 = 2; // client + upstream socket
 const FD_HEADROOM: u64 = 64; // listener, DNS, logs, etc.
 
@@ -260,6 +261,7 @@ pub struct ServerBuilder {
     port: u16,
     max_connections: MaxConnections,
     idle_timeout: Option<Duration>,
+    connect_start_interval: Duration,
     connect_policy: ConnectPolicyConfig,
     threat_feed_files: Vec<PathBuf>,
     socks5_bind: Option<BindAddress>,
@@ -272,6 +274,7 @@ struct ValidatedServerConfig {
     socks5_bind_addrs: Option<Vec<SocketAddr>>,
     max_connections: MaxConnections,
     idle_timeout: Option<Duration>,
+    connect_start_interval: Duration,
     connect_policy: Arc<ConnectPolicy>,
 }
 
@@ -288,6 +291,7 @@ impl ServerBuilder {
             port: DEFAULT_PORT,
             max_connections: max_connections_from_raw(DEFAULT_MAX_CONNECTIONS),
             idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
+            connect_start_interval: Duration::from_millis(DEFAULT_CONNECT_START_INTERVAL_MS),
             connect_policy: ConnectPolicyConfig::default(),
             threat_feed_files: Vec::new(),
             socks5_bind: None,
@@ -323,6 +327,16 @@ impl ServerBuilder {
         } else {
             Some(idle_timeout)
         };
+        self
+    }
+
+    /// Sets the minimum interval between outbound TCP connection attempts.
+    ///
+    /// Shared by HTTP CONNECT and SOCKS5, including retries and address fallback.
+    /// Defaults to 5 milliseconds. Zero disables the delay. A permit wait times out after 30 seconds;
+    /// pending flows count toward `max_connections`.
+    pub fn connect_start_interval(mut self, interval: Duration) -> Self {
+        self.connect_start_interval = interval;
         self
     }
 
@@ -473,6 +487,7 @@ impl ServerBuilder {
             socks5_bind_addrs,
             max_connections: cap_max_connections(self.max_connections),
             idle_timeout: self.idle_timeout,
+            connect_start_interval: self.connect_start_interval,
             connect_policy,
         })
     }
@@ -491,6 +506,7 @@ async fn server_with_config(config: ValidatedServerConfig) -> Result<()> {
         socks5_listener,
         config.max_connections,
         config.idle_timeout,
+        config.connect_start_interval,
         config.connect_policy,
         None,
     )
@@ -514,6 +530,7 @@ async fn start_with_config(config: ValidatedServerConfig) -> Result<ServerHandle
         socks5_listener,
         config.max_connections,
         config.idle_timeout,
+        config.connect_start_interval,
         config.connect_policy,
         Some(shutdown_rx),
     ));
@@ -576,15 +593,25 @@ async fn run_server(
     socks5_listener: Option<TcpListener>,
     max_connections: MaxConnections,
     idle_timeout: Option<Duration>,
+    connect_start_interval: Duration,
     connect_policy: Arc<ConnectPolicy>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
+    let connector = DirectConnector::new(connect_start_interval);
+
     // Start the scheduler
     let quantum = DEFAULT_QUANTUM;
     let tick = Duration::from_millis(DEFAULT_TICK_MS);
     let scheduler = Scheduler::new(quantum, tick)
         .with_max_connections(max_connections)
         .start();
+
+    let proxy_context = ProxyContext {
+        scheduler: scheduler.clone(),
+        connect_policy,
+        idle_timeout,
+        connector,
+    };
 
     // Start the flow ID counter
     let flow_counter = Arc::new(AtomicUsize::new(1));
@@ -639,7 +666,7 @@ async fn run_server(
             }
         };
 
-        let connect_policy = connect_policy.clone();
+        let proxy_context = proxy_context.clone();
 
         // Handle each connection in a dedicated task
         actix::spawn(async move {
@@ -649,10 +676,8 @@ async fn run_server(
                         client_stream,
                         client_addr,
                         flow_id,
-                        scheduler,
-                        connect_policy,
+                        proxy_context,
                         pending_reservation,
-                        idle_timeout,
                     )
                     .await
                 }
@@ -661,10 +686,8 @@ async fn run_server(
                         client_stream,
                         client_addr,
                         flow_id,
-                        scheduler,
-                        connect_policy,
+                        proxy_context,
                         pending_reservation,
-                        idle_timeout,
                     )
                     .await
                 }
@@ -968,6 +991,20 @@ mod tests {
         assert!(err.unwrap_err().to_string().contains("--threat-feed-file"));
     }
 
+    #[test]
+    fn connection_start_interval_defaults_to_five_milliseconds_and_can_be_disabled() {
+        assert_eq!(
+            ServerBuilder::new().connect_start_interval,
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            ServerBuilder::new()
+                .connect_start_interval(Duration::ZERO)
+                .connect_start_interval,
+            Duration::ZERO
+        );
+    }
+
     #[actix_rt::test]
     async fn validate_resolves_startup_values_before_running_server() {
         let config = ServerBuilder::new()
@@ -975,6 +1012,7 @@ mod tests {
             .port(8123)
             .max_connections(7)
             .idle_timeout(Duration::from_secs(42))
+            .connect_start_interval(Duration::from_millis(200))
             .validate()
             .await
             .expect("valid startup configuration");
@@ -986,6 +1024,7 @@ mod tests {
         assert_eq!(config.socks5_bind_addrs, None);
         assert_eq!(config.max_connections, max_connections_from_raw(7));
         assert_eq!(config.idle_timeout, Some(Duration::from_secs(42)));
+        assert_eq!(config.connect_start_interval, Duration::from_millis(200));
     }
 
     #[test]
@@ -1183,6 +1222,56 @@ mod tests {
         }
 
         handle.shutdown().await.expect("shutdown");
+    }
+
+    #[actix_rt::test]
+    async fn http_and_socks5_share_connection_start_interval() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let interval = Duration::from_millis(200);
+        let handle = server()
+            .bind("127.0.0.1")
+            .port(0)
+            .socks5_port(0)
+            .connect_start_interval(interval)
+            .allow_port(backend_addr.port())
+            .allow_cidr("127.0.0.0/8")
+            .unwrap()
+            .background()
+            .await
+            .unwrap();
+
+        let mut http = TcpStream::connect(handle.listen_addr()).await.unwrap();
+        let started = tokio::time::Instant::now();
+        http.write_all(format!("CONNECT {backend_addr} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let (first_upstream, _) = backend.accept().await.unwrap();
+        let mut response = vec![0; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        http.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+        let mut socks = TcpStream::connect(handle.socks5_listen_addr().unwrap())
+            .await
+            .unwrap();
+        socks.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        socks.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&backend_addr.port().to_be_bytes());
+        socks.write_all(&request).await.unwrap();
+        let (second_upstream, _) = tokio::time::timeout(Duration::from_secs(2), backend.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= interval);
+        let mut reply = [0; 10];
+        socks.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        // The first tunnel remains open: the gate limits starts, not lifetimes.
+        drop((http, socks, first_upstream, second_upstream));
+        handle.shutdown().await.unwrap();
     }
 
     #[actix_rt::test]

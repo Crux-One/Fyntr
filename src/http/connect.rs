@@ -23,7 +23,7 @@ use crate::{
     },
     connect_target::TargetAuthority,
     flow::{
-        FlowId,
+        FlowId, ProxyContext,
         connection::{
             BidirectionalTunnel, FlowCleanup, RegisterTunnelError, RegisteredTunnel,
             SchedulerCapacityError, TunnelContext, TunnelIo, configure_upstream_stream,
@@ -158,6 +158,7 @@ struct ConnectSession {
     client_addr: SocketAddr,
     scheduler: Addr<Scheduler>,
     connect_policy: Arc<ConnectPolicy>,
+    connector: DirectConnector,
     client_reader: BufReader<OwnedReadHalf>,
     client_write: OwnedWriteHalf,
     pending_reservation: Option<PendingConnectionReservation>,
@@ -360,8 +361,7 @@ impl ConnectState {
         Self::reject_if_scheduler_at_capacity(&mut session, "before dialing").await?;
 
         let target_authority = TargetAuthority::new(&target.host, target.port);
-        let upstream = DirectConnector;
-        let upstream_connection = match upstream.dial(session.flow_id, &target).await {
+        let upstream_connection = match session.connector.dial(session.flow_id, &target).await {
             Ok(connection) => connection,
             Err(e) => {
                 let detail = format!(
@@ -522,11 +522,15 @@ impl ConnectSession {
         client_stream: TcpStream,
         flow_id: FlowId,
         client_addr: SocketAddr,
-        scheduler: Addr<Scheduler>,
-        connect_policy: Arc<ConnectPolicy>,
+        context: ProxyContext,
         pending_reservation: PendingConnectionReservation,
-        idle_timeout: Option<Duration>,
     ) -> Self {
+        let ProxyContext {
+            scheduler,
+            connect_policy,
+            idle_timeout,
+            connector,
+        } = context;
         let (client_read, client_write) = client_stream.into_split();
         Self {
             flow_id,
@@ -537,6 +541,7 @@ impl ConnectSession {
             client_write,
             pending_reservation: Some(pending_reservation),
             idle_timeout,
+            connector,
         }
     }
 
@@ -588,19 +593,15 @@ pub(crate) async fn handle_connect_proxy(
     client_stream: TcpStream,
     client_addr: SocketAddr,
     flow_id: FlowId,
-    scheduler: Addr<Scheduler>,
-    connect_policy: Arc<ConnectPolicy>,
+    context: ProxyContext,
     pending_reservation: PendingConnectionReservation,
-    idle_timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
     let session = ConnectSession::new(
         client_stream,
         flow_id,
         client_addr,
-        scheduler,
-        connect_policy,
+        context,
         pending_reservation,
-        idle_timeout,
     );
 
     match run_connect_flow(session).await {
@@ -706,10 +707,13 @@ mod tests {
                 stream,
                 peer,
                 flow_id,
-                scheduler,
-                connect_policy,
+                ProxyContext {
+                    scheduler,
+                    connect_policy,
+                    idle_timeout: None,
+                    connector: DirectConnector::default(),
+                },
                 pending_reservation,
-                None,
             )
             .await
             .unwrap();
@@ -1296,7 +1300,7 @@ mod tests {
         let accept = async move {
             let _ = listener.accept().await.unwrap();
         };
-        let connector = DirectConnector;
+        let connector = DirectConnector::default();
         let ((), connected) = tokio::join!(accept, connector.dial(FlowId(1), &target));
 
         let connection = connected.unwrap();
@@ -1324,7 +1328,7 @@ mod tests {
         };
 
         let connect_task =
-            task::spawn(async move { DirectConnector.dial(FlowId(1), &target).await });
+            task::spawn(async move { DirectConnector::default().dial(FlowId(1), &target).await });
 
         task::yield_now().await;
         time::advance(CONNECT_BACKOFF_BASE).await;
