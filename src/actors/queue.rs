@@ -51,14 +51,25 @@ impl fmt::Display for EnqueueError {
 
 impl Error for EnqueueError {}
 
+/// Atomically replenish the active queue and reserve one bounded batch for its writer.
 #[derive(Message)]
-#[rtype(result = "()")]
-pub(crate) struct AddQuantum(pub usize);
+#[rtype(result = "TurnResult")]
+pub(crate) struct ServiceTurn {
+    pub quantum: usize,
+    pub writer_capacity: usize,
+}
 
-#[derive(Message)]
-#[rtype(result = "Option<DequeueResult>")]
-pub(crate) struct Dequeue {
-    pub max_bytes: usize,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnStatus {
+    Empty,
+    More,
+    WriterBlocked,
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnResult {
+    pub packets: Vec<Bytes>,
+    pub status: TurnStatus,
 }
 
 /// Releases bytes that a dequeue reserved atomically after the corresponding
@@ -79,13 +90,6 @@ pub(crate) struct Close;
 /// Use this instead of [`Close`] when a fast, best-effort shutdown is required.
 /// Used by the scheduler on Unregister to forcibly tear down the queue.
 pub(crate) struct StopNow;
-
-#[derive(Debug)]
-pub(crate) struct DequeueResult {
-    pub packet: Bytes,
-    pub remaining: usize,
-    pub ready_for_more: bool,
-}
 
 #[derive(Default)]
 pub(crate) struct QueueState {
@@ -122,41 +126,37 @@ impl QueueState {
         Ok(())
     }
 
-    pub(crate) fn add_quantum(&mut self, quantum: usize) {
-        self.deficit = self.deficit.saturating_add(quantum);
-    }
-
-    pub(crate) fn dequeue(&mut self, max_bytes: usize) -> (Option<DequeueResult>, bool) {
-        let dequeue_result = if let Some(front) = self.buf.front() {
-            if front.len() <= self.deficit && front.len() <= max_bytes {
-                let pkt = self.buf.pop_front().unwrap();
-                self.deficit -= pkt.len();
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(pkt.len());
-                self.writer_pending_bytes = self.writer_pending_bytes.saturating_add(pkt.len());
-                let ready_for_more = self
-                    .buf
-                    .front()
-                    .is_some_and(|next| next.len() <= self.deficit && next.len() <= max_bytes);
-                Some(DequeueResult {
-                    packet: pkt,
-                    remaining: self.buf.len(),
-                    ready_for_more,
-                })
-            } else {
-                None
+    fn service_turn(&mut self, quantum: usize, writer_capacity: usize) -> TurnResult {
+        const MAX_PACKETS_PER_TURN: usize = 64;
+        if !self.buf.is_empty() {
+            self.deficit = self.deficit.saturating_add(quantum);
+        }
+        let mut packets = Vec::new();
+        let mut bytes = 0;
+        while let Some(front) = self.buf.front() {
+            if packets.len() == MAX_PACKETS_PER_TURN
+                || front.len() > self.deficit
+                || front.len() > MAX_DEQUEUE_BYTES - bytes
+                || front.len() > writer_capacity - bytes
+            {
+                break;
             }
-        } else {
-            None
+            let packet = self.buf.pop_front().unwrap();
+            self.deficit -= packet.len();
+            bytes += packet.len();
+            packets.push(packet);
+        }
+        self.buffered_bytes -= bytes;
+        self.writer_pending_bytes += bytes;
+        let status = match self.buf.front() {
+            None => {
+                self.deficit = 0;
+                TurnStatus::Empty
+            }
+            Some(front) if front.len() > writer_capacity - bytes => TurnStatus::WriterBlocked,
+            Some(_) => TurnStatus::More,
         };
-
-        let should_stop = self.closing && self.buf.is_empty();
-        (dequeue_result, should_stop)
-    }
-
-    fn has_ready_packet(&self, max_bytes: usize) -> bool {
-        self.buf
-            .front()
-            .is_some_and(|front| front.len() <= self.deficit && front.len() <= max_bytes)
+        TurnResult { packets, status }
     }
 
     pub(crate) fn close(&mut self) -> bool {
@@ -216,7 +216,7 @@ impl QueueActor {
             return;
         };
 
-        if self.state.has_ready_packet(MAX_DEQUEUE_BYTES) {
+        if !self.state.buf.is_empty() {
             notifier.scheduler.do_send(FlowReady {
                 flow_id: notifier.flow_id,
             });
@@ -245,32 +245,18 @@ impl Handler<Enqueue> for QueueActor {
     }
 }
 
-// AddQuantum
-impl Handler<AddQuantum> for QueueActor {
-    type Result = ();
+impl Handler<ServiceTurn> for QueueActor {
+    type Result = MessageResult<ServiceTurn>;
 
-    fn handle(&mut self, msg: AddQuantum, _ctx: &mut Self::Context) -> Self::Result {
-        self.state.add_quantum(msg.0);
-        self.maybe_notify_ready();
-    }
-}
-
-// Dequeue
-impl Handler<Dequeue> for QueueActor {
-    type Result = MessageResult<Dequeue>;
-
-    fn handle(&mut self, msg: Dequeue, ctx: &mut Self::Context) -> Self::Result {
-        let (dequeue_result, should_stop) = self.state.dequeue(msg.max_bytes);
-
-        self.ready_notified = dequeue_result
-            .as_ref()
-            .is_some_and(|result| result.ready_for_more);
-
-        if should_stop {
+    fn handle(&mut self, msg: ServiceTurn, ctx: &mut Self::Context) -> Self::Result {
+        let result = self.state.service_turn(msg.quantum, msg.writer_capacity);
+        // The scheduler owns remaining backlog until drained or blocked. A later
+        // enqueue on an empty queue must send a fresh notification.
+        self.ready_notified = result.status != TurnStatus::Empty;
+        if self.state.closing && self.state.buf.is_empty() {
             ctx.stop();
         }
-
-        MessageResult(dequeue_result)
+        MessageResult(result)
     }
 }
 
@@ -339,152 +325,119 @@ impl Handler<InspectBufferedState> for QueueActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix::MailboxError;
 
-    #[actix_rt::test]
-    async fn test_enqueue_and_dequeue() {
-        let addr = QueueActor::new().start();
-
-        // Add quantum to allow dequeue (must be >= data.len()).
-        // This simulates a scenario where the quantum is not enough at first, so the dequeue will fail until enough quantum is added.
-        addr.do_send(AddQuantum(4));
-
-        // Enqueue a packet into the queue actor.
-        let data = Bytes::from_static(b"hello");
-        addr.do_send(Enqueue(data.clone()));
-
-        // Attempt to dequeue. Since the quantum is insufficient, this should return None (dequeue not allowed yet).
-        let res = addr.send(Dequeue { max_bytes: 1024 }).await.unwrap();
-        assert!(res.is_none());
-
-        // Add more quantum to reach the required amount for the packet size.
-        addr.do_send(AddQuantum(1));
-        let res = addr.send(Dequeue { max_bytes: 1024 }).await.unwrap();
-        assert!(res.is_some());
-
-        let result = res.unwrap();
-        assert_eq!(result.packet, data);
-        assert_eq!(result.remaining, 0);
-    }
-
-    #[actix_rt::test]
-    async fn test_close_behavior() {
-        let addr = QueueActor::new().start();
-
-        addr.do_send(Close);
-
-        // Confirm that the actor stops immediately after receiving Close.
-        // After stopping, sending messages to the actor should fail (either error or None).
-        let res = addr.send(Dequeue { max_bytes: 1024 }).await;
-        assert_actor_stopped_or_empty(res);
-    }
-
-    #[actix_rt::test]
-    async fn test_stop_now_drops_buffer_and_stops() {
-        let addr = QueueActor::new().start();
-
-        let data = Bytes::from_static(b"payload");
-        addr.do_send(Enqueue(data));
-
-        addr.do_send(StopNow);
-
-        let res = addr.send(Dequeue { max_bytes: 1024 }).await;
-        assert!(res.is_err(), "queue actor should stop immediately");
-    }
-
-    #[actix_rt::test]
-    async fn test_dequeue_respects_max_bytes() {
-        let addr = QueueActor::new().start();
-
-        let payload = Bytes::from_static(b"0123456789");
-        addr.do_send(Enqueue(payload.clone()));
-
-        // Provide sufficient quantum for the packet, but restrict max_bytes below packet length.
-        addr.do_send(AddQuantum(usize::MAX));
-        let res = addr
-            .send(Dequeue {
-                max_bytes: payload.len() - 1,
-            })
-            .await
-            .unwrap();
-        assert!(
-            res.is_none(),
-            "dequeue should be blocked by max_bytes constraint"
+    #[test]
+    fn service_turn_batches_fifo_within_quantum_and_reserves_bytes() {
+        let mut state = QueueState::default();
+        for data in [b"aaa".as_slice(), b"bbbb", b"cc"] {
+            state.enqueue(Bytes::copy_from_slice(data)).unwrap();
+        }
+        let first = state.service_turn(7, 100);
+        assert_eq!(
+            first.packets,
+            vec![Bytes::from_static(b"aaa"), Bytes::from_static(b"bbbb")]
         );
+        assert_eq!(first.status, TurnStatus::More);
+        assert_eq!(state.writer_pending_bytes, 7);
+        assert_eq!(state.buffered_bytes, 2);
+        let second = state.service_turn(7, 100);
+        assert_eq!(second.packets, vec![Bytes::from_static(b"cc")]);
+        assert_eq!(second.status, TurnStatus::Empty);
+        assert_eq!(state.deficit, 0);
+    }
 
-        // Allow dequeue by lifting the max_bytes restriction.
-        let res = addr
-            .send(Dequeue {
-                max_bytes: payload.len(),
+    #[test]
+    fn large_packet_accumulates_deficit_on_active_turns_only() {
+        let mut state = QueueState::default();
+        for _ in 0..100 {
+            state.service_turn(16 * 1024, 100_000);
+        }
+        assert_eq!(state.deficit, 0);
+        let packet = Bytes::from(vec![0; MAX_QUEUE_PACKET_BYTES]);
+        state.enqueue(packet.clone()).unwrap();
+        for _ in 0..3 {
+            let turn = state.service_turn(16 * 1024, 100_000);
+            assert!(turn.packets.is_empty());
+            assert_eq!(turn.status, TurnStatus::More);
+        }
+        let turn = state.service_turn(16 * 1024, 100_000);
+        assert_eq!(turn.packets, vec![packet]);
+        assert_eq!(turn.status, TurnStatus::Empty);
+        assert_eq!(state.deficit, 0);
+    }
+
+    #[test]
+    fn turn_distinguishes_writer_capacity_from_deficit_and_bounds_tiny_packets() {
+        let mut state = QueueState::default();
+        state.enqueue(Bytes::from_static(b"abc")).unwrap();
+        let turn = state.service_turn(10, 2);
+        assert_eq!(turn.status, TurnStatus::WriterBlocked);
+        assert!(turn.packets.is_empty());
+        assert_eq!(state.writer_pending_bytes, 0);
+        assert_eq!(state.service_turn(10, 3).packets.len(), 1);
+        for _ in 0..100 {
+            state.enqueue(Bytes::new()).unwrap();
+        }
+        let turn = state.service_turn(10, 0);
+        assert_eq!(turn.packets.len(), 64);
+        assert_eq!(turn.status, TurnStatus::More);
+        assert_eq!(state.service_turn(10, 0).packets.len(), 36);
+    }
+
+    #[test]
+    fn turn_byte_limit_and_combined_reservation_limit_remain_enforced() {
+        let mut state = QueueState::default();
+        let packet = Bytes::from(vec![0; MAX_QUEUE_PACKET_BYTES]);
+        for _ in 0..MAX_QUEUE_BUFFERED_BYTES / packet.len() {
+            state.enqueue(packet.clone()).unwrap();
+        }
+        let turn = state.service_turn(usize::MAX, MAX_QUEUE_BUFFERED_BYTES);
+        assert_eq!(turn.packets.len(), 1);
+        assert_eq!(state.writer_pending_bytes, MAX_DEQUEUE_BYTES);
+        assert_eq!(
+            state.buffered_bytes + state.writer_pending_bytes,
+            MAX_QUEUE_BUFFERED_BYTES
+        );
+        assert!(matches!(
+            state.enqueue(Bytes::from_static(b"x")),
+            Err(EnqueueError::QueueBufferExceeded { .. })
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn close_drains_backlog_before_stopping() {
+        let queue = QueueActor::new().start();
+        queue
+            .send(Enqueue(Bytes::from_static(b"payload")))
+            .await
+            .unwrap()
+            .unwrap();
+        queue.send(Close).await.unwrap();
+        let turn = queue
+            .send(ServiceTurn {
+                quantum: 1024,
+                writer_capacity: 1024,
             })
             .await
             .unwrap();
-        let result = res.expect("packet should dequeue once max_bytes allows it");
-        assert_eq!(result.packet, payload);
-        assert_eq!(result.remaining, 0);
+        assert_eq!(turn.packets, vec![Bytes::from_static(b"payload")]);
+        assert_eq!(turn.status, TurnStatus::Empty);
+        assert!(queue.send(InspectBufferedState).await.is_err());
     }
 
     #[actix_rt::test]
-    async fn test_fifo_and_remaining_count() {
-        let addr = QueueActor::new().start();
-
-        let first = Bytes::from_static(b"first");
-        let second = Bytes::from_static(b"second");
-        addr.do_send(Enqueue(first.clone()));
-        addr.do_send(Enqueue(second.clone()));
-
-        addr.do_send(AddQuantum(usize::MAX));
-
-        let res_first = addr
-            .send(Dequeue {
-                max_bytes: usize::MAX,
-            })
+    async fn close_empty_and_stop_now_stop_the_queue() {
+        let queue = QueueActor::new().start();
+        queue.send(Close).await.unwrap();
+        assert!(queue.send(InspectBufferedState).await.is_err());
+        let queue = QueueActor::new().start();
+        queue
+            .send(Enqueue(Bytes::from_static(b"payload")))
             .await
             .unwrap()
-            .expect("first dequeue should succeed");
-        assert_eq!(res_first.packet, first);
-        assert_eq!(res_first.remaining, 1);
-
-        let res_second = addr
-            .send(Dequeue {
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .expect("second dequeue should succeed");
-        assert_eq!(res_second.packet, second);
-        assert_eq!(res_second.remaining, 0);
-    }
-
-    #[actix_rt::test]
-    async fn test_close_after_drain() {
-        let addr = QueueActor::new().start();
-
-        let payload = Bytes::from_static(b"payload");
-        addr.do_send(Enqueue(payload.clone()));
-
-        // Initiate closing while there is still data buffered.
-        addr.do_send(Close);
-        addr.do_send(AddQuantum(usize::MAX));
-
-        // First dequeue should return the buffered packet.
-        let result = addr
-            .send(Dequeue {
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .expect("queue should dequeue buffered packet before stopping");
-        assert_eq!(result.packet, payload);
-        assert_eq!(result.remaining, 0);
-
-        // Subsequent messages should fail because the actor stops after draining.
-        let res = addr
-            .send(Dequeue {
-                max_bytes: usize::MAX,
-            })
-            .await;
-        assert_actor_stopped_or_empty(res);
+            .unwrap();
+        queue.send(StopNow).await.unwrap();
+        assert!(queue.send(InspectBufferedState).await.is_err());
     }
 
     #[test]
@@ -527,8 +480,7 @@ mod tests {
         for _ in 0..(MAX_QUEUE_BUFFERED_BYTES / MAX_QUEUE_PACKET_BYTES) {
             state.enqueue(chunk.clone()).unwrap();
         }
-        state.add_quantum(usize::MAX);
-        state.dequeue(MAX_QUEUE_PACKET_BYTES).0.unwrap();
+        state.service_turn(usize::MAX, MAX_QUEUE_PACKET_BYTES);
 
         assert_eq!(
             state.buffered_bytes + state.writer_pending_bytes,
@@ -547,25 +499,16 @@ mod tests {
         for _ in 0..(MAX_QUEUE_BUFFERED_BYTES / MAX_QUEUE_PACKET_BYTES) {
             queue.send(Enqueue(chunk.clone())).await.unwrap().unwrap();
         }
-        queue
-            .send(AddQuantum(MAX_QUEUE_PACKET_BYTES * 2))
-            .await
-            .unwrap();
-
-        queue
-            .send(Dequeue {
-                max_bytes: MAX_QUEUE_PACKET_BYTES,
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        queue
-            .send(Dequeue {
-                max_bytes: MAX_QUEUE_PACKET_BYTES,
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        for _ in 0..2 {
+            let turn = queue
+                .send(ServiceTurn {
+                    quantum: MAX_QUEUE_PACKET_BYTES,
+                    writer_capacity: MAX_QUEUE_PACKET_BYTES,
+                })
+                .await
+                .unwrap();
+            assert_eq!(turn.packets.len(), 1);
+        }
         queue
             .send(ReleasePendingBytes(MAX_QUEUE_PACKET_BYTES))
             .await
@@ -582,13 +525,5 @@ mod tests {
             state.buffered_bytes + state.writer_pending_bytes,
             MAX_QUEUE_BUFFERED_BYTES
         );
-    }
-
-    // Helper to assert that the actor is stopped or the queue is empty.
-    fn assert_actor_stopped_or_empty<T>(res: Result<Option<T>, MailboxError>) {
-        match res {
-            Ok(None) | Err(_) => (),
-            Ok(Some(_)) => panic!("expected actor to be stopped or queue empty"),
-        }
     }
 }

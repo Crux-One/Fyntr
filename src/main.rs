@@ -3,8 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use fyntr::run::{
-    self, BindAddress, DEFAULT_BIND, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS,
-    DEFAULT_PORT,
+    self, BindAddress, DEFAULT_BIND, DEFAULT_CONNECT_START_INTERVAL_MS, DEFAULT_IDLE_TIMEOUT_SECS,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -35,6 +35,10 @@ struct Cli {
     /// Maximum number of concurrent connections allowed
     #[clap(long, env = "FYNTR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
+
+    /// Minimum interval in milliseconds between outbound TCP connect attempts across both protocols (0 disables)
+    #[clap(long, env = "FYNTR_CONNECT_START_INTERVAL_MS", default_value_t = DEFAULT_CONNECT_START_INTERVAL_MS)]
+    connect_start_interval_ms: u64,
 
     /// Established tunnel idle timeout in seconds (0 to disable)
     #[clap(
@@ -87,6 +91,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .bind(cli.bind)
         .port(cli.port)
         .max_connections(cli.max_connections)
+        .connect_start_interval(Duration::from_millis(cli.connect_start_interval_ms))
         .idle_timeout(Duration::from_secs(cli.idle_timeout));
 
     if let Some(bind) = cli.socks5_bind {
@@ -119,4 +124,42 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     server.foreground().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_start_interval_defaults_to_five_milliseconds_and_parses_overrides() {
+        assert_eq!(
+            Cli::try_parse_from(["fyntr"])
+                .unwrap()
+                .connect_start_interval_ms,
+            5
+        );
+        assert_eq!(
+            Cli::try_parse_from(["fyntr", "--connect-start-interval-ms", "0"])
+                .unwrap()
+                .connect_start_interval_ms,
+            0
+        );
+        assert_eq!(
+            Cli::try_parse_from(["fyntr", "--connect-start-interval-ms", "200"])
+                .unwrap()
+                .connect_start_interval_ms,
+            200
+        );
+        assert_eq!(
+            Cli::try_parse_from([
+                "fyntr",
+                "--connect-start-interval-ms",
+                &u64::MAX.to_string()
+            ])
+            .unwrap()
+            .connect_start_interval_ms,
+            u64::MAX
+        );
+        assert!(Cli::try_parse_from(["fyntr", "--connect-start-interval-ms", "-1"]).is_err());
+    }
 }

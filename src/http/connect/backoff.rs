@@ -6,6 +6,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+use super::upstream::ConnectStartLimiter;
 use crate::flow::FlowId;
 
 const CONNECT_MAX_ATTEMPTS: usize = 3;
@@ -46,14 +47,20 @@ pub(super) async fn connect_to_any_with_backoff(
     flow_id: FlowId,
     backend_addrs: &[SocketAddr],
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
-    connect_to_any_with_backoff_with_log_target(flow_id, backend_addrs, CONNECT_BACKOFF_LOG_TARGET)
-        .await
+    connect_to_any_with_backoff_with_log_target(
+        flow_id,
+        backend_addrs,
+        CONNECT_BACKOFF_LOG_TARGET,
+        &ConnectStartLimiter::new(Duration::ZERO),
+    )
+    .await
 }
 
 pub(super) async fn connect_to_any_with_backoff_with_log_target(
     flow_id: FlowId,
     backend_addrs: &[SocketAddr],
     log_target: &'static str,
+    limiter: &ConnectStartLimiter,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
     if backend_addrs.is_empty() {
         return Err(std::io::Error::new(
@@ -69,6 +76,8 @@ pub(super) async fn connect_to_any_with_backoff_with_log_target(
     let mut last_err = None;
     for attempt in 1..=CONNECT_MAX_ATTEMPTS {
         for &addr in backend_addrs {
+            // A permit timeout ends the whole dial; no attempt has been made.
+            limiter.wait().await?;
             let connect = TcpStream::connect(addr);
             match timeout(CONNECT_ATTEMPT_TIMEOUT, connect).await {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
@@ -106,6 +115,77 @@ pub(super) async fn connect_to_any_with_backoff_with_log_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn address_fallback_waits_for_shared_start_permit() {
+        let reachable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_addr = reachable.local_addr().unwrap();
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+        let interval = Duration::from_millis(100);
+        let limiter = ConnectStartLimiter::new(interval);
+        let started = tokio::time::Instant::now();
+        let (stream, addr) = connect_to_any_with_backoff_with_log_target(
+            FlowId(1),
+            &[refused_addr, reachable_addr],
+            CONNECT_BACKOFF_LOG_TARGET,
+            &limiter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(addr, reachable_addr);
+        assert!(started.elapsed() >= interval);
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn retries_also_wait_for_shared_start_permit() {
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+        // Longer than either backoff, so both retry attempts need to wait.
+        let interval = Duration::from_millis(500);
+        let limiter = ConnectStartLimiter::new(interval);
+        let started = tokio::time::Instant::now();
+        let err = connect_to_any_with_backoff_with_log_target(
+            FlowId(1),
+            &[refused_addr],
+            CONNECT_BACKOFF_LOG_TARGET,
+            &limiter,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(started.elapsed() >= interval * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permit_timeout_ends_dial_without_retries_or_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limiter = ConnectStartLimiter::new(Duration::MAX);
+        limiter.wait().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let err = connect_to_any_with_backoff_with_log_target(
+            FlowId(1),
+            &[addr, addr],
+            CONNECT_BACKOFF_LOG_TARGET,
+            &limiter,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("start permit"));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        let mut accept = Box::pin(listener.accept());
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            assert!(accept.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
 
     fn backoff_sequence(steps: usize) -> Vec<Duration> {
         let mut delay = CONNECT_BACKOFF_BASE;
